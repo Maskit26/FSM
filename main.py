@@ -277,20 +277,7 @@ async def handle_parcel_confirmed(
     except DbLayerError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
-@app.get("/api/orders/{order_id}", response_model=dict)
-async def get_order(order_id: int, db: DatabaseLayer = Depends(get_db)):
-    """Получить заказ по ID"""
-    try:
-        order = db.get_order(order_id)
-        if not order:
-            raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
-        return order
-    except DbLayerError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.get("/api/orders/route", response_model=List[dict])
+@app.get("/api/orders/by-route", response_model=List[dict])
 async def get_orders_by_route(
     from_city: str,
     to_city: str,
@@ -302,6 +289,17 @@ async def get_orders_by_route(
         status_list = statuses.split(",") if statuses else None
         orders = db.get_orders_for_route(from_city, to_city, status_list)
         return orders
+    except DbLayerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/orders/{order_id}", response_model=dict)
+async def get_order(order_id: int, db: DatabaseLayer = Depends(get_db)):
+    """Получить заказ по ID"""
+    try:
+        order = db.get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+        return order
     except DbLayerError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
