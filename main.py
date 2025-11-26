@@ -305,6 +305,23 @@ async def get_orders_by_route(
     except DbLayerError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/api/orders", response_model=List[dict])
+async def get_all_orders(
+    statuses: Optional[str] = None,
+    db: DatabaseLayer = Depends(get_db),
+):
+    """
+    Получить все заказы без привязки к маршруту.
+    Опционально: фильтр по статусам, через запятую, например:
+    ?statuses=order_created,order_parcel_confirmed
+    """
+    try:
+        status_list = statuses.split(",") if statuses else None
+        orders = db.get_all_orders(status_list)
+        return orders
+    except DbLayerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 # ==================== БИРЖИ КУРЬЕРОВ (НОВЫЕ) ====================
 
 @app.get("/api/courier/exchange-pickup", response_model=dict)

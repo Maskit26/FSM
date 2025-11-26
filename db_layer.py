@@ -805,6 +805,52 @@ class DatabaseLayer:
             for row in rows
         ]
 
+    def get_all_orders(
+        self,
+        statuses: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """
+        Получить список всех заказов (без привязки к маршруту).
+        Optionally: фильтр по статусам.
+        """
+        query = """
+            SELECT
+                id,
+                status,
+                description,
+                pickup_type,
+                delivery_type,
+                from_city,
+                to_city,
+                source_cell_id,
+                dest_cell_id
+            FROM orders
+            WHERE 1 = 1
+        """
+        params: Dict[str, object] = {}
+
+        if statuses:
+            placeholders = ", ".join(f":status{i}" for i in range(len(statuses)))
+            query += f" AND status IN ({placeholders})"
+            params.update({f"status{i}": s for i, s in enumerate(statuses)})
+
+        rows = self.session.execute(text(query), params).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "status": row[1],
+                "description": row[2],
+                "pickup_type": row[3],
+                "delivery_type": row[4],
+                "from_city": row[5],
+                "to_city": row[6],
+                "source_cell_id": row[7],
+                "dest_cell_id": row[8],
+            }
+            for row in rows
+        ]
+
     def get_orders_for_courier(self, courier_id: int) -> List[int]:
         """IDs заказов, в которых участвует курьер (courier1 или courier2)."""
         rows = self.session.execute(
