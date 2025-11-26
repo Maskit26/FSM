@@ -30,6 +30,7 @@ class UserCreateRequest(BaseModel):
     role: str
 
 class LockerCreateRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
     locker_id: int
     locker_code: str
     location_address: str

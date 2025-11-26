@@ -48,9 +48,24 @@ class DatabaseLayer:
         connection_string = (
             f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}"
         )
-        self.engine = create_engine(connection_string, echo=echo, future=True)
-        Session = sessionmaker(bind=self.engine, autoflush=False, autocommit=False)
+
+        # ОДИН раз создаём engine с правильными параметрами
+        self.engine = create_engine(
+            connection_string,
+            echo=echo,
+            future=True,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
+
+        Session = sessionmaker(
+            bind=self.engine,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
         self.session = Session()
+
         self._raw_config = {
             "host": host,
             "port": port,
