@@ -45,7 +45,8 @@ class OrderResponse(BaseModel):
     id: int
     status: str
     description: str
-    delivery_type: Optional[str]
+    pickup_type: Optional[str] = None
+    delivery_type: Optional[str] = None
     from_city: str
     to_city: str
     source_cell_id: Optional[int]
