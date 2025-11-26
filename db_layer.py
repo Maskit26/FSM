@@ -1260,56 +1260,56 @@ class DatabaseLayer:
             ) from e
 
     
-def update_trip_active_flags(self, max_orders: int = 5, wait_hours: float = 24.0) -> int:
-    """
-    Активация рейсов с учётом ТОЛЬКО активных заказов.
-    
-    Исключает заказы в статусах: cancelled, completed, failed.
-    """
-    if max_orders <= 0 and wait_hours <= 0:
-        return 0
+    def update_trip_active_flags(self, max_orders: int = 5, wait_hours: float = 24.0) -> int:
+        """
+        Активация рейсов с учётом ТОЛЬКО активных заказов.
+        
+        Исключает заказы в статусах: cancelled, completed, failed.
+        """
+        if max_orders <= 0 and wait_hours <= 0:
+            return 0
 
-    session = self.session
-    threshold = datetime.now() - timedelta(hours=wait_hours)
+        session = self.session
+        threshold = datetime.now() - timedelta(hours=wait_hours)
 
-    # Считаем только активные заказы
-    rows = session.execute(
-        text(
-            """
-            SELECT t.id, t.created_at, COUNT(o.id) AS order_count
-            FROM trips t
-            LEFT JOIN stage_orders so ON so.trip_id = t.id
-            LEFT JOIN orders o ON o.id = so.order_id 
-                AND o.status NOT IN ('order_cancelled', 'order_completed', 'order_failed')
-            WHERE t.status = 'trip_created' AND t.active = 0
-            GROUP BY t.id, t.created_at
-            """
-        )
-    ).fetchall()
-
-    updated = 0
-    for trip_id, created_at, order_count in rows:
-        make_active = False
-
-        if max_orders > 0 and order_count >= max_orders:
-            make_active = True
-            print(f"[DEBUG active] Рейс {trip_id}: {order_count} активных заказов → активируем")
-        elif wait_hours > 0 and created_at and created_at < threshold:
-            make_active = True
-            print(f"[DEBUG active] Рейс {trip_id}: ожидание более {wait_hours} ч.")
-
-        if make_active:
-            session.execute(
-                text("UPDATE trips SET active = 1 WHERE id = :trip_id"),
-                {"trip_id": trip_id},
+        # Считаем только активные заказы
+        rows = session.execute(
+            text(
+                """
+                SELECT t.id, t.created_at, COUNT(o.id) AS order_count
+                FROM trips t
+                LEFT JOIN stage_orders so ON so.trip_id = t.id
+                LEFT JOIN orders o ON o.id = so.order_id 
+                    AND o.status NOT IN ('order_cancelled', 'order_completed', 'order_failed')
+                WHERE t.status = 'trip_created' AND t.active = 0
+                GROUP BY t.id, t.created_at
+                """
             )
-            updated += 1
+        ).fetchall()
 
-    if updated > 0:
-        session.commit()
-        print(f"[DEBUG active] Активировано {updated} рейсов")
+        updated = 0
+        for trip_id, created_at, order_count in rows:
+            make_active = False
 
-    return updated
+            if max_orders > 0 and order_count >= max_orders:
+                make_active = True
+                print(f"[DEBUG active] Рейс {trip_id}: {order_count} активных заказов → активируем")
+            elif wait_hours > 0 and created_at and created_at < threshold:
+                make_active = True
+                print(f"[DEBUG active] Рейс {trip_id}: ожидание более {wait_hours} ч.")
+
+            if make_active:
+                session.execute(
+                    text("UPDATE trips SET active = 1 WHERE id = :trip_id"),
+                    {"trip_id": trip_id},
+                )
+                updated += 1
+
+        if updated > 0:
+            session.commit()
+            print(f"[DEBUG active] Активировано {updated} рейсов")
+
+        return updated
 
     # ==================== АВТОМАТИЧЕСКАЯ ОБРАБОТКА ТАЙМАУТОВ ====================
 

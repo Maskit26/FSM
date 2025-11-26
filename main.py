@@ -46,9 +46,9 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
-    if db_instance:
-        db_instance.close()
-        print("🔌 Database connection closed")
+    #if db_instance:
+     #   db_instance.close()
+      #  print("🔌 Database connection closed")
 
 # ========== FASTAPI APP ==========
 app = FastAPI(
