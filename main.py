@@ -63,8 +63,7 @@ origins = [
     "http://localhost:3000",
     "http://localhost:5173",
     "https://v0-fsm-emulator-interface.vercel.app",
-    "https://*.vercel.app",
-    "*"  # Для разработки, в продакшене убери
+
 ]
 
 app.add_middleware(
