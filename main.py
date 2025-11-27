@@ -592,6 +592,14 @@ async def create_cell(request: CellCreateRequest, db: DatabaseLayer = Depends(ge
         )
     except DbLayerError as e:
         raise HTTPException(status_code=400, detail=str(e))
+        
+
+@app.get("/api/lockers", response_model=List[dict])
+async def list_lockers(db: DatabaseLayer = Depends(get_db)):
+    try:
+        return db.get_lockers()
+    except DbLayerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/lockers/{locker_id}/cells", response_model=List[CellResponse])

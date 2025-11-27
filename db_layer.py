@@ -602,7 +602,52 @@ class DatabaseLayer:
             ),
             {"locker_id": locker_id},
         ).fetchone()
-        return row[0] if row else None
+        return row[0] if row else None   
+
+    def get_lockers(self) -> List[Dict]:
+        """
+        Получить список всех постаматов.
+
+        Возвращает:
+            [
+                {
+                    "id": 1,
+                    "locker_code": "POST1",
+                    "location_address": "Москва, Точка #1",
+                    "status": "locker_active",
+                    "latitude": 55.123456,
+                    "longitude": 37.123456,
+                },
+                ...
+            ]
+        """
+        rows = self.session.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    locker_code,
+                    location_address,
+                    status,
+                    latitude,
+                    longitude
+                FROM lockers
+                ORDER BY id ASC
+                """
+            )
+        ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "locker_code": row[1],
+                "location_address": row[2],
+                "status": row[3],
+                "latitude": row[4],
+                "longitude": row[5],
+            }
+            for row in rows
+        ]
 
     def get_locker_cells_by_status(
         self, locker_id: int, status: str
