@@ -918,33 +918,32 @@ class DatabaseLayer:
     def handle_parcel_confirmed(self, order_id: int):
         """
         Обработка после попадания посылки в постамат2 (вторая развилка).
-        
-        НЕ делает автоматических FSM переходов!
-        Только логирует куда пойдёт заказ дальше на основе delivery_type.
-        
-        - delivery_type='self' → заказ ждёт получателя (самовывоз)
-        - delivery_type='courier' → заказ виден на бирже для курьера2
-        
-        Вызывать после FSM перехода в order_parcel_confirmed.
+
+        Ожидается, что заказ уже в состоянии order_parcel_confirmed_post2.
+        НЕ делает FSM-переходов, только логирует ветку по delivery_type.
         """
         order = self.get_order(order_id)
         if not order:
             raise DbLayerError(f"Заказ {order_id} не найден")
-        
+
+        status = order.get("status")
+        if status != "order_parcel_confirmed_post2":
+            raise DbLayerError(
+                f"handle_parcel_confirmed: некорректный статус '{status}', "
+                "ожидается 'order_parcel_confirmed_post2'"
+            )
+
         delivery_type = order.get("delivery_type", "self")
-        
+
         if delivery_type == "self":
-            # Получатель сам заберёт из постамата2
             print(f"[DEBUG] Заказ {order_id}: в постамате2, ожидает самовывоз получателем")
-            print(f"[DEBUG] Доступное действие: order_pickup_poluchatel")
-        
+            print("[DEBUG] Доступное действие: order_pickup_poluchatel")
         elif delivery_type == "courier":
-            # Заказ доступен на бирже для курьера2
             print(f"[DEBUG] Заказ {order_id}: в постамате2, доступен на бирже для курьера2")
-            print(f"[DEBUG] Доступное действие: order_assign_courier2_to_order (когда курьер2 возьмёт)")
-        
+            print("[DEBUG] Доступное действие: order_assign_courier2_to_order")
         else:
             raise DbLayerError(f"Неизвестный delivery_type: {delivery_type}")
+
 
     # ==================== НОВЫЕ МЕТОДЫ: БИРЖИ ====================
 
@@ -996,7 +995,7 @@ class DatabaseLayer:
         """
         Получить заказы для курьера2 (доставка получателю).
         
-        Это заказы в статусе order_parcel_confirmed с delivery_type='courier'.
+        Это заказы в статусе order_parcel_confirmed_post2 с delivery_type='courier'.
         
         Args:
             city: Фильтр по городу назначения (опционально)
@@ -1012,7 +1011,7 @@ class DatabaseLayer:
             FROM orders o
             JOIN locker_cells lc ON lc.id = o.dest_cell_id
             JOIN lockers l ON l.id = lc.locker_id
-            WHERE o.status = 'order_parcel_confirmed'
+            WHERE o.status = 'order_parcel_confirmed_post2'
               AND o.delivery_type = 'courier'
         """
         
