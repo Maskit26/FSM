@@ -177,20 +177,61 @@ class DatabaseLayer:
         )
 
     def set_courier1_in_stage(self, order_id: int, courier_id: int):
-        """Устанавливает courier1_user_id в stage_orders для заказа."""
-        self.session.execute(
-            text("UPDATE stage_orders SET courier1_user_id = :cid WHERE order_id = :oid"),
-            {"cid": courier_id, "oid": order_id}
+        """
+        Устанавливает курьера для плеча pickup (courier1) в stage_orders.
+        Пишет только в courier_user_id для строки с leg='pickup'.
+        """
+        session = self.session
+        session.execute(
+            text(
+                """
+                UPDATE stage_orders
+                SET courier_user_id = :cid
+                WHERE orderid = :oid
+                AND leg = 'pickup'
+                """
+            ),
+            {"cid": courier_id, "oid": order_id},
         )
-        self.session.commit()
+        session.commit()
 
     def set_courier2_in_stage(self, order_id: int, courier_id: int):
-        """Устанавливает courier2_user_id в stage_orders для заказа."""
-        self.session.execute(
-            text("UPDATE stage_orders SET courier2_user_id = :cid WHERE order_id = :oid"),
-            {"cid": courier_id, "oid": order_id}
+        """
+        Устанавливает курьера для плеча delivery (courier2) в stage_orders.
+        Создаёт/обновляет строку с leg='delivery', пишет только в courier_user_id.
+        """
+        session = self.session
+
+        # Берём tripid из pickup-строки
+        row = session.execute(
+            text(
+                """
+                SELECT trip_id
+                FROM stage_orders
+                WHERE order_id = :oid AND leg = 'pickup'
+                LIMIT 1
+                """
+            ),
+            {"oid": order_id},
+        ).fetchone()
+
+        if not row:
+            raise DbLayerError(f"Для заказа {order_id} не найдена строка pickup в stageorders")
+
+        trip_id = row[0]
+
+        session.execute(
+            text(
+                """
+                INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id)
+                VALUES (:trip_id, :order_id, 'delivery', :cid) AS new
+                ON DUPLICATE KEY UPDATE
+                    courier_user_id = new.courier_user_id
+                """
+            ),
+            {"trip_id": trip_id, "order_id": order_id, "cid": courier_id},
         )
-        self.session.commit()
+        session.commit()
 
     def order_pickup_by_driver(self, order_id: int, driver_id: int) -> bool:
         """Водитель забирает заказ из постамата (FSM: order_pickup_by_voditel)."""
@@ -917,8 +958,7 @@ class DatabaseLayer:
             text(
                 "SELECT DISTINCT so.order_id "
                 "FROM stage_orders so "
-                "WHERE so.courier1_user_id = :courier_id "
-                "   OR so.courier2_user_id = :courier_id"
+                "WHERE so.courier_user_id = :courier_id"
             ),
             {"courier_id": courier_id},
         ).fetchall()
@@ -1236,11 +1276,12 @@ class DatabaseLayer:
             # 4. Вставка
             session.execute(
                 text(
-                    "INSERT INTO stage_orders (trip_id, order_id) "
-                    "VALUES (:trip_id, :order_id)"
+                    "INSERT INTO stage_orders (trip_id, order_id, leg) "
+                    "VALUES (:trip_id, :order_id, 'pickup')"
                 ),
                 {"trip_id": trip_id, "order_id": order_id},
             )
+
             session.commit()
             return True, "Заказ привязан к рейсу"
         except Exception as e:
