@@ -851,6 +851,70 @@ class DatabaseLayer:
             self.session.rollback()
             raise DbLayerError(f"Заказ '{description}': {e}") from e
 
+    def create_order_request_and_fsm(
+        self,
+        client_user_id: int,
+        parcel_type: str,
+        cell_size: str,
+        sender_delivery: str,
+        recipient_delivery: str,
+    ) -> int:
+        """
+        Создаёт заявку в order_requests + инстанс серверного FSM процесса 'order_creation'.
+        Возвращает request_id.
+        """
+        session = self.session
+        try:
+            # 1. INSERT в order_requests
+            session.execute(
+                text(
+                    """
+                    INSERT INTO order_requests
+                        (client_user_id, parcel_type, cell_size, sender_delivery, recipient_delivery)
+                    VALUES
+                        (:client_user_id, :parcel_type, :cell_size, :sender_delivery, :recipient_delivery)
+                    """
+                ),
+                {
+                    "client_user_id": client_user_id,
+                    "parcel_type": parcel_type,
+                    "cell_size": cell_size,
+                    "sender_delivery": sender_delivery,
+                    "recipient_delivery": recipient_delivery,
+                },
+            )
+
+            # Получаем id вставленной заявки (в рамках того же соединения)
+            result = session.execute(text("SELECT LAST_INSERT_ID()"))
+            request_id = int(result.scalar_one())
+
+            # 2. INSERT в server_fsm_instances для процесса 'order_creation'
+            session.execute(
+                text(
+                    """
+                    INSERT INTO server_fsm_instances
+                        (entity_type, entity_id, process_name, fsm_state, attempts_count)
+                    VALUES
+                        (:entity_type, :entity_id, :process_name, :fsm_state, :attempts_count)
+                    """
+                ),
+                {
+                    "entity_type": "order_request",
+                    "entity_id": request_id,
+                    "process_name": "order_creation",
+                    "fsm_state": "WAITING_FOR_RESERVATION",
+                    "attempts_count": 0,
+                },
+            )
+
+            session.commit()
+            return request_id
+
+        except Exception as e:
+            session.rollback()
+            # Используем твой DbLayerError, который уже объявлен в db_layer.py
+            raise DbLayerError(f"create_order_request_and_fsm failed: {e}") from e
+
     def get_order(self, order_id: int) -> Optional[Dict]:
         """Вернуть заказ по ID."""
         row = self.session.execute(

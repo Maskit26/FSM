@@ -10,7 +10,8 @@ from models import (
     TripCreateRequest, TripResponse,
     FsmActionRequest, ApiResponse,
     UserCreateRequest, LockerCreateRequest,
-    CellCreateRequest, CellResponse, ButtonResponse
+    CellCreateRequest, CellResponse, ButtonResponse,
+    ClientCreateOrderRequest,
 )
 
 # ========== DATABASE SINGLETON ==========
@@ -174,6 +175,31 @@ async def create_order_smart(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка создания заказа: {str(e)}")
 
+@app.post("/api/client/create_order_request", response_model=dict)
+async def create_order_request(
+    payload: ClientCreateOrderRequest,
+    db: DatabaseLayer = Depends(get_db),
+):
+    """
+    Принимает 5 полей от клиента, создаёт запись в order_requests
+    и инстанс серверного FSM процесса 'order_creation'.
+    """
+    try:
+        request_id = db.create_order_request_and_fsm(
+            client_user_id=payload.client_user_id,
+            parcel_type=payload.parcel_type,
+            cell_size=payload.cell_size,
+            sender_delivery=payload.sender_delivery,
+            recipient_delivery=payload.recipient_delivery,
+        )
+
+        return {
+            "success": True,
+            "request_id": request_id,
+            "status": "PENDING",
+        }
+    except DbLayerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/orders/create", response_model=dict)
 async def create_order_manual(

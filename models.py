@@ -10,6 +10,13 @@ class OrderCreateRequest(BaseModel):
     dest_cell_id: Optional[int] = None
     delivery_type: Optional[str] = None
 
+class ClientCreateOrderRequest(BaseModel):
+    client_user_id: int
+    parcel_type: str
+    cell_size: str
+    sender_delivery: str
+    recipient_delivery: str
+
 class TripCreateRequest(BaseModel):
     from_city: str
     to_city: str
