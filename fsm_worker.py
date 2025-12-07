@@ -116,6 +116,7 @@ def main():
         try:
             rows = fetch_ready_instances(db)
             if not rows:
+                db.session.commit()
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
@@ -142,9 +143,11 @@ def main():
 
         except DbLayerError as e:
             print(f"[WORKER] DbLayerError: {e}")
+            db.session.rollback()
             time.sleep(POLL_INTERVAL_SECONDS)
         except Exception as e:
             print(f"[WORKER] Unexpected error: {e}")
+            db.session.rollback()
             time.sleep(POLL_INTERVAL_SECONDS)
 
 
