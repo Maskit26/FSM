@@ -1,13 +1,17 @@
 # fsm_worker.py
 
 import time
-from typing import Any
+from typing import Any, Dict
 
 from sqlalchemy import text
 
 from db_layer import DatabaseLayer, DbLayerError
-from fsm_actions import OrderCreationActions
-
+from fsm_engine import (
+    build_actions_context,
+    run_fsm_step,
+    FsmStepResult,
+    PROCESS_DEFS,
+)
 
 POLL_INTERVAL_SECONDS = 5
 BATCH_SIZE = 10
@@ -16,15 +20,23 @@ BATCH_SIZE = 10
 def fetch_ready_instances(db: DatabaseLayer):
     """
     Универсальный выбор процессов, готовых к обработке.
-    Сейчас: только WAITING_FOR_RESERVATION.
+    Пока берём только не завершённые процессы с next_timer_at <= NOW().
     """
     session = db.session
     rows = session.execute(
         text(
             """
-            SELECT id, entity_type, entity_id, process_name, fsm_state, attempts_count
+            SELECT
+                id,
+                entity_type,
+                entity_id,
+                process_name,
+                fsm_state,
+                next_timer_at,
+                attempts_count,
+                last_error
             FROM server_fsm_instances
-            WHERE fsm_state = 'WAITING_FOR_RESERVATION'
+            WHERE fsm_state NOT IN ('COMPLETED', 'FAILED')
               AND (next_timer_at IS NULL OR next_timer_at <= NOW())
             ORDER BY id
             LIMIT :limit
@@ -35,131 +47,58 @@ def fetch_ready_instances(db: DatabaseLayer):
     return rows
 
 
-def process_fsm_instance(
+def row_to_instance_dict(row: Any) -> Dict[str, Any]:
+    """
+    Преобразует строку server_fsm_instances в dict, чтобы удобно передавать в движок.
+    """
+    return {
+        "id": row[0],
+        "entity_type": row[1],
+        "entity_id": row[2],
+        "process_name": row[3],
+        "fsm_state": row[4],
+        "next_timer_at": row[5],
+        "attempts_count": row[6],
+        "last_error": row[7],
+    }
+
+
+def apply_fsm_result(
     db: DatabaseLayer,
-    order_actions: OrderCreationActions,
-    row: Any,
+    instance: Dict[str, Any],
+    result: FsmStepResult,
 ):
     """
-    Диспетчер: выбирает обработчик по process_name / fsm_state.
-    """
-    fsm_id = row[0]
-    entity_type = row[1]
-    entity_id = row[2]
-    process_name = row[3]
-    fsm_state = row[4]
-    attempts_count = row[5]
-
-    print(
-        f"[WORKER] instance_id={fsm_id}, "
-        f"entity_type={entity_type}, entity_id={entity_id}, "
-        f"process_name={process_name}, state={fsm_state}, attempts={attempts_count}"
-    )
-
-    if process_name == "order_creation" and fsm_state == "WAITING_FOR_RESERVATION":
-        handle_order_creation(db, order_actions, fsm_id, entity_id, attempts_count)
-    else:
-        print(f"[WORKER] Нет обработчика для process={process_name}, state={fsm_state}")
-
-
-def handle_order_creation(
-    db: DatabaseLayer,
-    actions: OrderCreationActions,
-    fsm_id: int,
-    request_id: int,
-    attempts_count: int,
-):
-    """
-    Обработчик процесса 'order_creation' на уровне движка:
-    - вызывает 2 action'а (поиск ячеек, создание заказа);
-    - по результату обновляет server_fsm_instances.
-    Все изменения в order_requests / orders / locker_cells делает actions.
+    Универсально обновляет server_fsm_instances по результату шага.
     """
     session = db.session
 
-    try:
-        # 1. Поиск ячеек
-        ok, src_id, dst_id, code = actions.find_cells_for_request(request_id)
-        if not ok:
-            # Процесс упал на этапе поиска ячеек
-            session.execute(
-                text(
-                    """
-                    UPDATE server_fsm_instances
-                    SET fsm_state = 'FAILED',
-                        last_error = :err,
-                        attempts_count = :attempts
-                    WHERE id = :fsm_id
-                    """
-                ),
-                {
-                    "fsm_id": fsm_id,
-                    "err": code or "CELLS_ERROR",
-                    "attempts": attempts_count + 1,
-                },
-            )
-            session.commit()
-            print(
-                f"[WORKER] order_creation FAILED on find_cells: "
-                f"request_id={request_id}, error={code}"
-            )
-            return
+    new_attempts = instance["attempts_count"] + (result.attempts_increment or 0)
 
-        # 2. Создание заказа из заявки
-        ok, order_id, code = actions.create_order_from_request(request_id, src_id, dst_id)
-        if not ok:
-            session.execute(
-                text(
-                    """
-                    UPDATE server_fsm_instances
-                    SET fsm_state = 'FAILED',
-                        last_error = :err,
-                        attempts_count = :attempts
-                    WHERE id = :fsm_id
-                    """
-                ),
-                {
-                    "fsm_id": fsm_id,
-                    "err": code or "ORDER_ERROR",
-                    "attempts": attempts_count + 1,
-                },
-            )
-            session.commit()
-            print(
-                f"[WORKER] order_creation FAILED on create_order: "
-                f"request_id={request_id}, error={code}"
-            )
-            return
-
-        # 3. Всё прошло успешно → помечаем процесс COMPLETED
-        session.execute(
-            text(
-                """
-                UPDATE server_fsm_instances
-                SET fsm_state = 'COMPLETED',
-                    last_error = NULL,
-                    attempts_count = :attempts
-                WHERE id = :fsm_id
-                """
-            ),
-            {
-                "fsm_id": fsm_id,
-                "attempts": attempts_count + 1,
-            },
-        )
-        session.commit()
-        print(
-            f"[WORKER] order_creation COMPLETED: "
-            f"request_id={request_id}, order_id={order_id}"
-        )
-
-    except Exception as e:
-        session.rollback()
-        print(f"[WORKER] Ошибка в handle_order_creation: {e}")
+    session.execute(
+        text(
+            """
+            UPDATE server_fsm_instances
+            SET fsm_state = :new_state,
+                last_error = :last_error,
+                next_timer_at = :next_timer_at,
+                attempts_count = :attempts,
+                updated_at = NOW()
+            WHERE id = :id
+            """
+        ),
+        {
+            "id": instance["id"],
+            "new_state": result.new_state,
+            "last_error": result.last_error,
+            "next_timer_at": result.next_timer_at,
+            "attempts": new_attempts,
+        },
+    )
+    session.commit()
 
 
 def main():
-    # Подключаемся теми же параметрами, что и main.py
     db = DatabaseLayer(
         host="localhost",
         port=3307,
@@ -168,9 +107,11 @@ def main():
         password="root",
         echo=False,
     )
-    order_actions = OrderCreationActions(db)
+    actions_ctx = build_actions_context(db)
 
     print("[WORKER] FSM worker started")
+    print(f"[WORKER] Loaded process definitions: {list(PROCESS_DEFS.keys())}")
+
     while True:
         try:
             rows = fetch_ready_instances(db)
@@ -179,7 +120,25 @@ def main():
                 continue
 
             for row in rows:
-                process_fsm_instance(db, order_actions, row)
+                instance = row_to_instance_dict(row)
+
+                print(
+                    f"[WORKER] instance_id={instance['id']}, "
+                    f"process={instance['process_name']}, "
+                    f"state={instance['fsm_state']}, "
+                    f"attempts={instance['attempts_count']}"
+                )
+
+                result = run_fsm_step(db, actions_ctx, instance)
+                if result is None:
+                    # Нет обработчика – просто пропускаем
+                    print(
+                        f"[WORKER] No handler for process={instance['process_name']} "
+                        f"state={instance['fsm_state']}"
+                    )
+                    continue
+
+                apply_fsm_result(db, instance, result)
 
         except DbLayerError as e:
             print(f"[WORKER] DbLayerError: {e}")
