@@ -101,10 +101,10 @@ def apply_fsm_result(
 def main():
     db = DatabaseLayer(
         host="localhost",
-        port=3307,
+        port=3306,
         database="testdb",
-        user="root",
-        password="root",
+        user="fsm",
+        password="6eF1zb",
         echo=False,
     )
     actions_ctx = build_actions_context(db)

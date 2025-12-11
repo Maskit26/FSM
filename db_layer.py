@@ -1,19 +1,19 @@
-"""
-ORM слой для работы с базой данных логистической системы.
+#"""
+#ORM слой для работы с базой данных логистической системы.
+#
+#FSM имена: trip_vzyat_reis, trip_start_trip (с подчёркиваниями!)
+#Все поля: from_city, to_city, driver_user_id (с подчёркиваниями!)
+#
+#Требования:
+#pip install sqlalchemy mysql-connector-python
 
-FSM имена: trip_vzyat_reis, trip_start_trip (с подчёркиваниями!)
-Все поля: from_city, to_city, driver_user_id (с подчёркиваниями!)
+#Использование:
+#from db_layer import DatabaseLayer, DbLayerError, FsmCallError
 
-Требования:
-pip install sqlalchemy mysql-connector-python
-
-Использование:
-from db_layer import DatabaseLayer, DbLayerError, FsmCallError
-
-db = DatabaseLayer(port=3307, password="root")
-order_id = db.create_order(...)
-trip_id, success, msg = db.assign_order_to_trip_smart(order_id, "Москва", "СПб")
-"""
+#db = DatabaseLayer(port=3306, password="6eF1zb")
+#order_id = db.create_order(...)
+#trip_id, success, msg = db.assign_order_to_trip_smart(order_id, "Москва", "СПб")
+#"""
 
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
@@ -38,10 +38,10 @@ class DatabaseLayer:
     def __init__(
         self,
         host: str = "localhost",
-        port: int = 3307,
+        port: int = 3306,
         database: str = "testdb",
-        user: str = "root",
-        password: str = "root",
+        user: str = "fsm",
+        password: str = "6eF1zb",
         echo: bool = False,
     ):
         """Инициализация подключения."""
