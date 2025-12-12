@@ -37,11 +37,11 @@ class FsmCallError(DbLayerError):
 class DatabaseLayer:
     def __init__(
         self,
-        host: str = "localhost",
-        port: int = 3306,
-        database: str = "testdb",
-        user: str = "fsm",
-        password: str = "6eF1zb",
+        host: str,
+        port: int,
+        database: str,
+        user: str,
+        password: str,
         echo: bool = False,
     ):
         """Инициализация подключения."""
@@ -72,7 +72,8 @@ class DatabaseLayer:
             "database": database,
             "user": user,
             "password": password,
-        }
+        }       
+        
 
     # ==================== FSM БАЗОВЫЙ ВЫЗОВ ====================
 

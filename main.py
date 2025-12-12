@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from typing import List, Optional
 import os
-
+from dotenv import load_dotenv
 from db_layer import DatabaseLayer, DbLayerError, FsmCallError
 from models import (
     OrderCreateRequest, OrderResponse,
@@ -13,7 +13,7 @@ from models import (
     CellCreateRequest, CellResponse, ButtonResponse,
     ClientCreateOrderRequest,
 )
-
+load_dotenv()
 # ========== DATABASE SINGLETON ==========
 db_instance: Optional[DatabaseLayer] = None
 

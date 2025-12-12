@@ -4,7 +4,8 @@ import time
 from typing import Any, Dict
 
 from sqlalchemy import text
-
+import os
+from dotenv import load_dotenv
 from db_layer import DatabaseLayer, DbLayerError
 from fsm_engine import (
     build_actions_context,
@@ -12,6 +13,7 @@ from fsm_engine import (
     FsmStepResult,
     PROCESS_DEFS,
 )
+load_dotenv()
 
 POLL_INTERVAL_SECONDS = 5
 BATCH_SIZE = 10
@@ -95,26 +97,25 @@ def apply_fsm_result(
             "attempts": new_attempts,
         },
     )
-    session.commit()
+    session.commit()    
 
-
-def main():
+def main():    
     db = DatabaseLayer(
-        host="localhost",
-        port=3306,
-        database="testdb",
-        user="fsm",
-        password="6eF1zb",
-        echo=False,
-    )
+    host=os.getenv("DB_HOST", "127.0.0.1"),
+    port=int(os.getenv("DB_PORT", "3306")),
+    database=os.getenv("DB_NAME", "testdb"),
+    user=os.getenv("DB_USER", "fsm"),
+    password=os.getenv("DB_PASSWORD", "6eF1zb"),
+    echo=False,
+)
     actions_ctx = build_actions_context(db)
 
     print("[WORKER] FSM worker started")
     print(f"[WORKER] Loaded process definitions: {list(PROCESS_DEFS.keys())}")
 
     while True:
-        try:
-            rows = fetch_ready_instances(db)
+        try:            
+            rows = fetch_ready_instances(db)            
             if not rows:
                 db.session.commit()
                 time.sleep(POLL_INTERVAL_SECONDS)
@@ -136,6 +137,8 @@ def main():
                     print(
                         f"[WORKER] No handler for process={instance['process_name']} "
                         f"state={instance['fsm_state']}"
+                        f"new_state={getattr(result, 'new_state', None)},",
+                        f"last_error={getattr(result, 'last_error', None)}",
                     )
                     continue
 
