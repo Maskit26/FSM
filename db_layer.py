@@ -188,7 +188,7 @@ class DatabaseLayer:
                 """
                 UPDATE stage_orders
                 SET courier_user_id = :cid
-                WHERE orderid = :oid
+                WHERE order_id = :oid
                 AND leg = 'pickup'
                 """
             ),
@@ -233,6 +233,36 @@ class DatabaseLayer:
             {"trip_id": trip_id, "order_id": order_id, "cid": courier_id},
         )
         session.commit()
+
+    def create_stage_order(self, trip_id: int, order_id: int, leg: str, courier_user_id: Optional[int] = None):
+        """
+        Создаёт запись в stage_orders.
+        
+        Args:
+            trip_id: ID рейса
+            order_id: ID заказа
+            leg: 'pickup' или 'delivery'
+            courier_user_id: ID курьера (или None если ещё не назначен)
+        """
+        session = self.session
+        
+        session.execute(
+            text(
+                """
+                INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id)
+                VALUES (:trip_id, :order_id, :leg, :courier_user_id)
+                """
+            ),
+            {
+                "trip_id": trip_id,
+                "order_id": order_id,
+                "leg": leg,
+                "courier_user_id": courier_user_id
+            }
+        )
+        session.commit()
+        
+        print(f"[DB] Создан stage_order: trip={trip_id}, order={order_id}, leg={leg}, courier={courier_user_id}")
 
     def order_pickup_by_driver(self, order_id: int, driver_id: int) -> bool:
         """Водитель забирает заказ из постамата (FSM: order_pickup_by_voditel)."""
@@ -798,6 +828,67 @@ class DatabaseLayer:
         except Exception as e:
             self.session.rollback()
             raise DbLayerError(f"Резерв ячеек для заказа {order_id}: {e}") from e
+    
+    def enqueue_fsm_instance(
+        self,
+        entity_type: str,
+        entity_id: int,
+        process_name: str,
+        fsm_state: str,
+        requested_by_user_id: int,
+        requested_user_role: str,
+        target_user_id: Optional[int] = None,
+        target_role: Optional[str] = None,
+    ) -> int:
+        session = self.session
+        try:
+            session.execute(text("""
+                INSERT INTO server_fsm_instances (
+                    entity_type, entity_id, process_name, fsm_state, attempts_count,
+                    requested_by_user_id, requested_user_role,
+                    target_user_id, target_role,
+                    last_error, next_timer_at
+                ) VALUES (
+                    :entity_type, :entity_id, :process_name, :fsm_state, 0,
+                    :requested_by_user_id, :requested_user_role,
+                    :target_user_id, :target_role,
+                    NULL, NULL
+                )
+                ON DUPLICATE KEY UPDATE
+                    fsm_state = VALUES(fsm_state),
+                    attempts_count = 0,
+                    last_error = NULL,
+                    next_timer_at = NULL,
+                    requested_by_user_id = VALUES(requested_by_user_id),
+                    requested_user_role = VALUES(requested_user_role),
+                    target_user_id = VALUES(target_user_id),
+                    target_role = VALUES(target_role),
+                    updated_at = NOW()
+            """), {
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "process_name": process_name,
+                "fsm_state": fsm_state,
+                "requested_by_user_id": requested_by_user_id,
+                "requested_user_role": requested_user_role,
+                "target_user_id": target_user_id,
+                "target_role": target_role,
+            })
+
+            row = session.execute(text("""
+                SELECT id
+                FROM server_fsm_instances
+                WHERE entity_type=:entity_type AND entity_id=:entity_id AND process_name=:process_name
+                LIMIT 1
+            """), {"entity_type": entity_type, "entity_id": entity_id, "process_name": process_name}).fetchone()
+
+            session.commit()
+            if not row:
+                raise DbLayerError("enqueue_fsm_instance: cannot read back instance id")
+            return int(row[0])
+        except Exception as e:
+            session.rollback()
+            raise DbLayerError(f"enqueue_fsm_instance failed: {e}") from e
 
     # ==================== ЗАКАЗЫ ====================
 
@@ -1189,6 +1280,15 @@ class DatabaseLayer:
         ]
 
     # ==================== РЕЙСЫ ====================
+
+    def set_driver_in_trip(self, trip_id: int, driver_id: int):
+        """Назначить водителя на рейс (в trips.driver_user_id)."""
+        session = self.session
+        session.execute(
+            text("UPDATE trips SET driver_user_id = :driver_id WHERE id = :trip_id"),
+            {"driver_id": driver_id, "trip_id": trip_id}
+        )
+        session.commit()
 
     def create_trip(
         self,
