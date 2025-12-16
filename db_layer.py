@@ -783,6 +783,32 @@ class DatabaseLayer:
             self.session.rollback()
             raise DbLayerError(f"Ячейки постамата {locker_id}: {e}") from e
 
+    def reserve_cells_for_order_in_session(self, order_id: int, source_cell_id: int, dest_cell_id: int):
+        """
+        Резервирует две ячейки для заказа в ТЕКУЩЕЙ транзакции (без FSM).
+        Используется внутри create_order_from_request чтобы избежать блокировок.
+        
+        Args:
+            order_id: ID заказа
+            source_cell_id: ID ячейки отправки
+            dest_cell_id: ID ячейки получения
+        """
+        session = self.session
+        
+        session.execute(
+            text(
+                """
+                UPDATE locker_cells
+                SET status = 'locker_reserved', current_order_id = :order_id
+                WHERE id IN (:src_id, :dst_id)
+                """
+            ),
+            {"order_id": order_id, "src_id": source_cell_id, "dst_id": dest_cell_id},
+        )
+        # НЕ commit - commit будет в конце всей транзакции
+        
+        print(f"[DB] Зарезервированы ячейки {source_cell_id}, {dest_cell_id} для заказа {order_id}")
+
     def reserve_cells_for_order(
         self,
         order_id: int,
@@ -1294,23 +1320,28 @@ class DatabaseLayer:
         self,
         from_city: str,
         to_city: str,
+        pickup_locker_id: int,
+        delivery_locker_id: int,
         driver_user_id: Optional[int] = None,
         description: Optional[str] = None,
         active: int = 0,
     ) -> int:
         """Создать рейс."""
+        session = self.session
         try:
-            self.session.execute(
+            session.execute(
                 text(
-                    "INSERT INTO trips "
-                    "(driver_user_id, from_city, to_city, status, description, active) "
-                    "VALUES (:driver_user_id, :from_city, :to_city, 'trip_created', :description, :active)"
+                    "INSERT INTO trips (from_city, to_city, pickup_locker_id, delivery_locker_id, "
+                    "driver_user_id, active, status) "
+                    "VALUES (:from_city, :to_city, :pickup_locker_id, :delivery_locker_id, "
+                    ":driver_user_id, :active, 'trip_created')"
                 ),
                 {
-                    "driver_user_id": driver_user_id,
                     "from_city": from_city,
                     "to_city": to_city,
-                    "description": description,
+                    "pickup_locker_id": pickup_locker_id,
+                    "delivery_locker_id": delivery_locker_id,
+                    "driver_user_id": driver_user_id,
                     "active": active,
                 },
             )
@@ -1432,17 +1463,19 @@ class DatabaseLayer:
 
             # 3. Лимит 5 заказов на рейс
             trip_count = session.execute(
-                text("SELECT COUNT(*) FROM stage_orders WHERE trip_id = :trip_id"),
+                text("SELECT COUNT(DISTINCT order_id) FROM stage_orders WHERE trip_id = :trip_id"),
                 {"trip_id": trip_id},
             ).scalar()
+            print(f"[DEBUG assign] trip_id={trip_id}, trip_count={trip_count}")
             if trip_count is not None and trip_count >= 5:
                 return False, "На рейсе уже 5 заказов"
 
             # 4. Вставка
             session.execute(
                 text(
-                    "INSERT INTO stage_orders (trip_id, order_id, leg) "
-                    "VALUES (:trip_id, :order_id, 'pickup')"
+                    "INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id) "
+                    "VALUES (:trip_id, :order_id, 'pickup', NULL), "
+                    "       (:trip_id, :order_id, 'delivery', NULL)"
                 ),
                 {"trip_id": trip_id, "order_id": order_id},
             )
@@ -1458,62 +1491,78 @@ class DatabaseLayer:
     ) -> Tuple[int, bool, str]:
         """
         Умная привязка заказа к рейсу:
-        - ищет существующий рейс по маршруту с <5 заказов
+        - ищет существующий рейс по локерам с <5 заказов
         - если не находит, создаёт новый
         """
         session = self.session
         try:
-            # 1. Проверка маршрута заказа
-            order_route = session.execute(
+            # 1. Получаем локеры из заказа
+            order_data = session.execute(
                 text(
-                    "SELECT from_city, to_city "
-                    "FROM orders WHERE id = :order_id"
+                    "SELECT o.from_city, o.to_city, "
+                    "lc1.locker_id as pickup_locker, lc2.locker_id as delivery_locker "
+                    "FROM orders o "
+                    "JOIN locker_cells lc1 ON lc1.id = o.source_cell_id "
+                    "JOIN locker_cells lc2 ON lc2.id = o.dest_cell_id "
+                    "WHERE o.id = :order_id"
                 ),
                 {"order_id": order_id},
             ).fetchone()
-            if not order_route or (
-                order_route[0] != order_from_city
-                or order_route[1] != order_to_city
-            ):
+            
+            if not order_data:
+                raise DbLayerError(f"Заказ {order_id} или его локеры не найдены")
+            
+            from_city, to_city, pickup_locker_id, delivery_locker_id = order_data
+            
+            if from_city != order_from_city or to_city != order_to_city:
                 raise DbLayerError(f"Маршрут заказа {order_id} не совпадает")
 
-            # 2. Ищем существующий рейс (<5 заказов)
+            # 2. Ищем существующий рейс по локерам (<5 заказов)
             potential_trip = session.execute(
                 text(
                     """
                     SELECT t.id
                     FROM trips t
                     LEFT JOIN (
-                        SELECT trip_id, COUNT(*) AS cnt
+                        SELECT trip_id, COUNT(DISTINCT order_id) AS cnt
                         FROM stage_orders
                         GROUP BY trip_id
                     ) so ON so.trip_id = t.id
-                    WHERE t.from_city = :from_city
-                      AND t.to_city = :to_city
+                    WHERE t.pickup_locker_id = :pickup_locker_id
+                      AND t.delivery_locker_id = :delivery_locker_id
                       AND t.status IN ('trip_created', 'trip_assigned')
+                      AND t.active = 0
                       AND (so.cnt IS NULL OR so.cnt < 5)
+                    ORDER BY t.id ASC
                     LIMIT 1
                     """
                 ),
-                {"from_city": order_from_city, "to_city": order_to_city},
+                {
+                    "pickup_locker_id": pickup_locker_id, 
+                    "delivery_locker_id": delivery_locker_id
+                },
             ).fetchone()
 
             if potential_trip:
                 trip_id = potential_trip[0]
-                print(f"[DEBUG smart] Используем существующий рейс: {trip_id}")
+                print(f"[DEBUG smart] Используем существующий рейс: {trip_id} (локеры {pickup_locker_id}→{delivery_locker_id})")
             else:
-                # 3. Создаём новый рейс без водителя
+                # 3. Создаём новый рейс с локерами
                 trip_id = self.create_trip(
-                    order_from_city, order_to_city, driver_user_id=None, active=0
+                    order_from_city, order_to_city, 
+                    pickup_locker_id, delivery_locker_id,
+                    driver_user_id=None, active=0
                 )
-                print(f"[DEBUG smart] Создан новый рейс: {trip_id}")
+                print(f"[DEBUG smart] Создан новый рейс: {trip_id} (локеры {pickup_locker_id}→{delivery_locker_id})")
 
             # 4. Привязываем заказ
             success, msg = self.assign_order_to_trip(order_id, trip_id)
             if (not success) and ("5 заказов" in msg):
                 print("[DEBUG smart] Рейс полон, создаём новый рейс")
                 trip_id = self.create_trip(
-                    order_from_city, order_to_city, driver_user_id=None, active=0
+                    order_from_city, order_to_city,
+                    pickup_locker_id, delivery_locker_id,
+                    driver_user_id=None, active=0
                 )
                 success, msg = self.assign_order_to_trip(order_id, trip_id)
 
@@ -1523,7 +1572,6 @@ class DatabaseLayer:
             raise DbLayerError(
                 f"Ошибка умной привязки заказа {order_id}: {e}"
             ) from e
-
     
     def update_trip_active_flags(self, max_orders: int = 5, wait_hours: float = 24.0) -> int:
         """
@@ -1541,7 +1589,7 @@ class DatabaseLayer:
         rows = session.execute(
             text(
                 """
-                SELECT t.id, t.created_at, COUNT(o.id) AS order_count
+                SELECT t.id, t.created_at, COUNT(DISTINCT o.id) AS order_count
                 FROM trips t
                 LEFT JOIN stage_orders so ON so.trip_id = t.id
                 LEFT JOIN orders o ON o.id = so.order_id 
