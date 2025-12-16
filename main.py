@@ -11,7 +11,7 @@ from models import (
     FsmActionRequest, ApiResponse,
     UserCreateRequest, LockerCreateRequest,
     CellCreateRequest, CellResponse, ButtonResponse,
-    ClientCreateOrderRequest,
+    ClientCreateOrderRequest, FsmEnqueueRequest,
 )
 load_dotenv()
 # ========== DATABASE SINGLETON ==========
@@ -401,6 +401,32 @@ async def get_exchange_orders_delivery(
         }
     except DbLayerError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/fsm/enqueue", response_model=ApiResponse)
+async def enqueue_fsm_request(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(get_db)):
+    # 1) Проверяем пользователя (пока userid приходит от фронта в body)
+    role = db.get_user_role(request.user_id)
+    if not role:
+        raise HTTPException(status_code=404, detail=f"User {request.userid} not found")
+
+    # 2) Создаём/обновляем инстанс (заявку) в serverfsminstances
+    try:
+        instance_id = db.enqueue_fsm_instance(
+            entity_type=request.entity_type,
+            entity_id=request.entity_id,
+            process_name=request.process_name,
+            fsm_state="PENDING",
+            requested_by_user_id=request.user_id,
+            requested_user_role=role,
+            target_user_id=request.target_user_id,
+            target_role=request.target_role,
+        )
+        return ApiResponse(success=True, message="ENQUEUED", data={"instance_id": instance_id})
+
+    except DbLayerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 # ==================== TRIPS ENDPOINTS ====================
 
