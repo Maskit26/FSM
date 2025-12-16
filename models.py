@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 
 # ========== REQUEST MODELS ==========
 class OrderCreateRequest(BaseModel):
@@ -47,6 +47,15 @@ class CellCreateRequest(BaseModel):
     locker_id: int
     cell_code: str
     cell_type: str = "S"
+
+class FsmEnqueueRequest(BaseModel):
+    entity_type: str        # 'order' | 'trip' ...
+    entity_id: int
+    process_name: str       # например 'order_assign_courier1'
+    user_id: int
+    target_user_id: Optional[int] = None
+    target_role: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 # ========== RESPONSE MODELS ==========
 class OrderResponse(BaseModel):
