@@ -35,6 +35,8 @@ def fetch_ready_instances(db: DatabaseLayer):
                 next_timer_at,
                 attempts_count,
                 last_error,
+                requested_by_user_id,
+                requested_user_role,
                 target_user_id,
                 target_role  
             FROM server_fsm_instances
@@ -60,8 +62,10 @@ def row_to_instance_dict(row: Any) -> Dict[str, Any]:
         "next_timer_at": row[5],
         "attempts_count": row[6],
         "last_error": row[7],
-        "target_user_id": row[8],
-        "target_role": row[9],
+        "requested_by_user_id": row[8],
+        "requested_user_role": row[9],
+        "target_user_id": row[10],
+        "target_role": row[11],        
     }
 
 def apply_fsm_result(
@@ -74,6 +78,16 @@ def apply_fsm_result(
     """
     session = db.session
     new_attempts = instance["attempts_count"] + (result.attempts_increment or 0)
+    if result.new_state == "FAILED":
+        print(f"[FSM] FAILED: instance_id={instance['id']}, "
+              f"process={instance['process_name']}, "
+              f"entity={instance['entity_type']}/{instance['entity_id']}, "
+              f"user_id={instance['requested_by_user_id']}, "
+              f"error: {result.last_error}")
+    else:
+        print(f"[FSM] {result.new_state}: instance_id={instance['id']}, "
+              f"process={instance['process_name']}, "
+              f"entity={instance['entity_type']}/{instance['entity_id']}")
     session.execute(
         text("""
             UPDATE server_fsm_instances
@@ -146,6 +160,8 @@ def main():
                     continue
 
                 apply_fsm_result(db, instance, result)
+                
+                print(f"[WORKER] ✅ Обновлено: instance_id={instance['id']}, new_state={result.new_state}")
 
         except DbLayerError as e:
             print(f"[WORKER] DbLayerError: {e}")

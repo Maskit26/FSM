@@ -1020,7 +1020,7 @@ class DatabaseLayer:
                     "entity_type": "order_request",
                     "entity_id": request_id,
                     "process_name": "order_creation",
-                    "fsm_state": "WAITING_FOR_RESERVATION",
+                    "fsm_state": "PENDING",
                     "attempts_count": 0,
                 },
             )

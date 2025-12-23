@@ -409,13 +409,16 @@ async def enqueue_fsm_request(request: FsmEnqueueRequest, db: DatabaseLayer = De
     if not role:
         raise HTTPException(status_code=404, detail=f"User {request.userid} not found")
 
+    # 2) ОПРЕДЕЛЯЕМ fsm_state по process_name
+    fsm_state = "PENDING"
+
     # 2) Создаём/обновляем инстанс (заявку) в serverfsminstances
     try:
         instance_id = db.enqueue_fsm_instance(
             entity_type=request.entity_type,
             entity_id=request.entity_id,
             process_name=request.process_name,
-            fsm_state="PENDING",
+            fsm_state=fsm_state,
             requested_by_user_id=request.user_id,
             requested_user_role=role,
             target_user_id=request.target_user_id,

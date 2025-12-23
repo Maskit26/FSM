@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, Any, Optional
 
 from db_layer import DatabaseLayer, DbLayerError
-from fsm_actions import OrderCreationActions, AssignmentActions
+from fsm_actions import (
+    OrderCreationActions, 
+    AssignmentActions, 
+    CourierCellActions,
+    CourierErrorActions, 
+    OperatorActions
+)
 
 
 @dataclass
@@ -23,12 +29,12 @@ FsmStateHandler = Callable[[DatabaseLayer, Dict[str, Any], Dict[str, Any]], FsmS
 
 # ==================== ORDER CREATION ====================
 
-def _handle_order_creation_waiting(
+def _handle_order_creation_pending(
     db: DatabaseLayer,
     ctx: Dict[str, Any],
     instance: Dict[str, Any],
 ) -> FsmStepResult:
-    """Обработчик состояния WAITING_FOR_RESERVATION для процесса 'order_creation'."""
+    """Обработчик состояния PENDING для процесса 'order_creation'."""
     actions: OrderCreationActions = ctx["order_creation_actions"]
     fsm_id = instance["id"]
     request_id = instance["entity_id"]
@@ -147,12 +153,139 @@ def _handle_assign_executor_pending(
         attempts_increment=1,
     )
 
+# ==================== РАБОТА С ПОСТАМАТОМ =================
+
+def _handle_courier_open_cell(
+    db: DatabaseLayer,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any],
+) -> FsmStepResult:
+    """
+    Курьер открывает ячейку (single-step процесс).
+    """
+    actions: CourierCellActions = ctx["courier_cell_actions"]
+    
+    order_id = instance["entity_id"]
+    courier_id = instance["requested_by_user_id"]
+    
+    success, error = actions.open_cell(order_id, courier_id)
+    
+    if not success:
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=error or "OPEN_FAILED",
+        )    
+    
+    print(f"[FSM] ✅ courier_open_cell COMPLETED: order={order_id}, courier={courier_id}")
+    return FsmStepResult(new_state="COMPLETED")
+
+def _handle_courier_close_cell(
+    db: DatabaseLayer,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any],
+) -> FsmStepResult:
+    """
+    Курьер закрывает ячейку (универсальный handler).
+    """
+    actions: CourierCellActions = ctx["courier_cell_actions"]
+    
+    order_id = instance["entity_id"]
+    courier_id = instance["requested_by_user_id"]
+    
+    success, error = actions.close_cell(order_id, courier_id)
+    
+    if not success:
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=error or "CLOSE_FAILED",
+        )
+    
+    return FsmStepResult(new_state="COMPLETED")
+
+
+# ==================== КУРЬЕРЫ: Ошибки и отмена ====================
+
+def _handle_courier_cancel_order(
+    db: DatabaseLayer,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any],
+) -> FsmStepResult:
+    """Курьер отменяет заказ."""
+    actions: CourierErrorActions = ctx["courier_error_actions"]
+    
+    order_id = instance["entity_id"]
+    courier_id = instance["requested_by_user_id"]
+    
+    success, error = actions.cancel_order(order_id, courier_id)
+    
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+    
+    return FsmStepResult(new_state="COMPLETED")
+
+
+def _handle_courier_locker_error(
+    db: DatabaseLayer,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any],
+) -> FsmStepResult:
+    """Курьер сообщает об ошибке с ячейкой."""
+    actions: CourierErrorActions = ctx["courier_error_actions"]
+    
+    order_id = instance["entity_id"]
+    courier_id = instance["requested_by_user_id"]
+    
+    success, error = actions.locker_error(order_id, courier_id)
+    
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+    
+    return FsmStepResult(new_state="COMPLETED")
+
+# ==================== РАБОТА ОПЕРАТОРА ====================
+
+def _handle_operator_reset_locker(
+    db: DatabaseLayer,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any],
+) -> FsmStepResult:
+    """Оператор сбрасывает ячейку в locker_free."""
+    actions: OperatorActions = ctx["operator_actions"]
+    
+    cell_id = instance["entity_id"]
+    operator_id = instance["requested_by_user_id"]
+    
+    success, error = actions.reset_locker(cell_id, operator_id)
+    
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+    
+    return FsmStepResult(new_state="COMPLETED")
+
+
+def _handle_operator_set_maintenance(
+    db: DatabaseLayer,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any],
+) -> FsmStepResult:
+    """Оператор переводит ячейку в обслуживание."""
+    actions: OperatorActions = ctx["operator_actions"]
+    
+    cell_id = instance["entity_id"]
+    operator_id = instance["requested_by_user_id"]
+    
+    success, error = actions.set_locker_maintenance(cell_id, operator_id)
+    
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+    
+    return FsmStepResult(new_state="COMPLETED")
 
 # ==================== РЕЕСТР ПРОЦЕССОВ ====================
 
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "order_creation": {
-        "WAITING_FOR_RESERVATION": _handle_order_creation_waiting,
+        "PENDING": _handle_order_creation_pending,
     },
     "order_assign_courier1": {
         "PENDING": _handle_assign_executor_pending,
@@ -163,6 +296,24 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "trip_assign_driver": {
         "PENDING": _handle_assign_executor_pending,
     },
+    "courier_open_cell": {
+    "PENDING": _handle_courier_open_cell,
+    },
+    "courier_close_cell": {
+        "PENDING": _handle_courier_close_cell,
+    },
+    "courier_cancel_order": {
+        "PENDING": _handle_courier_cancel_order,
+    },
+    "courier_locker_error": {
+        "PENDING": _handle_courier_locker_error,
+    },
+    "operator_reset_locker": {
+        "PENDING": _handle_operator_reset_locker,
+    },
+    "operator_set_maintenance": {
+        "PENDING": _handle_operator_set_maintenance,
+    },
 }
 
 
@@ -171,6 +322,9 @@ def build_actions_context(db: DatabaseLayer) -> Dict[str, Any]:
     return {
         "order_creation_actions": OrderCreationActions(db),
         "assignment_actions": AssignmentActions(db),
+        "courier_cell_actions": CourierCellActions(db),
+        "courier_error_actions": CourierErrorActions(db),
+        "operator_actions": OperatorActions(db),
     }
 
 
