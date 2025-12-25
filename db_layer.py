@@ -1103,8 +1103,7 @@ class DatabaseLayer:
                 description,
                 pickup_type,
                 delivery_type,
-                from_city,
-                to_city,
+                parcel_type,
                 source_cell_id,
                 dest_cell_id
             FROM orders
@@ -1126,10 +1125,9 @@ class DatabaseLayer:
                 "description": row[2],
                 "pickup_type": row[3],
                 "delivery_type": row[4],
-                "from_city": row[5],
-                "to_city": row[6],
-                "source_cell_id": row[7],
-                "dest_cell_id": row[8],
+                "parcel_type": row[5],
+                "source_cell_id": row[6],
+                "dest_cell_id": row[7],
             }
             for row in rows
         ]
