@@ -327,356 +327,362 @@ class AssignmentActions:
 
 # =========== РАБОТА С ПОСТАМАТОМ ===========================
 
-class CourierCellActions:
-    """
-    Действия курьеров с ячейками постаматов.
-
-    """
-    
+class ClientActions:
+    """Действия клиента (отправителя)."""
     def __init__(self, db: DatabaseLayer):
         self.db = db
         self.session = db.session
-    
-    def _determine_leg(self, order_status: str) -> str:
-        """
-        Определяет leg (pickup/delivery) по статусу заказа.
-        
-        Returns:
-            "pickup" для курьера1 (забор от клиента)
-            "delivery" для курьера2 (доставка получателю)
-        """
-        pickup_statuses = [
-            "order_courier1_assigned",
-            "order_courier_has_parcel"
-        ]
-        
-        delivery_statuses = [
-            "order_courier2_assigned",
-            "order_courier2_has_parcel"
-        ]
-        
-        if order_status in pickup_statuses:
-            return "pickup"
-        elif order_status in delivery_statuses:
-            return "delivery"
+
+    def _get_source_cell_id(self, order_id: int) -> int:
+        order = self.db.get_order(order_id)
+        if not order or not order.get("source_cell_id"):
+            raise DbLayerError(f"Нет source_cell_id для заказа {order_id}")
+        return order["source_cell_id"]
+
+    def open_cell_for_client(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Клиент открывает ячейку отправки (locker_reserved → locker_opened)."""
+        try:
+            cell_id = self._get_source_cell_id(order_id)
+            self.db.open_locker_for_recipient(cell_id, user_id, "")
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def close_cell_for_client(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Клиент закрывает ячейку после помещения посылки."""
+        try:
+            cell_id = self._get_source_cell_id(order_id)
+            # Подтверждаем посылку в заказе
+            self.db.order_confirm_parcel_in(order_id, user_id)
+            # Закрываем ячейку → locker_occupied
+            self.db.close_locker(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def cancel_order(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Клиент отменяет заказ до передачи."""
+        try:
+            # 1. Получаем заказ
+            order = self.db.get_order(order_id)
+            if not order:
+                return False, "ORDER_NOT_FOUND"
+
+            # 2. Отменяем заказ (FSM: order_created → order_cancelled)
+            self.db.order_cancel_reservation(order_id, user_id)
+
+            # 3. Сбрасываем резерв ячеек
+            src_id = order.get("source_cell_id")
+            dst_id = order.get("dest_cell_id")
+            if src_id:
+                self.db.cancel_locker_reservation(src_id, user_id)
+            if dst_id:
+                self.db.cancel_locker_reservation(dst_id, user_id)
+
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def report_locker_error(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Клиент сообщает, что ячейка не закрылась."""
+        try:
+            cell_id = self._get_source_cell_id(order_id)
+            self.db.locker_not_closed(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+
+class RecipientActions:
+    """Действия получателя."""
+    def __init__(self, db: DatabaseLayer):
+        self.db = db
+        self.session = db.session
+
+    def _get_dest_cell_id(self, order_id: int) -> int:
+        order = self.db.get_order(order_id)
+        if not order or not order.get("dest_cell_id"):
+            raise DbLayerError(f"Нет dest_cell_id для заказа {order_id}")
+        return order["dest_cell_id"]
+
+    def open_cell_for_recipient(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Получатель открывает ячейку получения."""
+        try:
+            cell_id = self._get_dest_cell_id(order_id)
+            self.db.open_locker_for_recipient(cell_id, user_id, "")
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def close_cell_for_recipient(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Получатель закрывает пустую ячейку."""
+        try:
+            cell_id = self._get_dest_cell_id(order_id)
+            self.db.close_locker_pickup(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def report_locker_error(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        try:
+            cell_id = self._get_dest_cell_id(order_id)
+            self.db.locker_not_closed(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+
+class DriverActions:
+    """Действия водителя с ячейками."""
+    def __init__(self, db: DatabaseLayer):
+        self.db = db
+        self.session = db.session
+
+    def _get_active_trip_for_driver(self, driver_id: int) -> dict:
+        trips = self.db.get_active_trips_for_driver(driver_id)
+        if not trips:
+            raise DbLayerError("Нет активного рейса у водителя")
+        return trips[0]
+
+    def _determine_intent(self, cell_id: int, trip: dict) -> str:
+        locker_id = self.session.execute(
+            text("SELECT locker_id FROM locker_cells WHERE id = :cell_id"),
+            {"cell_id": cell_id}
+        ).scalar()
+        if locker_id == trip["pickup_locker_id"]:
+            return "pickup"   # Забирает из locker_occupied
+        elif locker_id == trip["delivery_locker_id"]:
+            return "delivery" # Кладёт в locker_reserved
         else:
-            return "unknown"
-    
-    def open_cell(self, order_id: int, courier_id: int) -> Tuple[bool, str]:
-        """
-        Открывает ячейку для курьера (используя готовые методы db_layer).
-        
-        Курьер1 (pickup leg):
-        - db.order_courier1_pickup_parcel() → order_courier_has_parcel
-        - db.open_locker_for_recipient() → locker_opened
-        
-        Курьер2 (delivery leg):
-        - db.order_courier2_pickup_parcel() → order_courier2_has_parcel
-        - db.open_locker_for_recipient() → locker_opened
-        
-        Args:
-            order_id: ID заказа
-            courier_id: ID курьера (роль = "courier")
-        
-        Returns:
-            (success, error_code)
-        """
+            raise DbLayerError(f"Ячейка {cell_id} не относится к рейсу")
+
+    def open_cell_for_driver(self, cell_id: int, user_id: int) -> Tuple[bool, str]:
+        """Водитель открывает ячейку (locker_occupied или locker_reserved → locker_opened)."""
         try:
-            order = self.db.get_order(order_id)
-            if not order:
-                return False, "ORDER_NOT_FOUND"
-            
-            # Определяем leg по статусу заказа
-            leg = self._determine_leg(order["status"])
-            
-            if leg == "pickup":
-                # Курьер1 (забор от клиента на POST1)
-                cell_id = order["source_cell_id"]
-                expected_status = "order_courier1_assigned"
-                
-                # FSM переход 1: Order (курьер1 взял посылку)
-                self.db.order_courier1_pickup_parcel(order_id, courier_id)
-                
-            elif leg == "delivery":
-                # Курьер2 (доставка получателю с POST2)
-                cell_id = order["dest_cell_id"]
-                expected_status = "order_courier2_assigned"
-                
-                # FSM переход 1: Order (курьер2 открыл ячейку)
-                self.db.order_courier2_pickup_parcel(order_id, courier_id)
-                
-            else:
-                return False, f"CANNOT_DETERMINE_LEG_FOR_STATUS_{order['status']}"
-            
-            if not cell_id:
-                return False, f"NO_CELL_FOR_LEG_{leg}"
-            
-            # FSM переход 2: Locker (открыть ячейку)
-            # Используем готовый метод с unlock_code (или пустой строкой)
-            self.db.open_locker_for_recipient(cell_id, courier_id, unlock_code="")
-            
-            print(f"[COURIER_CELL] ✅ Курьер ({leg}) открыл ячейку {cell_id} для заказа {order_id}")
+            trip = self._get_active_trip_for_driver(user_id)
+            intent = self._determine_intent(cell_id, trip)
+            # Открытие одинаково для обоих случаев
+            self.db.open_locker_for_recipient(cell_id, user_id, "")
             return True, ""
-            
-        except FsmCallError as e:
-            print(f"[COURIER_CELL] ❌ FSM ошибка открытия: {e}")
-            self.session.rollback()
-            return False, str(e)
-        except Exception as e:
-            print(f"[COURIER_CELL] ❌ Ошибка открытия: {e}")
-            self.session.rollback()
-            return False, str(e)
-    
-    def close_cell(self, order_id: int, courier_id: int) -> Tuple[bool, str]:
-        """
-        Закрывает ячейку и делает переход по заказу.
-        
-        Курьер1 (pickup leg):
-        - db.order_confirm_parcel_in() → order_parcel_confirmed
-        - db.close_locker() → locker_occupied
-        
-        Курьер2 (delivery leg):
-        - db.order_courier2_delivered_parcel() → order_courier2_parcel_delivered
-        - db.close_locker_pickup() → locker_closed_empty
-        
-        Args:
-            order_id: ID заказа
-            courier_id: ID курьера
-        
-        Returns:
-            (success, error_code)
-        """
-        try:
-            order = self.db.get_order(order_id)
-            if not order:
-                return False, "ORDER_NOT_FOUND"
-            
-            # Определяем leg
-            leg = self._determine_leg(order["status"])
-            
-            if leg == "pickup":
-                # Курьер1 закрывает POST1
-                cell_id = order["source_cell_id"]
-                expected_status = "order_courier_has_parcel"
-                
-                # FSM переход 1: Order (подтвердить посылку в ячейке)
-                self.db.order_confirm_parcel_in(order_id, courier_id)
-                
-                # FSM переход 2: Locker (закрыть ячейку → locker_occupied)
-                self.db.close_locker(cell_id, courier_id)
-                
-            elif leg == "delivery":
-                # Курьер2 закрывает POST2
-                cell_id = order["dest_cell_id"]
-                expected_status = "order_courier2_has_parcel"
-                
-                # FSM переход 1: Order (курьер2 доставил посылку)
-                self.db.order_courier2_delivered_parcel(order_id, courier_id)
-                
-                # FSM переход 2: Locker (закрыть ячейку → locker_closed_empty)
-                self.db.close_locker_pickup(cell_id, courier_id)
-                
-            else:
-                return False, f"CANNOT_DETERMINE_LEG_FOR_STATUS_{order['status']}"
-            
-            if not cell_id:
-                return False, f"NO_CELL_FOR_LEG_{leg}"
-            
-            print(f"[COURIER_CELL] ✅ Курьер ({leg}) закрыл ячейку {cell_id} для заказа {order_id}")
-            return True, ""
-            
-        except FsmCallError as e:
-            print(f"[COURIER_CELL] ❌ FSM ошибка закрытия: {e}")
-            self.session.rollback()
-            return False, str(e)
-        except Exception as e:
-            print(f"[COURIER_CELL] ❌ Ошибка закрытия: {e}")
+        except (FsmCallError, Exception) as e:
             self.session.rollback()
             return False, str(e)
 
-class CourierErrorActions:
-    """
-    Технические действия курьеров: отмена заказа, ошибки с ячейками.
-    """
-    
+    def close_cell_for_driver(self, cell_id: int, user_id: int) -> Tuple[bool, str]:
+        """Водитель закрывает ячейку — логика зависит от intent."""
+        try:
+            trip = self._get_active_trip_for_driver(user_id)
+            intent = self._determine_intent(cell_id, trip)
+
+            if intent == "pickup":
+                # Забирает: подтверждаем выдачу → locker_parcel_pickup_driver
+                self.db.confirm_locker_parcel_out_driver(cell_id, user_id)
+                # Закрываем → locker_closed_empty
+                self.db.close_locker_pickup(cell_id, user_id)
+            else:  # delivery
+                # Находим заказ по ячейке
+                order_id = self.session.execute(
+                    text("SELECT current_order_id FROM locker_cells WHERE id = :cell_id"),
+                    {"cell_id": cell_id}
+                ).scalar()
+                if not order_id:
+                    raise DbLayerError(f"Ячейка {cell_id} не привязана к заказу")
+                # Подтверждаем посылку в заказе
+                self.db.order_confirm_parcel_in(order_id, user_id)
+                # Закрываем → locker_occupied
+                self.db.close_locker(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def report_locker_error_cell(self, cell_id: int, user_id: int) -> Tuple[bool, str]:
+        """Водитель сообщает об ошибке ячейки."""
+        try:
+            self.db.locker_not_closed(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+class CourierActions:
+    """Универсальные действия курьера (courier1 и courier2 определяются по статусу заказа)."""
     def __init__(self, db: DatabaseLayer):
         self.db = db
         self.session = db.session
-    
-    def cancel_order(self, order_id: int, courier_id: int) -> Tuple[bool, str]:
-        """
-        Отмена заказа курьером (используя готовые методы).
-        
-        Курьер1: db.order_courier1_cancel() → order_created
-        Курьер2: db.order_courier2_cancel() → order_arrived_at_post2
-        """
+
+    def _get_leg_and_cell_id(self, order: dict) -> Tuple[str, int]:
+        """Определяет leg и cell_id по статусу заказа."""
+        status = order["status"]
+        pickup_statuses = ["order_courier1_assigned", "order_courier_has_parcel"]
+        delivery_statuses = ["order_courier2_assigned", "order_courier2_has_parcel"]
+
+        if status in pickup_statuses:
+            return "pickup", order["source_cell_id"]
+        elif status in delivery_statuses:
+            return "delivery", order["dest_cell_id"]
+        else:
+            raise DbLayerError(f"Неизвестный статус для курьера: {status}")
+
+    def open_cell(self, order_id: int, user_id: int) -> Tuple[bool, str]:
         try:
             order = self.db.get_order(order_id)
             if not order:
                 return False, "ORDER_NOT_FOUND"
-            
+            leg, cell_id = self._get_leg_and_cell_id(order)
+
+            # FSM переход по заказу (создаёт контекст для открытия)
+            if leg == "pickup":
+                self.db.order_courier1_pickup_parcel(order_id, user_id)
+            else:  # delivery
+                self.db.order_courier2_pickup_parcel(order_id, user_id)
+
+            # Открытие ячейки
+            self.db.open_locker_for_recipient(cell_id, user_id, "")
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def close_cell(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        try:
+            order = self.db.get_order(order_id)
+            if not order:
+                return False, "ORDER_NOT_FOUND"
+            leg, cell_id = self._get_leg_and_cell_id(order)
+
+            if leg == "pickup":
+                # Подтверждаем посылку в системе забора
+                self.db.order_confirm_parcel_in(order_id, user_id)
+                # Закрываем ячейку → locker_occupied
+                self.db.close_locker(cell_id, user_id)
+            else:  # delivery
+                # Подтверждаем доставку
+                self.db.order_courier2_delivered_parcel(order_id, user_id)
+                # Закрываем → locker_closed_empty
+                self.db.close_locker_pickup(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    # fsm_actions.py → CourierActions
+    def cancel_order(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        try:
+            order = self.db.get_order(order_id)
+            if not order:
+                return False, "ORDER_NOT_FOUND"
             status = order["status"]
-            
             if status == "order_courier1_assigned":
-                # Отмена курьером1
-                self.db.order_courier1_cancel(order_id, courier_id)
-                print(f"[COURIER_ERROR] ✅ Курьер1 отменил заказ {order_id}")
-                
+                self.db.order_courier1_cancel(order_id, user_id)
+                # === ОЧИСТКА КУРЬЕРА ИЗ STAGE_ORDERS ===
+                self.db.clear_courier_from_stage_order(order_id, "pickup", user_id)
             elif status == "order_courier2_assigned":
-                # Отмена курьером2
-                self.db.order_courier2_cancel(order_id, courier_id)
-                print(f"[COURIER_ERROR] ✅ Курьер2 отменил заказ {order_id}")
-                
+                self.db.order_courier2_cancel(order_id, user_id)
+                # === ОЧИСТКА КУРЬЕРА2 ИЗ STAGE_ORDERS ===
+                self.db.clear_courier_from_stage_order(order_id, "delivery", user_id)
             else:
-                return False, f"CANNOT_CANCEL_FROM_STATUS_{status}"
-            
+                return False, f"CANNOT_CANCEL_FROM_{status}"
             return True, ""
-            
-        except FsmCallError as e:
-            print(f"[COURIER_ERROR] ❌ FSM ошибка отмены: {e}")
+        except (FsmCallError, Exception) as e:
             self.session.rollback()
             return False, str(e)
-        except Exception as e:
-            print(f"[COURIER_ERROR] ❌ Ошибка отмены: {e}")
-            self.session.rollback()
-            return False, str(e)
-    
-    def locker_error(self, order_id: int, courier_id: int) -> Tuple[bool, str]:
-        """
-        Ячейка не открылась или не закрылась.
-        
-        Locker: db.locker_not_closed() → locker_error
-        """
+
+    def report_locker_error(self, order_id: int, user_id: int) -> Tuple[bool, str]:
         try:
             order = self.db.get_order(order_id)
             if not order:
                 return False, "ORDER_NOT_FOUND"
-            
-            # Определяем ячейку по статусу
-            status = order["status"]
-            
-            if status in ["order_courier1_assigned", "order_courier_has_parcel"]:
-                cell_id = order["source_cell_id"]
-            elif status in ["order_courier2_assigned", "order_courier2_has_parcel"]:
-                cell_id = order["dest_cell_id"]
-            else:
-                return False, f"CANNOT_REPORT_ERROR_FROM_STATUS_{status}"
-            
-            if not cell_id:
-                return False, "NO_CELL_ID"
-            
-            # FSM переход: locker_opened → locker_error
-            self.db.locker_not_closed(cell_id, courier_id)
-            
-            print(f"[COURIER_ERROR] ⚠️ Ошибка с ячейкой {cell_id} для заказа {order_id}")
+            _, cell_id = self._get_leg_and_cell_id(order)
+            self.db.locker_not_closed(cell_id, user_id)
             return True, ""
-            
-        except FsmCallError as e:
-            print(f"[COURIER_ERROR] ❌ FSM ошибка: {e}")
-            self.session.rollback()
-            return False, str(e)
-        except Exception as e:
-            print(f"[COURIER_ERROR] ❌ Ошибка: {e}")
-            self.session.rollback()
-            return False, str(e)
-    
-    def cancel_cell_reservation(self, cell_id: int, user_id: int) -> Tuple[bool, str]:
-        """
-        Отмена резерва ячейки.
-        
-        Locker: db.cancel_locker_reservation() → locker_free
-        """
-        try:
-            self.db.cancel_locker_reservation(cell_id, user_id)
-            print(f"[COURIER_ERROR] ✅ Отменён резерв ячейки {cell_id}")
-            return True, ""
-            
-        except FsmCallError as e:
-            print(f"[COURIER_ERROR] ❌ FSM ошибка отмены резерва: {e}")
-            self.session.rollback()
-            return False, str(e)
-        except Exception as e:
-            print(f"[COURIER_ERROR] ❌ Ошибка отмены резерва: {e}")
+        except (FsmCallError, Exception) as e:
             self.session.rollback()
             return False, str(e)
 
 # ================= РАБОТА ОПЕРАТОРА =====================
 class OperatorActions:
-    """
-    Действия оператора: обслуживание ячеек, управление системой.
-    """
-    
+    """Действия оператора: технические операции с заказами и ячейками."""
     def __init__(self, db: DatabaseLayer):
         self.db = db
         self.session = db.session
-    
-    def reset_locker(self, cell_id: int, operator_id: int) -> Tuple[bool, str]:
-        """
-        Сброс ячейки в свободное состояние.
-        Locker: * → locker_free
-        FSM: locker_reset
-        
-        Используется когда:
-        - Ячейка зависла в неправильном статусе
-        - Нужно принудительно освободить ячейку
-        """
+
+    def _get_source_cell_id(self, order_id: int) -> int:
+        order = self.db.get_order(order_id)
+        if not order or not order.get("source_cell_id"):
+            raise DbLayerError(f"Нет source_cell_id для заказа {order_id}")
+        return order["source_cell_id"]
+
+    def _get_dest_cell_id(self, order_id: int) -> int:
+        order = self.db.get_order(order_id)
+        if not order or not order.get("dest_cell_id"):
+            raise DbLayerError(f"Нет dest_cell_id для заказа {order_id}")
+        return order["dest_cell_id"]
+
+    def open_cell_for_operator(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Оператор открывает ячейку (любую — по логике, но пока только source)."""
         try:
-            self.db.reset_locker(cell_id, operator_id)
-            print(f"[OPERATOR] ✅ Ячейка {cell_id} сброшена в locker_free")
+            # Оператор может открыть любую ячейку, но для совместимости — source
+            cell_id = self._get_source_cell_id(order_id)
+            self.db.open_locker_for_recipient(cell_id, user_id, "")
             return True, ""
-            
-        except FsmCallError as e:
-            print(f"[OPERATOR] ❌ FSM ошибка сброса: {e}")
+        except (FsmCallError, Exception) as e:
             self.session.rollback()
             return False, str(e)
-        except Exception as e:
-            print(f"[OPERATOR] ❌ Ошибка сброса ячейки: {e}")
-            self.session.rollback()
-            return False, str(e)
-    
-    def set_locker_maintenance(self, cell_id: int, operator_id: int) -> Tuple[bool, str]:
-        """
-        Перевод ячейки в обслуживание.
-        Locker: * → locker_maintenance
-        FSM: locker_set_locker_to_maintenance
-        
-        Используется когда:
-        - Ячейка неисправна (замок, датчик)
-        - Требуется физический ремонт
-        - Нужно временно вывести ячейку из работы
-        """
+
+    def close_cell_for_operator(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Оператор закрывает ячейку (source)."""
         try:
-            self.db.set_locker_maintenance(cell_id, operator_id)
-            print(f"[OPERATOR] ✅ Ячейка {cell_id} переведена в locker_maintenance")
+            cell_id = self._get_source_cell_id(order_id)
+            # Можно закрыть как пустую, так и занятую — используем общий close
+            # В FSM: из locker_opened → можно в locker_occupied или locker_closed_empty
+            # Но без контекста — безопаснее использовать общий метод
+            self.db.close_locker(cell_id, user_id)
             return True, ""
-            
-        except FsmCallError as e:
-            print(f"[OPERATOR] ❌ FSM ошибка перевода в обслуживание: {e}")
+        except (FsmCallError, Exception) as e:
             self.session.rollback()
             return False, str(e)
-        except Exception as e:
-            print(f"[OPERATOR] ❌ Ошибка перевода в обслуживание: {e}")
-            self.session.rollback()
-            return False, str(e)
-    
-    def force_cancel_order(self, order_id: int, operator_id: int) -> Tuple[bool, str]:
-        """
-        Принудительная отмена заказа оператором (если есть такой FSM action).
-        """
+
+    def force_cancel_order(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Оператор принудительно отменяет заказ."""
         try:
-            # Если в базе есть order_operator_cancel или подобное
-            # self.db.order_operator_cancel(order_id, operator_id)
-            
-            # Временно через универсальный метод:
-            self.db.call_fsm_action("order", order_id, "order_cancel_reservation", operator_id)
-            print(f"[OPERATOR] ✅ Заказ {order_id} отменён оператором")
+            self.db.order_cancel_reservation(order_id, user_id)
             return True, ""
-            
-        except FsmCallError as e:
-            print(f"[OPERATOR] ❌ FSM ошибка отмены заказа: {e}")
+        except (FsmCallError, Exception) as e:
             self.session.rollback()
             return False, str(e)
-        except Exception as e:
-            print(f"[OPERATOR] ❌ Ошибка отмены заказа: {e}")
+
+    def report_locker_error(self, order_id: int, user_id: int) -> Tuple[bool, str]:
+        """Оператор сообщает об ошибке ячейки."""
+        try:
+            cell_id = self._get_source_cell_id(order_id)
+            self.db.locker_not_closed(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)    
+
+    def reset_locker(self, cell_id: int, user_id: int) -> Tuple[bool, str]:
+        """Сброс состояния ячейки (из locker_error → locker_free)."""
+        try:
+            self.db.reset_locker(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def set_locker_maintenance(self, cell_id: int, user_id: int) -> Tuple[bool, str]:
+        """Поставить ячейку на обслуживание."""
+        try:
+            self.db.set_locker_maintenance(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
             self.session.rollback()
             return False, str(e)
