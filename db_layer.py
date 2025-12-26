@@ -1144,6 +1144,27 @@ class DatabaseLayer:
         ).fetchall()
         return [row[0] for row in rows]
 
+    def clear_courier_from_stage_order(self, order_id: int, leg: str, user_id: int) -> bool:
+        """
+        Очищает courier_user_id в stage_orders для указанного leg.
+        Вызывается при отказе курьера от заказа.
+        """
+        session = self.session
+        try:
+            session.execute(
+                text("""
+                    UPDATE stage_orders
+                    SET courier_user_id = NULL
+                    WHERE order_id = :order_id AND leg = :leg
+                """),
+                {"order_id": order_id, "leg": leg}
+            )
+            session.commit()
+            return True
+        except Exception as e:
+            session.rollback()
+            raise DbLayerError(f"clear_courier_from_stage_order failed: {e}") from e
+
     # ==================== НОВЫЕ МЕТОДЫ: РАЗВИЛКИ FSM ====================
 
     def start_order_flow(self, order_id: int, user_id: int = 0):
@@ -1217,25 +1238,23 @@ class DatabaseLayer:
         Биржа для курьера1 (забор от клиента).
         
         Показывает заказы:
-        - Статус: order_courier_reserved_post1_and_post2
+        - Статус: order_created
         - pickup_type: courier
         """
         query = """
-            SELECT o.id, o.status, o.description, o.from_city, o.to_city,
+            SELECT o.id, o.status, o.description,
                 l.location_address as source_address,
                 lc.cell_code as source_cell_code,
                 lc.cell_type as cell_size
             FROM orders o
             JOIN locker_cells lc ON lc.id = o.source_cell_id
             JOIN lockers l ON l.id = lc.locker_id
-            WHERE o.status = 'order_courier_reserved_post1_and_post2'  # ← ПРАВИЛЬНЫЙ СТАТУС
+            WHERE o.status = 'order_created'
             AND o.pickup_type = 'courier'
         """
         
         params = {}
-        if city:
-            query += " AND o.from_city = :city"
-            params["city"] = city
+        
         
         query += " ORDER BY o.created_at ASC"
         
@@ -1246,11 +1265,9 @@ class DatabaseLayer:
                 "id": row[0],
                 "status": row[1],
                 "description": row[2],
-                "from_city": row[3],
-                "to_city": row[4],
-                "source_address": row[5],
-                "source_cell_code": row[6],
-                "cell_size": row[7],
+                "source_address": row[3],
+                "source_cell_code": row[4],
+                "cell_size": row[5],
             }
             for row in result
         ]
