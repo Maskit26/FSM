@@ -466,6 +466,14 @@ class DatabaseLayer:
         """Фиксация незакрытой ячейки (FSM: locker_dont_closed)."""
         return self.call_fsm_action("locker", cell_id, "locker_dont_closed", user_id)
 
+    def get_order_id_by_cell_id(self, cell_id: int) -> Optional[int]:
+        """Возвращает ID заказа, привязанного к ячейке (current_order_id)."""
+        result = self.session.execute(
+            text("SELECT current_order_id FROM locker_cells WHERE id = :cell_id"),
+            {"cell_id": cell_id}
+        ).scalar()
+        return result
+
     # ==================== КНОПКИ ====================
 
     def get_buttons(
