@@ -5,6 +5,7 @@ from typing import List, Optional
 import os
 from dotenv import load_dotenv
 from db_layer import DatabaseLayer, DbLayerError, FsmCallError
+from fsm_engine import PROCESS_DEFS
 from models import (
     OrderCreateRequest, OrderResponse,
     TripCreateRequest, TripResponse,
@@ -403,7 +404,13 @@ async def get_exchange_orders_delivery(
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/fsm/enqueue", response_model=ApiResponse)
-async def enqueue_fsm_request(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(get_db)):
+async def enqueue_fsm(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(get_db)):
+    if request.process_name not in PROCESS_DEFS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Недопустимое имя процесса: '{request.process_name}'. "
+                   f"Доступные процессы: {', '.join(sorted(PROCESS_DEFS.keys()))}"
+        )
     # 1) Проверяем пользователя (пока userid приходит от фронта в body)
     role = db.get_user_role(request.user_id)
     if not role:
