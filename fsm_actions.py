@@ -311,8 +311,8 @@ class AssignmentActions:
             if role == "driver":
                 # 1. Записать в trips.driver_user_id
                 self.db.set_driver_in_trip(trip_id, executor_id)
-                # 2. FSM action (если есть trip_assign_driver)
-                self.db.trip_assign_driver(trip_id, operator_id=0)
+                # 2. FSM action 
+                self.db.driver_take_trip(trip_id, executor_id)
                 
             else:
                 print(f"[ASSIGNMENT] Неизвестная роль для trip: {role}")
@@ -468,8 +468,28 @@ class DriverActions:
         try:
             trip = self._get_active_trip_for_driver(user_id)
             intent = self._determine_intent(cell_id, trip)
-            # Открытие одинаково для обоих случаев
-            self.db.open_locker_for_recipient(cell_id, user_id, "")
+
+            if intent == "pickup":
+                # === FSM: locker ===
+                self.db.open_locker_for_recipient(cell_id, user_id, "")
+                # === FSM: order ===
+                order_id = self.db.get_order_id_by_cell_id(cell_id)
+                if order_id:
+                    self.db.order_parcel_submitted(order_id, user_id)
+                # === FSM: trip ===
+                self.db.trip_assign_voditel(trip["id"], user_id)
+
+            elif intent == "delivery":
+                # === FSM: locker ===
+                self.db.open_locker_for_recipient(cell_id, user_id, "")
+                # === FSM: order ===
+                order_id = self.db.get_order_id_by_cell_id(cell_id)
+                if order_id:
+                    self.db.order_confirm_parcel_in(order_id, user_id)            
+
+            else:
+                return False, f"UNKNOWN_INTENT_{intent}"
+
             return True, ""
         except (FsmCallError, Exception) as e:
             self.session.rollback()
@@ -482,22 +502,23 @@ class DriverActions:
             intent = self._determine_intent(cell_id, trip)
 
             if intent == "pickup":
-                # Забирает: подтверждаем выдачу → locker_parcel_pickup_driver
-                self.db.confirm_locker_parcel_out_driver(cell_id, user_id)
-                # Закрываем → locker_closed_empty
+                # === FSM: locker ===
                 self.db.close_locker_pickup(cell_id, user_id)
-            else:  # delivery
-                # Находим заказ по ячейке
-                order_id = self.session.execute(
-                    text("SELECT current_order_id FROM locker_cells WHERE id = :cell_id"),
-                    {"cell_id": cell_id}
-                ).scalar()
-                if not order_id:
-                    raise DbLayerError(f"Ячейка {cell_id} не привязана к заказу")
-                # Подтверждаем посылку в заказе
-                self.db.order_confirm_parcel_in(order_id, user_id)
+                # === FSM: order ===
+                order_id = self.db.get_order_id_by_cell_id(cell_id)
+                if order_id:
+                    self.db.order_pickup_by_voditel(order_id, user_id)
+                # === FSM: trip ===
+                self.db.trip_confirm_pickup(trip["id"], user_id)
+
+            elif intent == "delivery":
+                # === FSM: locker ===
                 # Закрываем → locker_occupied
                 self.db.close_locker(cell_id, user_id)
+
+            else:
+                return False, f"UNKNOWN_INTENT_{intent}"
+
             return True, ""
         except (FsmCallError, Exception) as e:
             self.session.rollback()
@@ -507,6 +528,56 @@ class DriverActions:
         """Водитель сообщает об ошибке ячейки."""
         try:
             self.db.locker_not_closed(cell_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def start_trip(self, trip_id: int, user_id: int) -> Tuple[bool, str]:
+        """Водитель начинает рейс (после забора)."""
+        try:
+            # === FSM: trip ===
+            self.db.trip_start_trip(trip_id, user_id)
+            # === FSM: order ===
+            # Обновить статусы всех заказов в рейсе
+            order_ids = self.db.get_orders_in_trip(trip_id)
+            for order_id in order_ids:
+                self.db.order_start_transit(order_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def arrive_at_destination(self, trip_id: int, user_id: int) -> Tuple[bool, str]:
+        """Водитель прибыл в точку доставки."""
+        try:
+            # === FSM: trip ===
+            self.db.trip_end_delivery(trip_id, user_id)
+            # === FSM: order ===
+            # Обновить статусы всех заказов в рейсе
+            order_ids = self.db.get_orders_in_trip(trip_id)
+            for order_id in order_ids:
+                self.db.order_arrive_at_post2(order_id, user_id)
+            return True, ""
+        except (FsmCallError, Exception) as e:
+            self.session.rollback()
+            return False, str(e)
+
+    def cancel_trip(self, trip_id: int, user_id: int) -> Tuple[bool, str]:
+        """Водитель отказывается от рейса до начала забора."""
+        try:
+            # Проверка: водитель действительно назначен на рейс
+            trip = self.db.get_trip(trip_id)
+            if not trip or trip.get("driver_user_id") != user_id:
+                return False, "TRIP_NOT_ASSIGNED_TO_DRIVER"
+
+            # Проверка: статус рейса — должен быть trip_assigned
+            status = trip["status"]
+            if status != "trip_assigned":
+                return False, f"CANNOT_CANCEL_FROM_STATUS_{status}"
+
+            # FSM: trip_assigned → trip_created
+            self.db.trip_report_failure(trip_id, user_id)
             return True, ""
         except (FsmCallError, Exception) as e:
             self.session.rollback()

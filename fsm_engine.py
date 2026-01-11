@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Any, Optional
 from db_layer import DatabaseLayer, DbLayerError
+import logging
+logger = logging.getLogger(__name__)
 from fsm_actions import (
     OrderCreationActions,
     AssignmentActions,
@@ -278,6 +280,39 @@ def _handle_locker_error(
         return FsmStepResult(new_state="FAILED", last_error=error)
     return FsmStepResult(new_state="COMPLETED")
 
+# ==================== КНОПКИ ВОДИТЕЛЯ ====================
+def _handle_start_trip(db: DatabaseLayer, ctx: Dict[str, Any], instance: Dict[str, Any]) -> FsmStepResult:
+    user_role = instance["requested_user_role"]
+    trip_id = instance["entity_id"]
+    user_id = instance["requested_by_user_id"]
+    if user_role != "driver":
+        return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
+    success, error = ctx["driver_actions"].start_trip(trip_id, user_id)
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+    return FsmStepResult(new_state="COMPLETED")
+
+def _handle_arrive_at_destination(db: DatabaseLayer, ctx: Dict[str, Any], instance: Dict[str, Any]) -> FsmStepResult:
+    user_role = instance["requested_user_role"]
+    trip_id = instance["entity_id"]
+    user_id = instance["requested_by_user_id"]
+    if user_role != "driver":
+        return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
+    success, error = ctx["driver_actions"].arrive_at_destination(trip_id, user_id)
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+    return FsmStepResult(new_state="COMPLETED")
+
+def _handle_cancel_trip(db: DatabaseLayer, ctx: Dict[str, Any], instance: Dict[str, Any]) -> FsmStepResult:
+    user_role = instance["requested_user_role"]
+    trip_id = instance["entity_id"]
+    user_id = instance["requested_by_user_id"]
+    if user_role != "driver":
+        return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
+    success, error = ctx["driver_actions"].cancel_trip(trip_id, user_id)
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+    return FsmStepResult(new_state="COMPLETED")
 
 # ==================== РЕЕСТР ПРОЦЕССОВ ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
@@ -292,6 +327,15 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     },
     "trip_assign_driver": {
         "PENDING": _handle_assign_executor_pending,
+    },
+    "start_trip": {
+        "PENDING": _handle_start_trip,
+    },
+    "arrive_at_destination": {
+        "PENDING": _handle_arrive_at_destination,
+    },
+    "cancel_trip": {
+        "PENDING": _handle_cancel_trip,
     },
     # Универсальные действия
     "open_cell": {"PENDING": _handle_open_cell},
@@ -318,19 +362,28 @@ def run_fsm_step(
     db: DatabaseLayer,
     actions_ctx: Dict[str, Any],
     instance: Dict[str, Any],
-) -> Optional[FsmStepResult]:
+) -> FsmStepResult:  # ← убрал Optional, теперь всегда возвращаем результат
     """Универсальный запуск одного шага FSM-процесса."""
     process_name = instance["process_name"]
     fsm_state = instance["fsm_state"]
-    process_def = PROCESS_DEFS.get(process_name)
-    if not process_def:
-        print(f"[FSM] ❌ Нет определения процесса: {process_name}")
-        return None
-    handler = process_def.get(fsm_state)
-    if not handler:
-        print(
-            f"[FSM] ❌ Нет обработчика состояния: "
-            f"process={process_name}, state={fsm_state}"
+
+    if process_name not in PROCESS_DEFS:
+        logger.error(f"Неизвестный процесс: {process_name}")
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=f"UNKNOWN_PROCESS: {process_name}",
+            attempts_increment=1
         )
-        return None
+
+    process_def = PROCESS_DEFS[process_name]
+    handler = process_def.get(fsm_state)
+
+    if not handler:
+        logger.warning(f"Нет обработчика состояния {fsm_state} для процесса {process_name}")
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=f"NO_HANDLER_FOR_STATE_{fsm_state}_IN_{process_name}",
+            attempts_increment=1
+        )
+
     return handler(db, actions_ctx, instance)
