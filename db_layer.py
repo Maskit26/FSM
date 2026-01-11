@@ -15,7 +15,7 @@
 #trip_id, success, msg = db.assign_order_to_trip_smart(order_id, "Москва", "СПб")
 #"""
 
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -47,7 +47,8 @@ class DatabaseLayer:
         """Инициализация подключения."""
         connection_string = (
             f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}"
-        )
+            f"?unix_socket=/var/run/mysqld/mysqld.sock"
+        )        
 
         # ОДИН раз создаём engine с правильными параметрами
         self.engine = create_engine(
@@ -57,6 +58,7 @@ class DatabaseLayer:
             pool_pre_ping=True,
             pool_recycle=1800,
         )
+        self.engine.pool.dispose()
 
         Session = sessionmaker(
             bind=self.engine,
@@ -73,6 +75,7 @@ class DatabaseLayer:
             "user": user,
             "password": password,
         }       
+        
         
 
     # ==================== FSM БАЗОВЫЙ ВЫЗОВ ====================
@@ -168,6 +171,20 @@ class DatabaseLayer:
     def trip_request_manual_intervention(self, trip_id: int, user_id: int) -> bool:
         """Запрос ручного вмешательства по рейсу (FSM: trip_request_manual_intervention)."""
         return self.call_fsm_action("trip", trip_id, "trip_request_manual_intervention", user_id)
+
+    def trip_report_failure(self, trip_id: int, user_id: int) -> bool:
+        """
+        Водитель отказывается от рейса.      
+        """
+        return self.call_fsm_action("trip", trip_id, "trip_report_failure", user_id)
+
+    def get_orders_in_trip(self, trip_id: int) -> List[int]:
+        """Возвращает список order_id, привязанных к trip_id через stage_orders."""
+        result = self.session.execute(
+            text("SELECT order_id FROM stage_orders WHERE trip_id = :trip_id"),
+            {"trip_id": trip_id}
+        ).fetchall()
+        return [row[0] for row in result]
 
     # ---------- ORDER / ЗАКАЗЫ ----------
 
@@ -403,6 +420,51 @@ class DatabaseLayer:
         return self.call_fsm_action(
             "order", order_id, "order_cancel_reservation", user_id
         )
+
+    def get_user_orders(self, user_id: int) -> List[Dict[str, Any]]:
+        """
+        Получить все заказы пользователя через order_requests.order_id.
+        """
+        if user_id <= 0:
+            raise DbLayerError("Invalid user_id")
+
+        rows = self.session.execute(
+            text("""
+                SELECT 
+                    o.id,
+                    o.status,
+                    o.description,
+                    o.parcel_type,
+                    o.pickup_type,
+                    o.delivery_type,
+                    o.source_cell_id,
+                    o.dest_cell_id,
+                    o.created_at,
+                    o.updated_at
+                FROM orders o
+                JOIN order_requests r ON r.order_id = o.id
+                WHERE r.client_user_id = :user_id
+                ORDER BY o.created_at DESC
+            """),
+            {"user_id": user_id},
+        ).fetchall()
+
+        orders = []
+        for row in rows:
+            orders.append({
+                "id": row[0],
+                "status": row[1],
+                "description": row[2],
+                "parcel_type": row[3],
+                "pickup_type": row[4],
+                "delivery_type": row[5],
+                "source_cell_id": row[6],
+                "dest_cell_id": row[7],
+                "created_at": row[8].isoformat() if row[8] else None,
+                "updated_at": row[9].isoformat() if row[9] else None,
+            })
+
+        return orders
 
     # ---------- LOCKER / ЯЧЕЙКИ ----------
 
@@ -1042,26 +1104,24 @@ class DatabaseLayer:
             raise DbLayerError(f"create_order_request_and_fsm failed: {e}") from e
 
     def get_order(self, order_id: int) -> Optional[Dict]:
-        """Вернуть заказ по ID."""
         row = self.session.execute(
             text(
-                "SELECT id, status, description, pickup_type, delivery_type, from_city, to_city, "
+                "SELECT id, status, description, pickup_type, delivery_type, "
                 "source_cell_id, dest_cell_id "
                 "FROM orders WHERE id = :id"
             ),
             {"id": order_id},
         ).fetchone()
+        
         if row:
             return {
                 "id": row[0],
                 "status": row[1],
                 "description": row[2],
-                "pickup_type": row[3],      # ← НОВОЕ
+                "pickup_type": row[3],
                 "delivery_type": row[4],
-                "from_city": row[5],
-                "to_city": row[6],
-                "source_cell_id": row[7],
-                "dest_cell_id": row[8],
+                "source_cell_id": row[5],
+                "dest_cell_id": row[6],
             }
         return None
 
