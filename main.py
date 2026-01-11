@@ -318,6 +318,22 @@ async def get_orders_by_route(
     except DbLayerError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/api/orders/user/{user_id}", response_model=List[dict])
+async def get_user_orders(
+    user_id: int,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить все заказы пользователя по ID.
+    """
+    try:
+        orders = db.get_user_orders(user_id)
+        return orders
+    except DbLayerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
 @app.get("/api/orders/{order_id}", response_model=dict)
 async def get_order(order_id: int, db: DatabaseLayer = Depends(get_db)):
     """Получить заказ по ID"""
