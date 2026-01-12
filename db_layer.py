@@ -428,43 +428,48 @@ class DatabaseLayer:
         if user_id <= 0:
             raise DbLayerError("Invalid user_id")
 
-        rows = self.session.execute(
-            text("""
-                SELECT 
-                    o.id,
-                    o.status,
-                    o.description,
-                    o.parcel_type,
-                    o.pickup_type,
-                    o.delivery_type,
-                    o.source_cell_id,
-                    o.dest_cell_id,
-                    o.created_at,
-                    o.updated_at
-                FROM orders o
-                JOIN order_requests r ON r.order_id = o.id
-                WHERE r.client_user_id = :user_id
-                ORDER BY o.created_at DESC
-            """),
-            {"user_id": user_id},
-        ).fetchall()
+        try:
+            rows = self.session.execute(
+                text("""
+                    SELECT 
+                        o.id,
+                        o.status,
+                        o.description,
+                        o.parcel_type,
+                        o.pickup_type,
+                        o.delivery_type,
+                        o.source_cell_id,
+                        o.dest_cell_id,
+                        o.created_at,
+                        o.updated_at
+                    FROM orders o
+                    JOIN order_requests r ON r.order_id = o.id
+                    WHERE r.client_user_id = :user_id
+                    ORDER BY o.created_at DESC
+                """),
+                {"user_id": user_id},
+            ).fetchall()
 
-        orders = []
-        for row in rows:
-            orders.append({
-                "id": row[0],
-                "status": row[1],
-                "description": row[2],
-                "parcel_type": row[3],
-                "pickup_type": row[4],
-                "delivery_type": row[5],
-                "source_cell_id": row[6],
-                "dest_cell_id": row[7],
-                "created_at": row[8].isoformat() if row[8] else None,
-                "updated_at": row[9].isoformat() if row[9] else None,
-            })
+            orders = []
+            for row in rows:
+                orders.append({
+                    "id": row[0],
+                    "status": row[1],
+                    "description": row[2],
+                    "parcel_type": row[3],
+                    "pickup_type": row[4],
+                    "delivery_type": row[5],
+                    "source_cell_id": row[6],
+                    "dest_cell_id": row[7],
+                    "created_at": row[8].isoformat() if row[8] else None,
+                    "updated_at": row[9].isoformat() if row[9] else None,
+                })
 
-        return orders
+            return orders
+
+        except Exception as e:
+            self.session.rollback()
+            raise DbLayerError(f"get_user_orders failed: {e}")
 
     # ---------- LOCKER / ЯЧЕЙКИ ----------
 
@@ -874,8 +879,7 @@ class DatabaseLayer:
                 """
             ),
             {"order_id": order_id, "src_id": source_cell_id, "dst_id": dest_cell_id},
-        )
-        # НЕ commit - commit будет в конце всей транзакции
+        )        
         
         print(f"[DB] Зарезервированы ячейки {source_cell_id}, {dest_cell_id} для заказа {order_id}")
 
@@ -985,6 +989,31 @@ class DatabaseLayer:
         except Exception as e:
             session.rollback()
             raise DbLayerError(f"enqueue_fsm_instance failed: {e}") from e
+
+    def get_last_instance_status_for_request(self, request_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Получает статус и last_error самого свежего инстанса для заявки.
+        Возвращает {'fsm_state': ..., 'last_error': ...} или None
+        """
+        row = self.session.execute(
+            text("""
+                SELECT fsm_state, last_error
+                FROM server_fsm_instances
+                WHERE entity_type = 'order_request'
+                AND entity_id = :request_id
+                AND process_name = 'order_creation'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """),
+            {"request_id": request_id}
+        ).fetchone()
+
+        if row:
+            return {
+                "fsm_state": row[0],
+                "last_error": row[1]
+            }
+        return None
 
     # ==================== ЗАКАЗЫ ====================
 
