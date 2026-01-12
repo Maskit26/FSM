@@ -176,31 +176,74 @@ async def create_order_smart(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка создания заказа: {str(e)}")
 
-@app.post("/api/client/create_order_request", response_model=dict)
+import time
+
+@app.post("/api/client/create_order_request", response_model=ApiResponse)
 async def create_order_request(
-    payload: ClientCreateOrderRequest,
-    db: DatabaseLayer = Depends(get_db),
+    request: ClientCreateOrderRequest,
+    db: DatabaseLayer = Depends(get_db)
 ):
-    """
-    Принимает 5 полей от клиента, создаёт запись в order_requests
-    и инстанс серверного FSM процесса 'order_creation'.
-    """
     try:
+        # Создаём заявку + инстанс
         request_id = db.create_order_request_and_fsm(
-            client_user_id=payload.client_user_id,
-            parcel_type=payload.parcel_type,
-            cell_size=payload.cell_size,
-            sender_delivery=payload.sender_delivery,
-            recipient_delivery=payload.recipient_delivery,
+            client_user_id=request.client_user_id,
+            parcel_type=request.parcel_type,
+            cell_size=request.cell_size,
+            sender_delivery=request.sender_delivery,
+            recipient_delivery=request.recipient_delivery
         )
 
-        return {
-            "success": True,
-            "request_id": request_id,
-            "status": "PENDING",
-        }
+        # Даём воркеру 5 секунды на обработку
+        time.sleep(5)
+
+        # Проверяем статус
+        status_info = db.get_last_instance_status_for_request(request_id)
+
+        if status_info:
+            fsm_state = status_info["fsm_state"]
+            last_error = status_info["last_error"]
+
+            if fsm_state == 'FAILED':
+                if last_error == 'NO_FREE_CELLS':
+                    return ApiResponse(
+                        success=False,
+                        message="Ячейки нужного размера закончились",
+                        data={"request_id": request_id, "error": last_error}
+                    )
+                else:
+                    return ApiResponse(
+                        success=False,
+                        message="Ошибка при обработке заявки",
+                        data={"request_id": request_id, "error": last_error or "Неизвестно"}
+                    )
+
+            elif fsm_state == 'COMPLETED':
+                return ApiResponse(
+                    success=True,
+                    message="Заказ успешно создан",
+                    data={"request_id": request_id}
+                )
+
+            else:
+                return ApiResponse(
+                    success=True,
+                    message="Заявка в обработке",
+                    data={"request_id": request_id, "status": fsm_state}
+                )
+
+        # Если инстанс ещё не появился
+        return ApiResponse(
+            success=True,
+            message="Заявка создана, обработка начата",
+            data={"request_id": request_id}
+        )
+
     except DbLayerError as e:
+        db.session.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.session.rollback()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 @app.post("/api/orders/create", response_model=dict)
 async def create_order_manual(
@@ -330,8 +373,10 @@ async def get_user_orders(
         orders = db.get_user_orders(user_id)
         return orders
     except DbLayerError as e:
+        db.session.rollback()
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        db.session.rollback()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 @app.get("/api/orders/{order_id}", response_model=dict)
