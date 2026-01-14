@@ -19,9 +19,12 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+import time
 import mysql.connector
 from mysql.connector import Error
 import traceback
+import logging
 
 
 class DbLayerError(Exception):
@@ -471,6 +474,170 @@ class DatabaseLayer:
             self.session.rollback()
             raise DbLayerError(f"get_user_orders failed: {e}")
 
+    def get_order_request(self, request_id: int, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+        print(f"Вызван get_order_request для request_id={request_id}")
+        retries = 0
+        while retries < max_retries:
+            try:
+                row = self.session.execute(
+                    text("""
+                        SELECT id, client_user_id, parcel_type, cell_size,
+                               sender_delivery, recipient_delivery, status
+                        FROM order_requests
+                        WHERE id = :id
+                    """),
+                    {"id": request_id}
+                ).fetchone()
+
+                if not row:
+                    return None
+
+                return {
+                    "id": row[0],
+                    "client_user_id": row[1],
+                    "parcel_type": row[2],
+                    "cell_size": row[3],
+                    "sender_delivery": row[4],
+                    "recipient_delivery": row[5],
+                    "status": row[6]
+                }
+            except OperationalError as e:
+                self.session.rollback()
+                retries += 1
+                if retries >= max_retries:
+                    logging.error(f"OperationalError after {max_retries} retries in get_order_request for request_id {request_id}: {e}")
+                    raise DbLayerError(f"Failed to get order request {request_id} after {max_retries} retries: {e}") from e
+                else:
+                    logging.warning(f"OperationalError on attempt {retries} for get_order_request {request_id}, retrying... Error: {e}")
+                    time.sleep(0.5 * retries) # Экспоненциальная задержка
+            except SQLAlchemyError as e:
+                # Другая ошибка SQLAlchemy, не связанная с подключением
+                self.session.rollback()
+                logging.error(f"SQLAlchemy error in get_order_request for request_id {request_id}: {e}")
+                raise DbLayerError(f"SQLAlchemy error in get_order_request for request_id {request_id}: {e}") from e
+            except Exception as e:
+                # Любая другая ошибка
+                self.session.rollback()
+                logging.error(f"General error in get_order_request for request_id {request_id}: {e}")
+                raise DbLayerError(f"General error in get_order_request for request_id {request_id}: {e}") from e
+
+    def create_order_and_reserve_cells(
+        self,
+        request_id: int,
+        source_cell_id: int,
+        dest_cell_id: int,
+        description: str,
+        from_city: str = "LOCAL",
+        to_city: str = "LOCAL",
+        pickup_type: str = "courier",
+        delivery_type: str = "courier",
+        max_retries: int = 3
+    ) -> Tuple[bool, Optional[int], str]:
+        session = self.session # Используем сессию, переданную в конструктор
+        retries = 0
+        while retries < max_retries:
+            try:
+                # 1. Создаём заказ
+                stmt = text("""
+                    INSERT INTO orders
+                        (description, from_city, to_city,
+                         source_cell_id, dest_cell_id,
+                         pickup_type, delivery_type, status)
+                    VALUES
+                        (:desc, :from_city, :to_city,
+                         :source_cell_id, :dest_cell_id,
+                         :pickup_type, :delivery_type, 'order_created')
+                """)
+                session.execute(stmt, {
+                    "desc": description,
+                    "from_city": from_city,
+                    "to_city": to_city,
+                    "source_cell_id": source_cell_id,
+                    "dest_cell_id": dest_cell_id,
+                    "pickup_type": pickup_type,
+                    "delivery_type": delivery_type,
+                })
+
+                # 2. Получаем ID созданного заказа
+                result = session.execute(text("SELECT LAST_INSERT_ID()"))
+                order_id = int(result.scalar_one())
+
+                # 3. Резервируем ячейки и обновляем current_order_id
+                update_stmt = text("""
+                    UPDATE locker_cells
+                    SET status = 'locker_reserved', current_order_id = :order_id
+                    WHERE id IN (:src_id, :dst_id)
+                """)
+                session.execute(update_stmt, {
+                    "order_id": order_id,
+                    "src_id": source_cell_id,
+                    "dst_id": dest_cell_id
+                })
+
+                # 4. Фиксируем все изменения
+                session.commit()
+                print(f"[DB] Заказ {order_id} создан, ячейки {source_cell_id}, {dest_cell_id} зарезервированы и привязаны.")
+                return True, order_id, ""
+
+            except OperationalError as e:
+                # Возможна ошибка подключения
+                session.rollback()
+                retries += 1
+                if retries >= max_retries:
+                    error_msg = f"OperationalError after {max_retries} retries in create_order_and_reserve_cells: {e}"
+                    print(error_msg)
+                    return False, None, error_msg
+                else:
+                    print(f"OperationalError on attempt {retries}, retrying... Error: {e}")
+                    time.sleep(0.5 * retries) # Экспоненциальная задержка
+            except SQLAlchemyError as e:
+                # Другая ошибка SQLAlchemy
+                session.rollback()
+                error_msg = f"SQLAlchemy error in create_order_and_reserve_cells: {e}"
+                print(error_msg)
+                return False, None, error_msg
+            except Exception as e:
+                # Любая другая ошибка
+                session.rollback()
+                error_msg = f"General error in create_order_and_reserve_cells: {e}"
+                print(error_msg)
+                return False, None, error_msg
+
+        # Этот код не должен быть достигнут, если max_retries > 0
+        # Но на всякий случай
+        error_msg = "UNKNOWN_RETRY_ERROR"
+        print(f"[DB] {error_msg} in create_order_and_reserve_cells after {max_retries} attempts.")
+        return False, None, error_msg
+
+    def mark_request_completed(self, request_id: int, order_id: int) -> bool:
+        session = self.session
+        try:
+            stmt = text("""
+                UPDATE order_requests
+                SET status = 'COMPLETED',
+                    order_id = :order_id,
+                    error_code = NULL,
+                    error_message = NULL
+                -- updated_at = NOW() <-- УБРАНО, так как столбца нет
+                WHERE id = :request_id
+            """)
+            session.execute(stmt, {
+                "request_id": request_id,
+                "order_id": order_id
+            })
+            session.commit()
+            print(f"[DB] Заявка {request_id} помечена COMPLETED, привязан заказ {order_id}.")
+            return True
+
+        except SQLAlchemyError as e:
+            session.rollback()
+            print(f"[DB] SQLAlchemy error in mark_request_completed: {e}")
+            return False
+        except Exception as e:
+            session.rollback()
+            print(f"[DB] General error in mark_request_completed: {e}")
+            return False
+
     # ---------- LOCKER / ЯЧЕЙКИ ----------
 
     def open_locker_for_recipient(
@@ -539,7 +706,50 @@ class DatabaseLayer:
             text("SELECT current_order_id FROM locker_cells WHERE id = :cell_id"),
             {"cell_id": cell_id}
         ).scalar()
-        return result
+        return result    
+
+    def mark_request_failed(self, request_id: int, error_code: str, error_message: str, max_retries: int = 3):
+        """Помечает заявку FAILED с кодом и сообщением."""
+        retries = 0
+        while retries < max_retries:
+            try:
+                stmt = text("""
+                    UPDATE order_requests
+                    SET status = 'FAILED',
+                        error_code = :error_code,
+                        error_message = :error_message
+                    -- updated_at = NOW() <-- УБРАНО, так как столбца нет
+                    WHERE id = :request_id
+                """)
+                self.session.execute(stmt, {
+                    "request_id": request_id,
+                    "error_code": error_code,
+                    "error_message": error_message
+                })
+                # Фиксируем изменения, связанные с этим конкретным действием
+                self.session.commit() # <-- КОММИТИМ ВНУТРИ МЕТОДА
+                print(f"[DB] Заявка {request_id} помечена FAILED: {error_code} - {error_message}.")
+                return # Успешно завершено
+            except OperationalError as e:
+                # В случае ошибки подключения - откатываем и пробуем снова
+                self.session.rollback()
+                retries += 1
+                if retries >= max_retries:
+                    logging.error(f"OperationalError after {max_retries} retries in mark_request_failed for request_id {request_id}: {e}")
+                    raise DbLayerError(f"Failed to mark request {request_id} as FAILED after {max_retries} retries: {e}") from e
+                else:
+                    logging.warning(f"OperationalError on attempt {retries} for mark_request_failed {request_id}, retrying... Error: {e}")
+                    time.sleep(0.5 * retries) # Экспоненциальная задержка
+            except SQLAlchemyError as e:
+                # В случае ЛЮБОЙ другой ошибки SQLAlchemy - откатываем и пробрасываем
+                self.session.rollback()
+                logging.error(f"SQLAlchemy error in mark_request_failed for request_id {request_id}: {e}")
+                raise DbLayerError(f"SQLAlchemy error in mark_request_failed for request_id {request_id}: {e}") from e
+            except Exception as e:
+                # В случае ЛЮБОЙ другой ошибки - откатываем и пробрасываем
+                self.session.rollback()
+                logging.error(f"General error in mark_request_failed for request_id {request_id}: {e}")
+                raise DbLayerError(f"General error in mark_request_failed for request_id {request_id}: {e}") from e
 
     # ==================== КНОПКИ ====================
 

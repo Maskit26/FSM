@@ -179,7 +179,7 @@ def check_stuck_instances(db: DatabaseLayer) -> int:
     session = db.session
     rows = session.execute(
         text("""
-            SELECT id, attempts_count
+            SELECT id, attempts_count, created_at
             FROM server_fsm_instances
             WHERE fsm_state = 'PENDING'
               AND TIMESTAMPDIFF(MINUTE, created_at, NOW()) > :threshold
@@ -189,8 +189,9 @@ def check_stuck_instances(db: DatabaseLayer) -> int:
 
     stuck_count = 0
     for row in rows:
-        instance_id, attempts = row
-        logger.warning(f"Застрявшая заявка: instance_id={instance_id}, attempts={attempts}")
+        instance_id, attempts, created_at = row
+        logger.warning(f"Застрявшая заявка: instance_id={instance_id}, attempts={attempts}, created_at={created_at}, diff_min={TIMESTAMPDIFF(MINUTE, created_at, NOW())}")
+        
         session.execute(
             text("""
                 UPDATE server_fsm_instances
@@ -252,6 +253,16 @@ def main():
                         logger.error(f"Ошибка проверки застрявших: {e}")
 
                 rows = fetch_ready_instances(db)
+                logger.debug(f"Получено готовых инстансов: {len(rows)} шт")
+                if rows:
+                    for row in rows:
+                        logger.info(f"  - instance_id={row[0]}, process={row[3]}, state={row[4]}, next_timer_at={row[5]}")
+                else:
+                    logger.debug("Нет готовых инстансов. Проверяем PENDING:")
+                    pending = db.session.execute(
+                        text("SELECT COUNT(*) FROM server_fsm_instances WHERE fsm_state = 'PENDING'")
+                    ).scalar()
+                    logger.debug(f"Всего PENDING в базе: {pending}")
                 if not rows:
                     db.session.commit()
                     time.sleep(POLL_INTERVAL_SECONDS)
