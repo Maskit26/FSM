@@ -22,7 +22,7 @@ BATCH_SIZE = 20  # Увеличили батч
 TRIP_ACTIVATION_INTERVAL = 30  # Секунды между проверками трипов
 MAX_ATTEMPTS = 5  # Макс. попыток перед FAILED
 STUCK_THRESHOLD_MINUTES = 60  # Застрявшие заявки > 60 мин → FAILED
-MAX_WORKERS = 4  # Макс. потоков для параллельной обработки
+MAX_WORKERS = 1  # Макс. потоков для параллельной обработки
 
 # Настройка логирования
 logging.basicConfig(
