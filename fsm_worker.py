@@ -150,14 +150,22 @@ def process_instance(db: DatabaseLayer, actions_ctx: Dict[str, Any], instance: D
             ))
             return
 
-        result = run_fsm_step(db, actions_ctx, instance)
+        try:
+            result = run_fsm_step(db, actions_ctx, instance)
 
-        # ← Вот важное изменение: если result is None — это тоже ошибка!
-        if result is None:
-            logger.error(f"run_fsm_step вернул None! instance_id={instance['id']}")
+            # Проверка, вернул ли run_fsm_step результат
+            if result is None:
+                logger.error(f"run_fsm_step вернул None! instance_id={instance['id']}")
+                # Обрабатываем как ошибку FSM шага
+                raise RuntimeError("run_fsm_step returned None")
+
+        except Exception as fsm_step_error:
+            # Обработка ошибки, возникшей внутри run_fsm_step (или в db_layer, fsm_actions и т.п.)
+            logger.error(f"Ошибка выполнения FSM шага для instance_id={instance['id']}: {fsm_step_error}", exc_info=True)
+            # Формируем результат ошибки FSM шага
             result = FsmStepResult(
                 new_state="FAILED",
-                last_error="RUN_FSM_STEP_RETURNED_NONE",
+                last_error=str(fsm_step_error),
                 attempts_increment=1
             )
 
@@ -176,22 +184,22 @@ def check_stuck_instances(db: DatabaseLayer) -> int:
     """
     Проверяет и фейлит застрявшие PENDING-заявки (> STUCK_THRESHOLD_MINUTES).
     """
-    session = db.session
+    session = db.session    
     rows = session.execute(
         text("""
-            SELECT id, attempts_count, created_at
+            SELECT id, attempts_count, created_at, TIMESTAMPDIFF(MINUTE, created_at, NOW()) AS diff_min
             FROM server_fsm_instances
             WHERE fsm_state = 'PENDING'
-              AND TIMESTAMPDIFF(MINUTE, created_at, NOW()) > :threshold
+            AND TIMESTAMPDIFF(MINUTE, created_at, NOW()) > :threshold
         """),
         {"threshold": STUCK_THRESHOLD_MINUTES},
     ).fetchall()
 
     stuck_count = 0
     for row in rows:
-        instance_id, attempts, created_at = row
-        logger.warning(f"Застрявшая заявка: instance_id={instance_id}, attempts={attempts}, created_at={created_at}, diff_min={TIMESTAMPDIFF(MINUTE, created_at, NOW())}")
-        
+        instance_id, attempts, created_at, diff_min = row
+        logger.warning(f"Застрявшая заявка: instance_id={instance_id}, attempts={attempts}, created_at={created_at}, diff_min={diff_min}")
+
         session.execute(
             text("""
                 UPDATE server_fsm_instances
