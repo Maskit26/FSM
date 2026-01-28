@@ -33,30 +33,64 @@ def _handle_order_creation_pending(
     ctx: Dict[str, Any],
     instance: Dict[str, Any],
 ) -> FsmStepResult:
-    """Обработчик состояния PENDING для процесса 'order_creation'."""
+    """
+    Обработчик состояния PENDING для процесса 'order_creation'.
+
+    """
+
     actions: OrderCreationActions = ctx["order_creation_actions"]
+
     fsm_id = instance["id"]
     request_id = instance["entity_id"]
-    # 1. Поиск ячеек
+
+    logger.info(
+        f"[FSM] order_creation PENDING: fsm_id={fsm_id}, request_id={request_id}"
+    )
+
+    # === ШАГ 1: поиск ячеек ===
     ok, src_id, dst_id, code = actions.find_cells_for_request(request_id)
-    if not ok:
+
+    if not ok:        
+        error_code = code or "NO_FREE_CELLS"
+
+        logger.error(
+            f"[FSM] find_cells_for_request FAILED: "
+            f"request_id={request_id}, code={error_code}"
+        )
+
         return FsmStepResult(
             new_state="FAILED",
-            last_error=code or "CELLS_ERROR",
+            last_error=error_code,
             attempts_increment=1,
         )
-    # 2. Создание заказа
-    ok, order_id, code = actions.create_order_from_request(request_id, src_id, dst_id)
-    if not ok:
+
+    # === ШАГ 2: создание заказа ===
+    ok, order_id, code = actions.create_order_from_request(
+        request_id=request_id,
+        source_cell_id=src_id,
+        dest_cell_id=dst_id,
+    )
+
+    if not ok:        
+        error_code = code or "ORDER_REQUEST_NOT_FOUND"
+
+        logger.error(
+            f"[FSM] create_order_from_request FAILED: "
+            f"request_id={request_id}, code={error_code}"
+        )
+
         return FsmStepResult(
             new_state="FAILED",
-            last_error=code or "ORDER_ERROR",
+            last_error=error_code,
             attempts_increment=1,
         )
-    print(
+
+    # Если мы здесь — заказ создан (даже если были предупреждения)
+    logger.info(
         f"[FSM] order_creation COMPLETED: "
         f"fsm_id={fsm_id}, request_id={request_id}, order_id={order_id}"
     )
+
     return FsmStepResult(
         new_state="COMPLETED",
         last_error=None,

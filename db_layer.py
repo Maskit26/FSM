@@ -25,6 +25,7 @@ import mysql.connector
 from mysql.connector import Error
 import traceback
 import logging
+logger = logging.getLogger(__name__)
 
 
 class DbLayerError(Exception):
@@ -426,15 +427,19 @@ class DatabaseLayer:
 
     def get_user_orders(self, user_id: int) -> List[Dict[str, Any]]:
         """
-        Получить все заказы пользователя через order_requests.order_id.
+        Получить все заказы пользователя.
+
+        Источник истины:
+        - orders (client_user_id)
         """
+
         if user_id <= 0:
             raise DbLayerError("Invalid user_id")
 
         try:
             rows = self.session.execute(
                 text("""
-                    SELECT 
+                    SELECT
                         o.id,
                         o.status,
                         o.description,
@@ -446,14 +451,14 @@ class DatabaseLayer:
                         o.created_at,
                         o.updated_at
                     FROM orders o
-                    JOIN order_requests r ON r.order_id = o.id
-                    WHERE r.client_user_id = :user_id
+                    WHERE o.client_user_id = :user_id
                     ORDER BY o.created_at DESC
                 """),
                 {"user_id": user_id},
             ).fetchall()
 
-            orders = []
+            orders: List[Dict[str, Any]] = []
+
             for row in rows:
                 orders.append({
                     "id": row[0],
@@ -471,7 +476,6 @@ class DatabaseLayer:
             return orders
 
         except Exception as e:
-            self.session.rollback()
             raise DbLayerError(f"get_user_orders failed: {e}")
 
     def get_order_request(self, request_id: int, max_retries: int = 3) -> Optional[Dict[str, Any]]:
@@ -522,92 +526,112 @@ class DatabaseLayer:
                 raise DbLayerError(f"General error in get_order_request for request_id {request_id}: {e}") from e
 
     def create_order_and_reserve_cells(
-        self,
-        request_id: int,
+        self,        
         source_cell_id: int,
         dest_cell_id: int,
         description: str,
-        from_city: str = "LOCAL",
-        to_city: str = "LOCAL",
-        pickup_type: str = "courier",
-        delivery_type: str = "courier",
-        max_retries: int = 3
+        pickup_type: str,
+        delivery_type: str,
+        client_user_id: int, 
+        max_retries: int = 3,
     ) -> Tuple[bool, Optional[int], str]:
-        session = self.session # Используем сессию, переданную в конструктор
+        """
+        Создаёт заказ и резервирует ячейки.
+        ВСЯ операция атомарна.
+        """        
+
+        session = self.session
         retries = 0
+
         while retries < max_retries:
             try:
-                # 1. Создаём заказ
+                # 1️⃣ Создаём заказ, теперь с client_user_id
                 stmt = text("""
-                    INSERT INTO orders
-                        (description, from_city, to_city,
-                         source_cell_id, dest_cell_id,
-                         pickup_type, delivery_type, status)
-                    VALUES
-                        (:desc, :from_city, :to_city,
-                         :source_cell_id, :dest_cell_id,
-                         :pickup_type, :delivery_type, 'order_created')
+                    INSERT INTO orders (
+                        description,
+                        from_city,
+                        to_city,
+                        source_cell_id,
+                        dest_cell_id,
+                        pickup_type,
+                        delivery_type,
+                        status,
+                        client_user_id  -- <-- Добавлено
+                    )
+                    VALUES (
+                        :description,
+                        'LOCAL',
+                        'LOCAL',
+                        :source_cell_id,
+                        :dest_cell_id,
+                        :pickup_type,
+                        :delivery_type,
+                        'order_created',
+                        :client_user_id  -- <-- Добавлено
+                    )
                 """)
+
                 session.execute(stmt, {
-                    "desc": description,
-                    "from_city": from_city,
-                    "to_city": to_city,
+                    "description": description,
                     "source_cell_id": source_cell_id,
                     "dest_cell_id": dest_cell_id,
                     "pickup_type": pickup_type,
                     "delivery_type": delivery_type,
+                    "client_user_id": client_user_id, # <-- Добавлено
                 })
 
-                # 2. Получаем ID созданного заказа
-                result = session.execute(text("SELECT LAST_INSERT_ID()"))
-                order_id = int(result.scalar_one())
+                # 2️⃣ Получаем ID заказа
+                order_id = session.execute(
+                    text("SELECT LAST_INSERT_ID()")
+                ).scalar_one()
 
-                # 3. Резервируем ячейки и обновляем current_order_id
+                # 3️⃣ Резервируем ячейки
                 update_stmt = text("""
                     UPDATE locker_cells
-                    SET status = 'locker_reserved', current_order_id = :order_id
+                    SET status = 'locker_reserved',
+                        current_order_id = :order_id
                     WHERE id IN (:src_id, :dst_id)
                 """)
+
                 session.execute(update_stmt, {
                     "order_id": order_id,
                     "src_id": source_cell_id,
-                    "dst_id": dest_cell_id
+                    "dst_id": dest_cell_id,
                 })
 
-                # 4. Фиксируем все изменения
+                # 4️⃣ Фиксируем транзакцию
                 session.commit()
-                print(f"[DB] Заказ {order_id} создан, ячейки {source_cell_id}, {dest_cell_id} зарезервированы и привязаны.")
+
+                logger.info(
+                    f"[DB] Order {order_id} created for user {client_user_id}, cells {source_cell_id},{dest_cell_id} reserved"
+                )
+
                 return True, order_id, ""
 
             except OperationalError as e:
-                # Возможна ошибка подключения
                 session.rollback()
                 retries += 1
+
                 if retries >= max_retries:
-                    error_msg = f"OperationalError after {max_retries} retries in create_order_and_reserve_cells: {e}"
-                    print(error_msg)
+                    error_msg = f"OperationalError after {max_retries} retries: {e}"
+                    logger.error(error_msg)
                     return False, None, error_msg
-                else:
-                    print(f"OperationalError on attempt {retries}, retrying... Error: {e}")
-                    time.sleep(0.5 * retries) # Экспоненциальная задержка
+
+                time.sleep(0.3 * retries)
+
             except SQLAlchemyError as e:
-                # Другая ошибка SQLAlchemy
                 session.rollback()
                 error_msg = f"SQLAlchemy error in create_order_and_reserve_cells: {e}"
-                print(error_msg)
-                return False, None, error_msg
-            except Exception as e:
-                # Любая другая ошибка
-                session.rollback()
-                error_msg = f"General error in create_order_and_reserve_cells: {e}"
-                print(error_msg)
+                logger.error(error_msg)
                 return False, None, error_msg
 
-        # Этот код не должен быть достигнут, если max_retries > 0
-        # Но на всякий случай
-        error_msg = "UNKNOWN_RETRY_ERROR"
-        print(f"[DB] {error_msg} in create_order_and_reserve_cells after {max_retries} attempts.")
-        return False, None, error_msg
+            except Exception as e:
+                session.rollback()
+                error_msg = f"Unexpected error in create_order_and_reserve_cells: {e}"
+                logger.exception(error_msg)
+                return False, None, error_msg
+
+        return False, None, "UNKNOWN_ERROR"
 
     def mark_request_completed(self, request_id: int, order_id: int) -> bool:
         session = self.session
@@ -617,8 +641,7 @@ class DatabaseLayer:
                 SET status = 'COMPLETED',
                     order_id = :order_id,
                     error_code = NULL,
-                    error_message = NULL
-                -- updated_at = NOW() <-- УБРАНО, так как столбца нет
+                    error_message = NULL               
                 WHERE id = :request_id
             """)
             session.execute(stmt, {
@@ -637,6 +660,36 @@ class DatabaseLayer:
             session.rollback()
             print(f"[DB] General error in mark_request_completed: {e}")
             return False
+
+    def get_order_request_status(self, request_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Получает статус и информацию об ошибке (если есть) для конкретной заявки.
+        """
+        try:
+            row = self.session.execute(
+                text("""
+                    SELECT status, order_id, error_code, error_message
+                    FROM order_requests
+                    WHERE id = :request_id
+                """),
+                {"request_id": request_id}
+            ).fetchone()
+
+            if not row:
+                return None # Заявка не найдена
+
+            return {
+                "status": row[0],
+                "order_id": row[1],
+                "error_code": row[2],
+                "error_message": row[3]
+            }
+        except SQLAlchemyError as e:
+            logging.error(f"SQLAlchemy error in get_order_request_status for request_id {request_id}: {e}")
+            raise DbLayerError(f"Failed to get status for order request {request_id}: {e}") from e
+        except Exception as e:
+            logging.error(f"General error in get_order_request_status for request_id {request_id}: {e}")
+            raise DbLayerError(f"General error getting status for order request {request_id}: {e}") from e
 
     # ---------- LOCKER / ЯЧЕЙКИ ----------
 

@@ -3,6 +3,9 @@
 from typing import Tuple, Optional
 from sqlalchemy import text
 from db_layer import DatabaseLayer, DbLayerError, FsmCallError
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class OrderCreationActions:
@@ -10,41 +13,35 @@ class OrderCreationActions:
     Actions для процесса 'order_creation':
     1) поиск двух свободных ячеек нужного размера;
     2) создание заказа из заявки и резерв ячеек.
-    
-    Работает поверх DatabaseLayer и таблиц:
-    - order_requests
-    - locker_cells
-    - orders
+
+    Единственный класс, который имеет право:
+    - менять order_requests.status
+    - писать order_requests.order_id
     """
 
     def __init__(self, db: DatabaseLayer):
         self.db = db
         self.session = db.session
 
+    # =====================================================
+    # ACTION 1 — ТОЛЬКО поиск ячеек (БЕЗ side-effects)
+    # =====================================================
     def find_cells_for_request(
         self,
         request_id: int,
     ) -> Tuple[bool, Optional[int], Optional[int], str]:
-        """
-        Action 1: поиск двух свободных ячеек нужного размера для заявки.
-        """
         try:
-            # 1. Читаем заявку через db_layer
             req = self.db.get_order_request(request_id)
             if not req:
                 return False, None, None, "ORDER_REQUEST_NOT_FOUND"
 
-            cell_size = req["cell_size"]
-            status = req["status"]
-
-            if status != "PENDING":
+            if req["status"] != "PENDING":
                 return False, None, None, "INVALID_REQUEST_STATE"
 
-            # 2. Жёстко выбираем два постамата
-            source_locker_id = 1  # POST1
-            dest_locker_id = 2    # POST2
+            cell_size = req["cell_size"]
+            source_locker_id = 1
+            dest_locker_id = 2
 
-            # 3. Ищем ячейки через db_layer
             src_cells = self.db.get_locker_cells_by_status(source_locker_id, "locker_free")
             dst_cells = self.db.get_locker_cells_by_status(dest_locker_id, "locker_free")
 
@@ -52,21 +49,23 @@ class OrderCreationActions:
             dst_cell = next((c for c in dst_cells if c["cell_type"] == cell_size), None)
 
             if not src_cell or not dst_cell:
-                # Нет ячеек — помечаем FAILED через db_layer
                 self.db.mark_request_failed(
-                    request_id,
-                    "NO_FREE_CELLS",
-                    "Не найдены свободные ячейки нужного размера"
+                    request_id=request_id,
+                    error_code="NO_FREE_CELLS",
+                    error_message=f"No free cells of type '{cell_size}' found for request {request_id}."
                 )
                 return False, None, None, "NO_FREE_CELLS"
 
             return True, int(src_cell["id"]), int(dst_cell["id"]), ""
 
-        except DbLayerError as e:
-            raise  
+        except DbLayerError:
+            raise
         except Exception as e:
             raise DbLayerError(f"find_cells_for_request({request_id}) failed: {e}")
 
+    # =====================================================
+    # ACTION 2 — создание заказа (ВСЯ бизнес-логика)
+    # =====================================================
     def create_order_from_request(
         self,
         request_id: int,
@@ -81,7 +80,15 @@ class OrderCreationActions:
             if req["status"] != "PENDING":
                 return False, None, "INVALID_REQUEST_STATE"
 
-            # Используем данные из обновленного get_order_request
+            client_user_id = req["client_user_id"]
+            if client_user_id is None:
+                self.db.mark_request_failed(
+                    request_id=request_id,
+                    error_code="LOGIC_ERROR_INVALID_REQUEST_DATA",
+                    error_message="Request has no associated user."
+                )
+                return False, None, "LOGIC_ERROR_INVALID_REQUEST_DATA"
+
             sender_delivery = req["sender_delivery"]
             recipient_delivery = req["recipient_delivery"]
             parcel_type = req["parcel_type"]
@@ -92,42 +99,49 @@ class OrderCreationActions:
             delivery_type = "self" if recipient_delivery == "self" else "courier"
 
             success, order_id, error_msg = self.db.create_order_and_reserve_cells(
-                request_id=request_id,
                 source_cell_id=source_cell_id,
                 dest_cell_id=dest_cell_id,
+                client_user_id=client_user_id,
                 description=description,
                 pickup_type=pickup_type,
-                delivery_type=delivery_type
+                delivery_type=delivery_type,
             )
 
             if not success:
-                print(f"[ORDER_CREATION] ❌ Ошибка при создании заказа и резервировании ячеек: {error_msg}")
-                return False, None, error_msg
+                self.db.mark_request_failed(
+                    request_id=request_id,
+                    error_code="ORDER_CREATION_FAILED",
+                    error_message=f"Order creation failed: {error_msg}"
+                )
+                return False, None, "ORDER_CREATION_FAILED"
 
             trip_id, trip_success, trip_msg = self.db.assign_order_to_trip_smart(
                 order_id=order_id,
                 order_from_city="LOCAL",
-                order_to_city="LOCAL"
+                order_to_city="LOCAL",
             )
 
             if not trip_success:
-                print(f"[ORDER_CREATION] ⚠️  Предупреждение: Не удалось назначить заказ {order_id} на маршрут: {trip_msg}")
-                return False, order_id, "TRIP_ASSIGNMENT_FAILED"
+                logger.warning(f"[ORDER_CREATION] assignment failed for order {order_id}: {trip_msg}")
 
-            print(f"[ORDER_CREATION] Заказ {order_id} назначен на маршрут {trip_id}")
-
-            completed_success = self.db.mark_request_completed(request_id, order_id)
+            completed_success = self.db.mark_request_completed(
+                request_id=request_id,
+                order_id=order_id
+            )
             if not completed_success:
-                print(f"[ORDER_CREATION] ❌ Ошибка при обновлении статуса заявки {request_id}")
+                self.db.mark_request_failed(
+                    request_id=request_id,
+                    error_code="REQUEST_COMPLETION_FAILED",
+                    error_message=f"Could not link request {request_id} to order {order_id} after creation."
+                )
                 return False, order_id, "REQUEST_COMPLETION_FAILED"
 
-            print(f"[ORDER_CREATION] Заказ {order_id} создан, ячейки {source_cell_id},{dest_cell_id} зарезервированы")
             return True, order_id, ""
 
-        except DbLayerError as e:
+        except DbLayerError:
             raise
         except Exception as e:
-            raise DbLayerError(f"create_order_from_request({request_id}) failed: {e}") from e
+            raise DbLayerError(f"create_order_from_request({request_id}) failed: {e}")
 
 
 class AssignmentActions:
