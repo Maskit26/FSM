@@ -20,6 +20,8 @@ class ClientCreateOrderRequest(BaseModel):
 class TripCreateRequest(BaseModel):
     from_city: str
     to_city: str
+    pickup_locker_id: int
+    delivery_locker_id: int
     driver_user_id: Optional[int] = None
     description: Optional[str] = None
     active: int = 0
