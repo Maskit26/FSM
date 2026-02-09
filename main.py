@@ -448,19 +448,16 @@ async def get_all_orders(
 
 @app.get("/api/courier/exchange-pickup", response_model=dict)
 async def get_exchange_orders_pickup(
+    courier_id: int,
     db: DatabaseLayer = Depends(get_db)
 ):
-    """
-    Биржа заказов для курьера1 (забор от клиента).
-    
-    Показывает заказы:
-    - Статус: order_created
-    - Тип забора: pickup_type='courier'
-    - Местоположение: source_cell (откуда забрать)
-    """
     with get_db_session(read_only=True) as session:
         try:
-            orders = db.get_available_orders_for_pickup(session)
+            user = db.get_user_by_id(session, courier_id)
+            if not user or user["role_name"] != "courier":
+                raise HTTPException(status_code=400, detail="Invalid courier ID")
+            
+            orders = db.get_available_orders_for_pickup(session, user["city"])
             return {
                 "type": "pickup",
                 "description": "Заказы для курьера1 (забор от клиента)",
@@ -469,23 +466,23 @@ async def get_exchange_orders_pickup(
             }
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error("exchange-pickup unexpected error: %s", e)
+            raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/api/courier/exchange-delivery", response_model=dict)
 async def get_exchange_orders_delivery(
+    courier_id: int,
     db: DatabaseLayer = Depends(get_db)
 ):
-    """
-    Биржа заказов для курьера2 (доставка получателю).
-    
-    Показывает заказы:
-    - Статус: order_parcel_confirmed_post2
-    - Тип доставки: delivery_type='courier'
-    - Местоположение: dest_cell (откуда забрать для доставки)
-    """
     with get_db_session(read_only=True) as session:
         try:
-            orders = db.get_available_orders_for_delivery(session)
+            user = db.get_user_by_id(session, courier_id)
+            if not user or user["role_name"] != "courier":
+                raise HTTPException(status_code=400, detail="Invalid courier ID")
+            
+            orders = db.get_available_orders_for_delivery(session, user["city"])
             return {
                 "type": "delivery",
                 "description": "Заказы для курьера2 (доставка получателю)",
@@ -494,6 +491,9 @@ async def get_exchange_orders_delivery(
             }
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error("exchange-delivery unexpected error: %s", e)
+            raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/fsm/enqueue", response_model=ApiResponse)
 async def enqueue_fsm(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(get_db)):

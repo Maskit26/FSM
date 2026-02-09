@@ -23,14 +23,14 @@ class OrderCreationActions:
             req = self.db.get_order_request(session, request_id)
 
             if not req:
-                return False, None, "ORDER_REQUEST_NOT_FOUND"
+                return False, None, "REQ_NOT_FOUND"
 
             if req["status"] != "PENDING":
-                return False, None, "INVALID_REQUEST_STATE"
+                return False, None, "INVALID_STATE"
 
             client_user_id = req["client_user_id"]
             if not client_user_id:
-                return False, None, "INVALID_REQUEST_DATA"
+                return False, None, "INVALID_DATA"
 
             parcel_type = req["parcel_type"]
             cell_size = req["cell_size"]
@@ -41,19 +41,32 @@ class OrderCreationActions:
             pickup_type = "self" if sender_delivery == "self" else "courier"
             delivery_type = "self" if recipient_delivery == "self" else "courier"
 
-            # 🔒 поиск + резерв
-            ok, src_id, dst_id = self.db.find_and_reserve_cells_by_size(
+            # Получаем город клиента
+            client_city = self.db.get_user_city(session, client_user_id)
+
+            # Определяем направление маршрута
+            if client_city == "МСК":
+                source_city = "МСК"
+                dest_city = "СПБ"
+            elif client_city == "СПБ":
+                source_city = "СПБ"
+                dest_city = "МСК"
+            else:
+                return False, None, f"UNSUPPORTED_CITY: {client_city}"
+
+            # 🔒 поиск + резерв ячеек по городам
+            ok, src_id, dst_id = self.db.find_and_reserve_cells_by_cities(
                 session,
-                source_locker_id=1,
-                dest_locker_id=2,
+                source_city=source_city,
+                dest_city=dest_city,
                 cell_size=cell_size,
             )
 
             if not ok:
-                logger.info("[ORDER_CREATE] no free cells")
+                logger.info("[ORDER_CREATE] no free cells in route %s → %s", source_city, dest_city)
                 return False, None, "NO_FREE_CELLS"
 
-            # 🧾 create order
+            # 🧾 создание заказа 
             order_id = self.db.create_order_record(
                 session,
                 description=description,
@@ -64,13 +77,13 @@ class OrderCreationActions:
                 dest_cell_id=dst_id,
             )
 
-            # 🚚 trip bind (без commit)
+            # 🚚 привязка к рейсу с реальными городами
             try:
                 self.db.assign_order_to_trip_smart(
                     session,
                     order_id,
-                    "LOCAL",
-                    "LOCAL",
+                    source_city,  # ← реальный город отправителя
+                    dest_city,    # ← реальный город получателя
                 )
             except Exception as e:
                 logger.warning(
@@ -86,7 +99,7 @@ class OrderCreationActions:
             raise
         except Exception as e:
             logger.exception("create_order_from_request crash")
-            raise DbLayerError(str(e))     
+            raise DbLayerError(str(e))
 
 
 class AssignmentActions:

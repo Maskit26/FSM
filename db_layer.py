@@ -639,71 +639,97 @@ class DatabaseLayer:
                 logger.error("get_order_request: неизвестная ошибка для request_id=%s: %s", request_id, e)
                 raise DbLayerError(f"General error in get_order_request for request_id {request_id}: {e}") from e
 
-    def find_and_reserve_cells_by_size(
+    def get_user_city(self, session: Session, user_id: int) -> str:
+        """
+        Получить город пользователя по ID.
+        """
+        logger.debug("get_user_city вызван для user_id=%s", user_id)
+        row = session.execute(
+            text("SELECT city FROM users WHERE id = :id"),
+            {"id": user_id}  # ← ИСПОЛЬЗУЕМ СЛОВАРЬ, А НЕ КОРТЕЖ
+        ).fetchone()
+        if not row or not row[0]:
+            raise DbLayerError(f"User {user_id} has no city")
+        return row[0]
+
+    def find_and_reserve_cells_by_cities(
         self,
         session: Session,
-        source_locker_id: int,
-        dest_locker_id: int,
+        source_city: str,
+        dest_city: str,
         cell_size: str,
     ) -> Tuple[bool, Optional[int], Optional[int]]:
         logger.debug(
-            "find_and_reserve_cells_by_size вызван: source_locker_id=%s, dest_locker_id=%s, cell_size=%s",
-            source_locker_id, dest_locker_id, cell_size
+            "find_and_reserve_cells_by_cities вызван: source_city=%s, dest_city=%s, cell_size=%s",
+            source_city, dest_city, cell_size
         )
 
         try:
+            # Ищем source_cell в source_city
             src = session.execute(text("""
-                SELECT id
-                FROM locker_cells
-                WHERE locker_id = :locker_id
-                AND cell_type = :cell_size
-                AND status = 'locker_free'
+                SELECT lc.id
+                FROM locker_cells lc
+                JOIN lockers l ON lc.locker_id = l.id
+                WHERE 
+                    l.city = :source_city
+                    AND lc.cell_type = :cell_size
+                    AND lc.status = 'locker_free'
+                ORDER BY l.id, lc.id
                 LIMIT 1
                 FOR UPDATE
             """), {
-                "locker_id": source_locker_id,
+                "source_city": source_city,
                 "cell_size": cell_size,
             }).fetchone()
 
             if not src:
-                logger.debug("find_and_reserve_cells_by_size: нет свободной ячейки в source_locker_id=%s", source_locker_id)
+                logger.debug("Нет свободной ячейки в городе отправителя: %s", source_city)
                 return False, None, None
 
+            # Ищем dest_cell в dest_city
             dst = session.execute(text("""
-                SELECT id
-                FROM locker_cells
-                WHERE locker_id = :locker_id
-                AND cell_type = :cell_size
-                AND status = 'locker_free'
+                SELECT lc.id
+                FROM locker_cells lc
+                JOIN lockers l ON lc.locker_id = l.id
+                WHERE 
+                    l.city = :dest_city
+                    AND lc.cell_type = :cell_size
+                    AND lc.status = 'locker_free'
+                ORDER BY l.id, lc.id
                 LIMIT 1
                 FOR UPDATE
             """), {
-                "locker_id": dest_locker_id,
+                "dest_city": dest_city,
                 "cell_size": cell_size,
             }).fetchone()
 
             if not dst:
-                logger.debug("find_and_reserve_cells_by_size: нет свободной ячейки в dest_locker_id=%s", dest_locker_id)
+                logger.debug("Нет свободной ячейки в городе получателя: %s", dest_city)
                 return False, None, None
 
             src_id = src[0]
             dst_id = dst[0]
 
+            # Резервируем обе ячейки
             session.execute(text("""
                 UPDATE locker_cells
                 SET status = 'locker_reserved'
-                WHERE id IN (:s, :d)
-            """), {"s": src_id, "d": dst_id})
+                WHERE id IN (:src_id, :dst_id)
+            """), {
+                "src_id": src_id,
+                "dst_id": dst_id,
+            })
 
-            logger.debug("find_and_reserve_cells_by_size: успешно зарезервированы ячейки %s → %s", src_id, dst_id)
+            logger.debug("Успешно зарезервированы ячейки: %s (из %s) → %s (в %s)",
+                        src_id, source_city, dst_id, dest_city)
             return True, src_id, dst_id
 
         except Exception as e:
             logger.error(
-                "find_and_reserve_cells_by_size завершился с ошибкой: source=%s, dest=%s, size=%s, error=%s",
-                source_locker_id, dest_locker_id, cell_size, e
+                "find_and_reserve_cells_by_cities завершился с ошибкой: %s → %s, size=%s, error=%s",
+                source_city, dest_city, cell_size, e
             )
-            raise DbLayerError(f"find_and_reserve_cells_by_size failed: {e}") from e
+            raise DbLayerError(f"find_and_reserve_cells_by_cities failed: {e}") from e
 
     def create_order_record(
         self,
@@ -724,8 +750,6 @@ class DatabaseLayer:
             session.execute(text("""
                 INSERT INTO orders (
                     description,
-                    from_city,
-                    to_city,
                     source_cell_id,
                     dest_cell_id,
                     pickup_type,
@@ -735,8 +759,6 @@ class DatabaseLayer:
                 )
                 VALUES (
                     :description,
-                    'LOCAL',
-                    'LOCAL',
                     :src,
                     :dst,
                     :pickup,
@@ -2246,12 +2268,14 @@ class DatabaseLayer:
     def get_available_orders_for_pickup(
         self,
         session: Session,
+        courier_city: str
     ) -> List[Dict[str, Any]]:
         """
         Биржа для курьеров: забрать посылку у клиента → отнести в постамат А.
-        Показывает только заказы, где pickup_type='courier' и этап ещё не взят.
+        Показывает только заказы, где pickup_type='courier', этап ещё не взят,
+        и постамат отправителя находится в городе курьера.
         """
-        logger.debug("get_available_orders_for_pickup вызван")
+        logger.debug("get_available_orders_for_pickup вызван для города: %s", courier_city)
         try:
             query = """
                 SELECT 
@@ -2259,6 +2283,7 @@ class DatabaseLayer:
                     o.status,
                     o.description,
                     l.location_address AS source_address,
+                    l.city AS source_city,
                     lc.cell_code AS source_cell_code,
                     lc.cell_type AS cell_size
                 FROM orders o
@@ -2272,17 +2297,19 @@ class DatabaseLayer:
                     o.status = 'order_created'
                     AND o.pickup_type = 'courier'
                     AND so.courier_user_id IS NULL
+                    AND l.city = :courier_city  
                 ORDER BY o.created_at ASC
             """
-            result = session.execute(text(query)).fetchall()
+            result = session.execute(text(query), {"courier_city": courier_city}).fetchall()  
             orders = [
                 {
                     "id": row[0],
                     "status": row[1],
                     "description": row[2],
                     "source_address": row[3],
-                    "source_cell_code": row[4],
-                    "cell_size": row[5],
+                    "source_city": row[4],
+                    "source_cell_code": row[5],
+                    "cell_size": row[6],
                 }
                 for row in result
             ]
@@ -2295,12 +2322,14 @@ class DatabaseLayer:
     def get_available_orders_for_delivery(
         self,
         session: Session,
+        courier_city: str
     ) -> List[Dict[str, Any]]:
         """
         Биржа для курьеров: забрать посылку из постамата Б → отдать получателю.
-        Показывает только заказы, где delivery_type='courier' и этап ещё не взят.
+        Показывает только заказы, где delivery_type='courier', этап ещё не взят,
+        и постамат получателя находится в городе курьера.
         """
-        logger.debug("get_available_orders_for_delivery вызван")
+        logger.debug("get_available_orders_for_delivery вызван для города: %s", courier_city)
         try:
             query = """
                 SELECT 
@@ -2308,6 +2337,7 @@ class DatabaseLayer:
                     o.status,
                     o.description,
                     l.location_address AS dest_address,
+                    l.city AS dest_city,
                     lc.cell_code AS dest_cell_code,
                     lc.cell_type AS cell_size
                 FROM orders o
@@ -2321,17 +2351,19 @@ class DatabaseLayer:
                     o.status = 'order_parcel_confirmed_post2'
                     AND o.delivery_type = 'courier'
                     AND so.courier_user_id IS NULL
+                    AND l.city = :courier_city
                 ORDER BY o.created_at ASC
             """
-            result = session.execute(text(query)).fetchall()
+            result = session.execute(text(query), {"courier_city": courier_city}).fetchall()
             orders = [
                 {
                     "id": row[0],
                     "status": row[1],
                     "description": row[2],
                     "dest_address": row[3],
-                    "dest_cell_code": row[4],
-                    "cell_size": row[5],
+                    "dest_city": row[4],
+                    "dest_cell_code": row[5],
+                    "cell_size": row[6],
                 }
                 for row in result
             ]
@@ -2340,6 +2372,20 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("get_available_orders_for_delivery завершился с ошибкой: %s", e)
             raise DbLayerError(f"Failed to fetch delivery orders: {e}") from e
+
+    def get_user_by_id(self, session: Session, user_id: int) -> Optional[Dict[str, Any]]:
+        row = session.execute(
+            text("SELECT id, name, role_name, city FROM users WHERE id = :id"),
+            {"id": user_id}
+        ).fetchone()
+        if row:
+            return {
+                "id": row[0],
+                "name": row[1],
+                "role_name": row[2],
+                "city": row[3]
+            }
+        return None
 
     # ==================== РЕЙСЫ ====================
 
@@ -2619,32 +2665,61 @@ class DatabaseLayer:
             order_id, order_from_city, order_to_city
         )
         try:
-            # 1. Получаем локеры из заказа
+            # 1. Получаем locker_id из заказа
             order_data = session.execute(
                 text(
-                    "SELECT o.from_city, o.to_city, "
-                    "lc1.locker_id as pickup_locker, lc2.locker_id as delivery_locker "
-                    "FROM orders o "
-                    "JOIN locker_cells lc1 ON lc1.id = o.source_cell_id "
-                    "JOIN locker_cells lc2 ON lc2.id = o.dest_cell_id "
-                    "WHERE o.id = :order_id"
+                    """
+                    SELECT 
+                        lc1.locker_id as pickup_locker, 
+                        lc2.locker_id as delivery_locker
+                    FROM orders o
+                    JOIN locker_cells lc1 ON lc1.id = o.source_cell_id
+                    JOIN locker_cells lc2 ON lc2.id = o.dest_cell_id
+                    WHERE o.id = :order_id
+                    """
                 ),
                 {"order_id": order_id},
             ).fetchone()
             
             if not order_data:
-                msg = f"Заказ {order_id} или его локеры не найдены"
+                msg = f"Заказ {order_id} или его ячейки не найдены"
                 logger.error("assign_order_to_trip_smart: %s", msg)
                 raise DbLayerError(msg)
             
-            from_city, to_city, pickup_locker_id, delivery_locker_id = order_data
-            
-            if from_city != order_from_city or to_city != order_to_city:
-                msg = f"Маршрут заказа {order_id} не совпадает"
+            pickup_locker_id, delivery_locker_id = order_data
+
+            # 2. Получаем города из lockers
+            cities = session.execute(
+                text(
+                    """
+                    SELECT 
+                        l1.city as from_city,
+                        l2.city as to_city
+                    FROM lockers l1
+                    JOIN lockers l2 ON 1=1
+                    WHERE l1.id = :pickup_locker_id
+                    AND l2.id = :delivery_locker_id
+                    """
+                ),
+                {
+                    "pickup_locker_id": pickup_locker_id,
+                    "delivery_locker_id": delivery_locker_id
+                }
+            ).fetchone()
+
+            if not cities:
+                msg = f"Постаматы не найдены для заказа {order_id}"
                 logger.error("assign_order_to_trip_smart: %s", msg)
                 raise DbLayerError(msg)
 
-            # 2. Ищем существующий рейс по локерам (<5 заказов)
+            from_city, to_city = cities
+
+            if from_city != order_from_city or to_city != order_to_city:
+                msg = f"Маршрут заказа {order_id} не совпадает: {from_city}→{to_city} vs {order_from_city}→{order_to_city}"
+                logger.error("assign_order_to_trip_smart: %s", msg)
+                raise DbLayerError(msg)
+
+            # 3. Ищем существующий рейс по локерам (<5 заказов)
             potential_trip = session.execute(
                 text(
                     """
@@ -2656,10 +2731,10 @@ class DatabaseLayer:
                         GROUP BY trip_id
                     ) so ON so.trip_id = t.id
                     WHERE t.pickup_locker_id = :pickup_locker_id
-                      AND t.delivery_locker_id = :delivery_locker_id
-                      AND t.status IN ('trip_created', 'trip_assigned')
-                      AND t.active = 0
-                      AND (so.cnt IS NULL OR so.cnt < 5)
+                    AND t.delivery_locker_id = :delivery_locker_id
+                    AND t.status IN ('trip_created', 'trip_assigned')
+                    AND t.active = 0
+                    AND (so.cnt IS NULL OR so.cnt < 5)
                     ORDER BY t.id ASC
                     LIMIT 1
                     """
@@ -2677,10 +2752,10 @@ class DatabaseLayer:
                     trip_id, pickup_locker_id, delivery_locker_id
                 )
             else:
-                # 3. Создаём новый рейс с локерами
+                # 4. Создаём новый рейс с локерами
                 trip_id = self.create_trip(
                     session,
-                    order_from_city, order_to_city, 
+                    from_city, to_city,  # ← реальные города из lockers
                     pickup_locker_id, delivery_locker_id,
                     driver_user_id=None, active=0
                 )
@@ -2689,13 +2764,13 @@ class DatabaseLayer:
                     trip_id, pickup_locker_id, delivery_locker_id
                 )
 
-            # 4. Привязываем заказ
+            # 5. Привязываем заказ
             success, msg = self.assign_order_to_trip(session, order_id, trip_id)
             if not success and "5 заказов" in msg:
                 logger.debug("Рейс %s полон, создаём новый рейс", trip_id)
                 trip_id = self.create_trip(
                     session,
-                    order_from_city, order_to_city,
+                    from_city, to_city,
                     pickup_locker_id, delivery_locker_id,
                     driver_user_id=None, active=0
                 )
