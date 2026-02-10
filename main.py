@@ -2,7 +2,8 @@ import os
 from typing import Generator, List, Optional, Dict
 from contextlib import contextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fsm_engine import PROCESS_DEFS
 from dotenv import load_dotenv
@@ -80,20 +81,35 @@ app = FastAPI(
 # ======================
 # CORS
 # ======================
-origins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://v0-fsm-emulator-interface.vercel.app",
-]
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if request.method == "OPTIONS":
+        # Возвращаем пустой 200 OK для preflight-запросов
+        headers = {}
+        if origin in [
+            "https://super-lamp.vercel.app/",
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "https://v0-fsm-emulator-interface.vercel.app/"
+        ]:
+            headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        return Response(status_code=200, headers=headers)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"]
-)
+    # Для обычных запросов
+    response = await call_next(request)
+    if origin in [
+        "https://super-lamp.vercel.app/",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://v0-fsm-emulator-interface.vercel.app/"
+    ]:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    return response
 
 # ======================
 # ОБРАБОТЧИК DB ERRORS
