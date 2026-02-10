@@ -2387,6 +2387,31 @@ class DatabaseLayer:
             }
         return None
 
+    def get_all_available_orders_for_courier(
+        self,
+        session: Session,
+        courier_city: str
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Возвращает все доступные заказы для курьера в его городе:
+        - pickup: забор у клиента (source_cell в городе курьера)
+        - delivery: доставка получателю (dest_cell в городе курьера)
+        """
+        pickup = self.get_available_orders_for_pickup(session, courier_city)
+        delivery = self.get_available_orders_for_delivery(session, courier_city)
+
+        # Добавляем тип прямо здесь — чтобы не дублировать логику в API
+        for order in pickup:
+            order["type"] = "pickup"
+        for order in delivery:
+            order["type"] = "delivery"
+
+        return {
+            "pickup": pickup,
+            "delivery": delivery,
+            "all": pickup + delivery  # ← удобно для фронта: один список
+        }
+
     # ==================== РЕЙСЫ ====================
 
     def set_driver_in_trip(
