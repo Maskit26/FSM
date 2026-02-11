@@ -598,7 +598,7 @@ class DatabaseLayer:
             try:
                 row = session.execute(
                     text("""
-                        SELECT id, client_user_id, parcel_type, cell_size,
+                        SELECT id, client_user_id, recipient_user_id, parcel_type, cell_size,
                                sender_delivery, recipient_delivery, status
                         FROM order_requests
                         WHERE id = :id
@@ -613,11 +613,12 @@ class DatabaseLayer:
                 result = {
                     "id": row[0],
                     "client_user_id": row[1],
-                    "parcel_type": row[2],
-                    "cell_size": row[3],
-                    "sender_delivery": row[4],
-                    "recipient_delivery": row[5],
-                    "status": row[6]
+                    "recipient_user_id": row[2], 
+                    "parcel_type": row[3],
+                    "cell_size": row[4],
+                    "sender_delivery": row[5],
+                    "recipient_delivery": row[6],
+                    "status": row[7]
                 }
                 logger.debug("get_order_request: успешно получена заявка request_id=%s", request_id)
                 return result
@@ -646,7 +647,7 @@ class DatabaseLayer:
         logger.debug("get_user_city вызван для user_id=%s", user_id)
         row = session.execute(
             text("SELECT city FROM users WHERE id = :id"),
-            {"id": user_id}  # ← ИСПОЛЬЗУЕМ СЛОВАРЬ, А НЕ КОРТЕЖ
+            {"id": user_id}  
         ).fetchone()
         if not row or not row[0]:
             raise DbLayerError(f"User {user_id} has no city")
@@ -738,6 +739,7 @@ class DatabaseLayer:
         pickup_type: str,
         delivery_type: str,
         client_user_id: int,
+        recipient_user_id: Optional[int],
         source_cell_id: int,
         dest_cell_id: int,
     ) -> int:
@@ -755,7 +757,8 @@ class DatabaseLayer:
                     pickup_type,
                     delivery_type,
                     status,
-                    client_user_id
+                    client_user_id,
+                    recipient_user_id
                 )
                 VALUES (
                     :description,
@@ -764,7 +767,8 @@ class DatabaseLayer:
                     :pickup,
                     :delivery,
                     'order_created',
-                    :client
+                    :client,
+                    :recipient
                 )
             """), {
                 "description": description,
@@ -773,6 +777,7 @@ class DatabaseLayer:
                 "pickup": pickup_type,
                 "delivery": delivery_type,
                 "client": client_user_id,
+                "recipient": recipient_user_id,
             })
 
             order_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
@@ -1912,6 +1917,7 @@ class DatabaseLayer:
         self,
         session: Session,
         client_user_id: int,
+        recipient_user_id: int,
         parcel_type: str,
         cell_size: str,
         sender_delivery: str,
@@ -1931,13 +1937,14 @@ class DatabaseLayer:
                 text(
                     """
                     INSERT INTO order_requests
-                        (client_user_id, parcel_type, cell_size, sender_delivery, recipient_delivery)
+                        (client_user_id, recipient_user_id, parcel_type, cell_size, sender_delivery, recipient_delivery)
                     VALUES
-                        (:client_user_id, :parcel_type, :cell_size, :sender_delivery, :recipient_delivery)
+                        (:client_user_id, :recipient_user_id, :parcel_type, :cell_size, :sender_delivery, :recipient_delivery)
                     """
                 ),
                 {
                     "client_user_id": client_user_id,
+                    "recipient_user_id": recipient_user_id,
                     "parcel_type": parcel_type,
                     "cell_size": cell_size,
                     "sender_delivery": sender_delivery,

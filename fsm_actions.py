@@ -33,6 +33,7 @@ class OrderCreationActions:
                 return False, None, "INVALID_DATA"
 
             parcel_type = req["parcel_type"]
+            recipient_user_id = req["recipient_user_id"]
             cell_size = req["cell_size"]
             sender_delivery = req["sender_delivery"]
             recipient_delivery = req["recipient_delivery"]
@@ -73,6 +74,7 @@ class OrderCreationActions:
                 pickup_type=pickup_type,
                 delivery_type=delivery_type,
                 client_user_id=client_user_id,
+                recipient_user_id=recipient_user_id,
                 source_cell_id=src_id,
                 dest_cell_id=dst_id,
             )

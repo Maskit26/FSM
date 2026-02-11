@@ -235,6 +235,7 @@ async def create_order_request(
             request_id = db.create_order_request_and_fsm(
                 session,
                 client_user_id=request.client_user_id,
+                recipient_user_id=request.recipient_user_id,
                 parcel_type=request.parcel_type,
                 cell_size=request.cell_size,
                 sender_delivery=request.sender_delivery,
