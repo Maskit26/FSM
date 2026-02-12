@@ -3,6 +3,7 @@
 import time
 import logging
 import os
+import json
 from typing import Any, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -83,6 +84,7 @@ def row_to_instance_dict(row: Tuple[Any, ...]) -> Dict[str, Any]:
         "requested_user_role": row[9],
         "target_user_id": row[10],
         "target_role": row[11],
+        "metadata_json": row[12],
     }
 
 # ================== CORE ==================
@@ -98,6 +100,17 @@ def process_instance(
     with get_db_session() as session:
         try:
             instance = row_to_instance_dict(instance_row)
+            # ДЕСЕРИАЛИЗАЦИЯ METADATA
+            try:
+                instance["metadata"] = json.loads(instance["metadata_json"]) if instance.get("metadata_json") else {}
+            except (ValueError, TypeError, json.JSONDecodeError):
+                logger.warning(
+                    "[FSM] invalid metadata_json for instance_id=%s: %s",
+                    instance["id"],
+                    instance.get("metadata_json")
+                )
+                instance["metadata"] = {}
+
             actions_ctx = build_actions_context(db)
 
             logger.info(

@@ -4,6 +4,10 @@ from typing import Tuple, Optional
 from db_layer import DatabaseLayer, DbLayerError
 from sqlalchemy.orm import Session
 import logging
+import hashlib
+import secrets
+import requests
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -900,4 +904,91 @@ class OperatorActions:
             return True, ""
         except Exception as e:
             logger.error("[OPERATOR] failed to set cell %s to maintenance: %s", cell_id, str(e))
+            return False, str(e)
+
+# ==================== Access Code ====================
+class AccessCodeActions:
+    def __init__(self, db: DatabaseLayer):
+        self.db = db
+
+    def request_access_code(
+        self,
+        session: Session,
+        order_id: int,
+        user_id: int,
+        leg: str
+    ) -> Tuple[bool, str]:
+        """
+        Генерирует и выдаёт PIN-код для открытия ячейки.
+        Проверяет:
+          - статус заказа
+          - право пользователя на доступ
+          - лимит ≤3 за 15 минут
+        Сохраняет хэш PIN в cell_access_tokens.
+        Отправляет PIN пользователю (SMS/push).
+        """
+        try:
+            # 1. Загрузить заказ
+            order = self.db.get_order(session, order_id)
+            if not order:
+                return False, "ORDER_NOT_FOUND"
+
+            # 2. Проверить статус (разрешённые состояния)
+            allowed_statuses = {
+                "pickup": ["order_created", "order_courier1_assigned"],
+                "delivery": ["order_parcel_confirmed_post2", "order_courier2_assigned"]
+            }
+            if order["status"] not in allowed_statuses[leg]:
+                return False, f"CODE_NOT_ALLOWED_IN_{order['status']}"
+
+            # 3. Определить, кто авторизован
+            authorized_user_id = None
+            if leg == "pickup":
+                if order["pickup_type"] == "self":
+                    authorized_user_id = order["client_user_id"]
+                else:
+                    stage = self.db.get_stage_order(session, order_id, "pickup")
+                    authorized_user_id = stage.courier_user_id if stage else None
+            else:  # delivery
+                if order["delivery_type"] == "self":
+                    authorized_user_id = order.get("recipient_user_id")
+                else:
+                    stage = self.db.get_stage_order(session, order_id, "delivery")
+                    authorized_user_id = stage.courier_user_id if stage else None
+
+            if authorized_user_id != user_id:
+                return False, "USER_NOT_AUTHORIZED"
+
+            # 4. Проверить лимит (≤3 за 15 мин)
+            recent = self.db.count_recent_access_code_requests(session, order_id, leg, 15)
+            if recent >= 3:
+                return False, "TOO_MANY_CODE_REQUESTS"
+
+            # 5. Определить cell_id
+            cell_id = order["source_cell_id"] if leg == "pickup" else order["dest_cell_id"]
+            if not cell_id:
+                return False, "CELL_ID_MISSING"
+
+            # 6. Генерация PIN            
+            pin = f"{secrets.randbelow(900000) + 100000:06d}"
+            pin_hash = hashlib.sha256(f"{pin}{order_id}{cell_id}".encode()).hexdigest()
+            expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+            # 7. Сохранить в cell_access_tokens
+            token_id = self.db.create_access_token(
+                session, order_id, leg, cell_id, user_id, pin_hash, expires_at
+            )
+
+            # 8. Отправить PIN
+            try:
+                success_send = self.db.send_code_to_user(session, user_id, pin)
+                if not success_send:
+                    logger.warning(f"Failed to deliver code to user {user_id}")
+            except Exception as e:
+                logger.error(f"Error in send_code_to_user: {e}")
+            logger.info(f"Access code issued: order={order_id}, leg={leg}, user={user_id}, token={token_id}")
+            return True, ""
+
+        except Exception as e:
+            logger.exception(f"request_access_code failed for order {order_id}: {e}")
             return False, str(e)

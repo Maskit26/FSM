@@ -28,6 +28,8 @@ from mysql.connector import Error
 import logging
 import time
 import traceback
+import json
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -1589,6 +1591,7 @@ class DatabaseLayer:
         requested_user_role: str,
         target_user_id: Optional[int] = None,
         target_role: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Создать или обновить инстанс FSM-процесса."""
         logger.debug(
@@ -1596,17 +1599,19 @@ class DatabaseLayer:
             entity_type, entity_id, process_name, fsm_state
         )
         try:
+            metadata_json = json.dumps(metadata) if metadata is not None else None
             session.execute(text("""
                 INSERT INTO server_fsm_instances (
                     entity_type, entity_id, process_name, fsm_state, attempts_count,
                     requested_by_user_id, requested_user_role,
                     target_user_id, target_role,
-                    last_error, next_timer_at
+                    last_error, next_timer_at, metadata_json
                 ) VALUES (
                     :entity_type, :entity_id, :process_name, :fsm_state, 0,
                     :requested_by_user_id, :requested_user_role,
                     :target_user_id, :target_role,
-                    NULL, NULL
+                    NULL, NULL,
+                    :metadata_json
                 )
                 ON DUPLICATE KEY UPDATE
                     fsm_state = VALUES(fsm_state),
@@ -1617,6 +1622,7 @@ class DatabaseLayer:
                     requested_user_role = VALUES(requested_user_role),
                     target_user_id = VALUES(target_user_id),
                     target_role = VALUES(target_role),
+                    metadata_json = VALUES(metadata_json),
                     updated_at = NOW()
             """), {
                 "entity_type": entity_type,
@@ -1627,6 +1633,7 @@ class DatabaseLayer:
                 "requested_user_role": requested_user_role,
                 "target_user_id": target_user_id,
                 "target_role": target_role,
+                "metadata_json": metadata_json,
             })
 
             row = session.execute(text("""
@@ -1738,7 +1745,8 @@ class DatabaseLayer:
                         requested_by_user_id,
                         requested_user_role,
                         target_user_id,
-                        target_role
+                        target_role,
+                        metadata_json
                     FROM server_fsm_instances
                     WHERE fsm_state NOT IN ('COMPLETED', 'FAILED')
                       AND (next_timer_at IS NULL OR next_timer_at <= NOW())
@@ -1993,7 +2001,7 @@ class DatabaseLayer:
             row = session.execute(
                 text(
                     "SELECT id, status, description, pickup_type, delivery_type, "
-                    "source_cell_id, dest_cell_id "
+                    "source_cell_id, dest_cell_id, client_user_id, recipient_user_id "
                     "FROM orders WHERE id = :id"
                 ),
                 {"id": order_id},
@@ -2008,6 +2016,8 @@ class DatabaseLayer:
                     "delivery_type": row[4],
                     "source_cell_id": row[5],
                     "dest_cell_id": row[6],
+                    "client_user_id": row[7],
+                    "recipient_user_id": row[8],
                 }
                 logger.debug("get_order: найден заказ %s", order_id)
                 return order
@@ -2181,6 +2191,85 @@ class DatabaseLayer:
                 order_id, leg, e
             )
             raise DbLayerError(f"clear_courier_from_stage_order failed: {e}") from e
+
+    # ==================== Access Code ====================
+    def get_stage_order(self, session: Session, order_id: int, leg: str):
+        row = session.execute(
+            text("SELECT courier_user_id FROM stage_orders WHERE order_id = :oid AND leg = :leg"),
+            {"oid": order_id, "leg": leg}
+        ).fetchone()
+        return row if row else None
+
+    def count_recent_access_code_requests(
+        self,
+        session: Session,
+        order_id: int,
+        leg: str,
+        minutes: int
+    ) -> int:
+        cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+        result = session.execute(
+            text("""
+                SELECT COUNT(*) 
+                FROM cell_access_tokens 
+                WHERE order_id = :order_id 
+                AND leg = :leg 
+                AND created_at > :cutoff
+            """),
+            {"order_id": order_id, "leg": leg, "cutoff": cutoff}
+        ).scalar()
+        return int(result) if result else 0
+
+    def create_access_token(
+        self,
+        session: Session,
+        order_id: int,
+        leg: str,
+        cell_id: int,
+        actor_user_id: int,
+        pin_hash: str,
+        expires_at: datetime
+    ) -> int:
+        session.execute(
+            text("""
+                INSERT INTO cell_access_tokens (
+                    order_id, leg, cell_id, actor_user_id, pin_hash, expires_at
+                ) VALUES (
+                    :order_id, :leg, :cell_id, :actor_user_id, :pin_hash, :expires_at
+                )
+            """),
+            {
+                "order_id": order_id,
+                "leg": leg,
+                "cell_id": cell_id,
+                "actor_user_id": actor_user_id,
+                "pin_hash": pin_hash,
+                "expires_at": expires_at,
+            }
+        )
+        return session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+
+    def send_code_to_user(self, session: Session, user_id: int, pin: str) -> bool:
+        """
+        ЗАГЛУШКА: имитация отправки SMS.
+        В продакшене заменить на интеграцию с SMS.RU / Twilio.
+        """
+        try:
+            # Получаем телефон для лога
+            row = session.execute(
+                text("SELECT phone FROM users WHERE id = :user_id"),
+                {"user_id": user_id}
+            ).fetchone()
+            phone = row[0] if row and row[0] else "UNKNOWN"
+
+            # Логируем как MOCK
+            logger.info(f"[MOCK SMS] Отправлен PIN {pin} пользователю {user_id} (телефон: {phone})")
+            return True  # Всегда успешно
+
+        except Exception as e:
+            logger.exception(f"send_code_to_user mock failed for user_id={user_id}: {e}")
+            return False
+
 
     # ==================== НОВЫЕ МЕТОДЫ: РАЗВИЛКИ FSM ====================
 

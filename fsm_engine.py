@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, Any, Optional
 from sqlalchemy.orm import Session
+import json
 import logging
 
 from db_layer import DatabaseLayer, DbLayerError
@@ -15,6 +16,7 @@ from fsm_actions import (
     ClientActions,
     RecipientActions,
     DriverActions,
+    AccessCodeActions,
 )
 
 logger = logging.getLogger(__name__)
@@ -386,6 +388,50 @@ def _handle_cancel_trip(
     logger.info(f"[FSM] cancel_trip COMPLETED: trip_id={trip_id}")
     return FsmStepResult(new_state="COMPLETED")
 
+# ==================== Access Code ====================
+def _handle_request_locker_access_code(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Обработчик запроса кода открытия ячейки.
+    Поддерживает: client, courier, recipient, driver.
+    Ожидает в instance["metadata"]: {"leg": "pickup" | "delivery"}
+    """
+    user_role = instance["requested_user_role"]
+    entity_type = instance["entity_type"]
+    order_id = instance["entity_id"]
+    user_id = instance["requested_by_user_id"]
+    metadata = instance.get("metadata", {})
+    
+    if entity_type != "order":
+        logger.error(f"[FSM] request_locker_access_code: unsupported entity_type={entity_type}")
+        return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
+
+    if not metadata or not isinstance(metadata, dict):
+        logger.error(f"[FSM] request_locker_access_code: missing or invalid metadata for order {order_id}")
+        return FsmStepResult(new_state="FAILED", last_error="MISSING_METADATA")
+
+    leg = metadata.get("leg")
+    if leg not in ("pickup", "delivery"):
+        logger.error(f"[FSM] request_locker_access_code: invalid leg={leg} for order {order_id}")
+        return FsmStepResult(new_state="FAILED", last_error="INVALID_LEG")
+
+    logger.info(f"[FSM] request_locker_access_code: role={user_role}, order={order_id}, leg={leg}, user={user_id}")
+
+    # Делегируем экшену
+    success, error = ctx["access_code_actions"].request_access_code(
+        session, order_id, user_id, leg
+    )
+
+    if not success:
+        logger.error(f"[FSM] request_locker_access_code FAILED: order={order_id}, error={error}")
+        return FsmStepResult(new_state="FAILED", last_error=error or "REQUEST_FAILED")
+
+    logger.info(f"[FSM] request_locker_access_code COMPLETED: order={order_id}")
+    return FsmStepResult(new_state="COMPLETED")
 
 # ==================== PROCESS REGISTRY ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
@@ -400,6 +446,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "close_cell": {"PENDING": _handle_close_cell},
     "cancel_order": {"PENDING": _handle_cancel_order},
     "locker_error": {"PENDING": _handle_locker_error},
+    "request_locker_access_code": {"PENDING": _handle_request_locker_access_code},
 }
 
 
@@ -413,6 +460,7 @@ def build_actions_context(db: DatabaseLayer) -> Dict[str, Any]:
         "client_actions": ClientActions(db),
         "recipient_actions": RecipientActions(db),
         "driver_actions": DriverActions(db),
+        "access_code_actions": AccessCodeActions(db),
     }
 
 

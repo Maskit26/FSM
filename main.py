@@ -86,10 +86,11 @@ async def cors_middleware(request: Request, call_next):
     origin = request.headers.get("origin")
     
     allowed_origins = [
-        "https://super-lamp.vercel.app",  # БЕЗ слэша!
+        "https://super-lamp.vercel.app",
+        "http://91.135.156.173:8000",
         "http://localhost:3000",
         "http://localhost:5173",
-        "https://v0-fsm-emulator-interface.vercel.app"  # БЕЗ слэша!
+        "https://v0-fsm-emulator-interface.vercel.app"
     ]
     
     if request.method == "OPTIONS":
@@ -97,13 +98,13 @@ async def cors_middleware(request: Request, call_next):
         headers = {
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "Authorization, Content-Type",
-            "Access-Control-Max-Age": "3600",  # Важно для Firefox!
+            "Access-Control-Max-Age": "3600",
         }
         if origin in allowed_origins:
             headers["Access-Control-Allow-Origin"] = origin
-            headers["Access-Control-Allow-Credentials"] = "true"  # Если используете cookies
+            headers["Access-Control-Allow-Credentials"] = "true"
         
-        return Response(status_code=204, headers=headers)  # 204 лучше чем 200
+        return Response(status_code=204, headers=headers)
 
     # Обычные запросы
     response = await call_next(request)
@@ -518,6 +519,7 @@ async def enqueue_fsm(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(ge
                 requested_user_role=role,
                 target_user_id=request.target_user_id,
                 target_role=request.target_role,
+                metadata=request.metadata,
             )
             return ApiResponse(success=True, message="ENQUEUED", data={"instance_id": instance_id})
 
