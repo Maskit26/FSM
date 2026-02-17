@@ -33,7 +33,6 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-
 class DbLayerError(Exception):
     """Базовое исключение для ошибок db_layer."""
     pass
@@ -360,8 +359,24 @@ class DatabaseLayer:
         return self.call_fsm_action(session, "order", order_id, "order_reserve_for_courier_A_to_B", courier_id)
 
     def order_confirm_parcel_in(self, session: Session, order_id: int, user_id: int) -> bool:
-        """Подтверждение, что посылка находится в нужном месте (FSM: order_confirm_parcel_in)."""
-        return self.call_fsm_action(session, "order", order_id, "order_confirm_parcel_in", user_id)
+        """Подтверждение, что посылка находится в нужном месте."""
+        logger.debug("order_confirm_parcel_in вызван: order_id=%s, user_id=%s", order_id, user_id)
+        
+        # Выполняем FSM-переход
+        self.call_fsm_action(session, "order", order_id, "order_confirm_parcel_in", user_id)
+
+        # Ставим задачу на привязку к рейсу
+        self.enqueue_fsm_instance(
+            session,
+            entity_type="order",
+            entity_id=order_id,
+            process_name="bind_order_to_trip",
+            fsm_state="PENDING",
+            requested_by_user_id=999999,  # системный
+            requested_user_role="system"
+        )
+
+        return True
 
     def order_mark_parcel_submitted(self, session: Session, order_id: int, user_id: int) -> bool:
         """Фиксация, что посылка сдана (FSM: order_parcel_submitted)."""
@@ -1440,24 +1455,30 @@ class DatabaseLayer:
 
     def get_locker_city_by_cell(self, session: Session, cell_id: int) -> str:
         """
-        Получить город по ID ячейки (парсит из location_address).
+        Возвращает город по ID ячейки через locker.city.
         """
         logger.debug("get_locker_city_by_cell вызван: cell_id=%s", cell_id)
         try:
-            result = session.execute(text("""
-                SELECT l.location_address 
-                FROM locker_cells lc
-                JOIN lockers l ON l.id = lc.locker_id
-                WHERE lc.id = :cell_id
-            """), {"cell_id": cell_id}).scalar()
+            result = session.execute(
+                text("""
+                    SELECT l.city
+                    FROM locker_cells c
+                    JOIN lockers l ON l.id = c.locker_id
+                    WHERE c.id = :cell_id
+                """),
+                {"cell_id": cell_id}
+            ).scalar()
 
             if not result:
-                logger.error("get_locker_city_by_cell: ячейка %s не найдена или адрес отсутствует", cell_id)
-                raise DbLayerError(f"Ячейка {cell_id} не найдена или у постамата нет адреса")
+                raise DbLayerError(f"Ячейка {cell_id} не найдена или не привязана к постамату")
 
-            city = result.split(",")[0].strip()
+            city = result.strip()
+            if not city:
+                raise DbLayerError(f"Постамат для ячейки {cell_id} не имеет города")
+
             logger.debug("get_locker_city_by_cell: cell_id=%s → city='%s'", cell_id, city)
             return city
+
         except Exception as e:
             logger.error("get_locker_city_by_cell завершился с ошибкой для cell_id=%s: %s", cell_id, e)
             raise DbLayerError(f"Failed to get city for cell {cell_id}: {e}") from e
@@ -2508,6 +2529,52 @@ class DatabaseLayer:
             "all": pickup + delivery  # ← удобно для фронта: один список
         }
 
+    def get_available_trips_for_driver_exchange(
+        self,
+        session: Session,
+        city: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Возвращает рейсы, доступные для взятия водителем из указанного города.
+        Условия:
+        - trips.from_city = :city
+        - trips.status = 'trip_created'
+        - trips.active = 1
+        """
+        logger.debug("get_available_trips_for_driver_exchange вызван для города: {}", city)
+
+        query = text("""
+            SELECT
+                t.id,
+                t.from_city,
+                t.to_city
+            FROM trips t
+            WHERE
+                t.from_city = :city
+                AND t.status = 'trip_created'
+                AND t.active = 1
+            ORDER BY t.created_at ASC;
+        """)
+
+        try:
+            result = session.execute(query, {"city": city}).fetchall()
+
+            trips = [
+                {
+                    "id": row[0],
+                    "from_city": row[1],
+                    "to_city": row[2]
+                }
+                for row in result
+            ]
+
+            logger.debug("Найдено {} рейсов для города {}", len(trips), city)
+            return trips
+
+        except Exception as e:
+            logger.error("get_available_trips_for_driver_exchange завершился с ошибкой: {}", e)
+            raise DbLayerError(f"Ошибка получения рейсов для биржи: {e}") from e
+
     # ==================== РЕЙСЫ ====================
 
     def set_driver_in_trip(
@@ -2705,18 +2772,21 @@ class DatabaseLayer:
         order_id: int,
         trip_id: int
     ) -> Tuple[bool, str]:
-        """Привязать заказ к рейсу с валидацией."""
+        """
+        Привязывает заказ к рейсу.
+        Обновляет trip_id в уже существующих записях stage_orders (pickup/delivery).
+        """
         logger.debug("assign_order_to_trip вызван: order_id=%s, trip_id=%s", order_id, trip_id)
         try:
-            # 1. Заказ не должен быть в активном рейсе
+            # Проверка: заказ не должен быть в активном рейсе
             count = session.execute(
-                text(
-                    "SELECT COUNT(*) "
-                    "FROM stage_orders so "
-                    "JOIN trips t ON t.id = so.trip_id "
-                    "WHERE so.order_id = :order_id "
-                    "  AND t.status NOT IN ('trip_completed', 'trip_failed')"
-                ),
+                text("""
+                    SELECT COUNT(*)
+                    FROM stage_orders so
+                    JOIN trips t ON t.id = so.trip_id
+                    WHERE so.order_id = :order_id
+                    AND t.status NOT IN ('trip_completed', 'trip_failed')
+                """),
                 {"order_id": order_id},
             ).scalar()
             if count and count > 0:
@@ -2724,7 +2794,7 @@ class DatabaseLayer:
                 logger.warning("assign_order_to_trip: %s (order_id=%s)", msg, order_id)
                 return False, msg
 
-            # 2. Проверка статуса рейса
+            # Проверка статуса рейса
             trip_status = session.execute(
                 text("SELECT status FROM trips WHERE id = :trip_id"),
                 {"trip_id": trip_id},
@@ -2738,7 +2808,7 @@ class DatabaseLayer:
                 logger.warning("assign_order_to_trip: %s", msg)
                 return False, msg
 
-            # 3. Лимит 5 заказов на рейс
+            # Лимит 5 заказов на рейс
             trip_count = session.execute(
                 text("SELECT COUNT(DISTINCT order_id) FROM stage_orders WHERE trip_id = :trip_id"),
                 {"trip_id": trip_id},
@@ -2749,15 +2819,19 @@ class DatabaseLayer:
                 logger.warning("assign_order_to_trip: %s (trip_id=%s)", msg, trip_id)
                 return False, msg
 
-            # 4. Вставка двух записей (pickup и delivery)
-            session.execute(
-                text(
-                    "INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id) "
-                    "VALUES (:trip_id, :order_id, 'pickup', NULL), "
-                    "       (:trip_id, :order_id, 'delivery', NULL)"
-                ),
+            # ОБНОВЛЕНИЕ trip_id в существующих записях
+            result = session.execute(
+                text("""
+                    UPDATE stage_orders
+                    SET trip_id = :trip_id
+                    WHERE order_id = :order_id
+                    AND leg IN ('pickup', 'delivery')
+                """),
                 {"trip_id": trip_id, "order_id": order_id},
             )
+
+            if result.rowcount != 2:
+                logger.warning("assign_order_to_trip: обновлено %d строк вместо 2 для order_id=%s", result.rowcount, order_id)
 
             logger.info("Заказ %s успешно привязан к рейсу %s", order_id, trip_id)
             return True, "Заказ привязан к рейсу"
@@ -2773,199 +2847,109 @@ class DatabaseLayer:
         self,
         session: Session,
         order_id: int,
-        order_from_city: str,
-        order_to_city: str
+        pickup_locker_id: int,
+        delivery_locker_id: int,
+        from_city: str,
+        to_city: str,
     ) -> Tuple[int, bool, str]:
         """
-        Умная привязка заказа к рейсу:
-        - ищет существующий рейс по локерам с <5 заказов
-        - если не находит, создаёт новый
+        Привязывает заказ к рейсу.
+        Ищет рейсы с <5 заказами, если нет — создаёт новый.
+        Если после привязки стало ровно 5 заказов — сразу активирует рейс.
         """
-        logger.debug(
-            "assign_order_to_trip_smart вызван: order_id=%s, from=%s, to=%s",
-            order_id, order_from_city, order_to_city
-        )
+        logger.debug("assign_order_to_trip_smart: order=%s, from=%s, to=%s", order_id, from_city, to_city)
         try:
-            # 1. Получаем locker_id из заказа
-            order_data = session.execute(
-                text(
-                    """
-                    SELECT 
-                        lc1.locker_id as pickup_locker, 
-                        lc2.locker_id as delivery_locker
-                    FROM orders o
-                    JOIN locker_cells lc1 ON lc1.id = o.source_cell_id
-                    JOIN locker_cells lc2 ON lc2.id = o.dest_cell_id
-                    WHERE o.id = :order_id
-                    """
-                ),
-                {"order_id": order_id},
-            ).fetchone()
-            
-            if not order_data:
-                msg = f"Заказ {order_id} или его ячейки не найдены"
-                logger.error("assign_order_to_trip_smart: %s", msg)
-                raise DbLayerError(msg)
-            
-            pickup_locker_id, delivery_locker_id = order_data
+            # 1. Ищем существующий рейс ПО ЛОКЕРАМ
+            existing_trip = session.execute(text("""
+                SELECT t.id
+                FROM trips t
+                LEFT JOIN (
+                    SELECT trip_id, COUNT(DISTINCT order_id) AS cnt
+                    FROM stage_orders
+                    GROUP BY trip_id
+                ) so ON so.trip_id = t.id
+                WHERE t.pickup_locker_id = :pickup_locker_id
+                AND t.delivery_locker_id = :delivery_locker_id
+                AND t.status IN ('trip_created', 'trip_assigned')
+                AND t.active = 0
+                AND (so.cnt IS NULL OR so.cnt < 5)
+                ORDER BY t.id ASC
+                LIMIT 1
+            """), {
+                "pickup_locker_id": pickup_locker_id,
+                "delivery_locker_id": delivery_locker_id,
+            }).fetchone()
 
-            # 2. Получаем города из lockers
-            cities = session.execute(
-                text(
-                    """
-                    SELECT 
-                        l1.city as from_city,
-                        l2.city as to_city
-                    FROM lockers l1
-                    JOIN lockers l2 ON 1=1
-                    WHERE l1.id = :pickup_locker_id
-                    AND l2.id = :delivery_locker_id
-                    """
-                ),
-                {
-                    "pickup_locker_id": pickup_locker_id,
-                    "delivery_locker_id": delivery_locker_id
-                }
-            ).fetchone()
-
-            if not cities:
-                msg = f"Постаматы не найдены для заказа {order_id}"
-                logger.error("assign_order_to_trip_smart: %s", msg)
-                raise DbLayerError(msg)
-
-            from_city, to_city = cities
-
-            if from_city != order_from_city or to_city != order_to_city:
-                msg = f"Маршрут заказа {order_id} не совпадает: {from_city}→{to_city} vs {order_from_city}→{order_to_city}"
-                logger.error("assign_order_to_trip_smart: %s", msg)
-                raise DbLayerError(msg)
-
-            # 3. Ищем существующий рейс по локерам (<5 заказов)
-            potential_trip = session.execute(
-                text(
-                    """
-                    SELECT t.id
-                    FROM trips t
-                    LEFT JOIN (
-                        SELECT trip_id, COUNT(DISTINCT order_id) AS cnt
-                        FROM stage_orders
-                        GROUP BY trip_id
-                    ) so ON so.trip_id = t.id
-                    WHERE t.pickup_locker_id = :pickup_locker_id
-                    AND t.delivery_locker_id = :delivery_locker_id
-                    AND t.status IN ('trip_created', 'trip_assigned')
-                    AND t.active = 0
-                    AND (so.cnt IS NULL OR so.cnt < 5)
-                    ORDER BY t.id ASC
-                    LIMIT 1
-                    """
-                ),
-                {
-                    "pickup_locker_id": pickup_locker_id, 
-                    "delivery_locker_id": delivery_locker_id
-                },
-            ).fetchone()
-
-            if potential_trip:
-                trip_id = potential_trip[0]
-                logger.debug(
-                    "Используем существующий рейс: %s (локеры %s→%s)",
-                    trip_id, pickup_locker_id, delivery_locker_id
-                )
+            if existing_trip:
+                trip_id = existing_trip[0]
+                logger.debug("Используем существующий рейс %s для заказа %s", trip_id, order_id)
             else:
-                # 4. Создаём новый рейс с локерами
+                # 2. Создаём новый рейс
                 trip_id = self.create_trip(
                     session,
-                    from_city, to_city,  # ← реальные города из lockers
-                    pickup_locker_id, delivery_locker_id,
-                    driver_user_id=None, active=0
+                    from_city=from_city,
+                    to_city=to_city,
+                    pickup_locker_id=pickup_locker_id,
+                    delivery_locker_id=delivery_locker_id,
+                    driver_user_id=None,
+                    active=0,
                 )
-                logger.debug(
-                    "Создан новый рейс: %s (локеры %s→%s)",
-                    trip_id, pickup_locker_id, delivery_locker_id
-                )
+                logger.debug("Создан новый рейс %s для заказа %s", trip_id, order_id)
 
-            # 5. Привязываем заказ
+            # 3. Привязываем заказ
             success, msg = self.assign_order_to_trip(session, order_id, trip_id)
-            if not success and "5 заказов" in msg:
-                logger.debug("Рейс %s полон, создаём новый рейс", trip_id)
-                trip_id = self.create_trip(
-                    session,
-                    from_city, to_city,
-                    pickup_locker_id, delivery_locker_id,
-                    driver_user_id=None, active=0
-                )
-                success, msg = self.assign_order_to_trip(session, order_id, trip_id)
+            if not success:
+                return 0, False, msg
 
-            return trip_id, success, msg
+            # 4. 🔥 Проверяем: стало ли 5 заказов?
+            current_count = session.execute(text("""
+                SELECT COUNT(DISTINCT order_id)
+                FROM stage_orders
+                WHERE trip_id = :trip_id
+            """), {"trip_id": trip_id}).scalar()
 
+            if current_count == 5:
+                logger.info("Рейс %s набрал 5 заказов — активируем немедленно", trip_id)
+                session.execute(text("UPDATE trips SET active = 1 WHERE id = :trip_id"), {"trip_id": trip_id})
+
+            return trip_id, True, "Заказ привязан"
         except Exception as e:
-            logger.error(
-                "assign_order_to_trip_smart завершился с ошибкой для order_id=%s: %s",
-                order_id, e
-            )
-            raise DbLayerError(f"Ошибка умной привязки заказа {order_id}: {e}") from e
+            logger.error("assign_order_to_trip_smart failed for order %s: %s", order_id, e)
+            raise DbLayerError(f"assign_order_to_trip_smart failed: {e}") from e
 
     def update_trip_active_flags(
         self,
         session: Session,
-        max_orders: int = 5,
+        max_orders=5,        
         wait_hours: float = 24.0
     ) -> int:
         """
-        Активация рейсов с учётом ТОЛЬКО активных заказов.
-        
-        Исключает заказы в статусах: cancelled, completed, failed.
+        Активация рейсов ТОЛЬКО по таймауту (24 часа).
+        Рейсы с 5+ заказами уже активированы в assign_order_to_trip_smart.
         """
-        logger.debug(
-            "update_trip_active_flags вызван: max_orders=%s, wait_hours=%s",
-            max_orders, wait_hours
-        )
-        if max_orders <= 0 and wait_hours <= 0:
-            logger.debug("update_trip_active_flags: условия отключены")
+        logger.debug("update_trip_active_flags (таймаут-режим): wait_hours=%s", wait_hours)
+        if wait_hours <= 0:
             return 0
 
         try:
             threshold = datetime.now() - timedelta(hours=wait_hours)
-
-            # Считаем только активные заказы
-            rows = session.execute(
-                text(
-                    """
-                    SELECT t.id, t.created_at, COUNT(DISTINCT o.id) AS order_count
-                    FROM trips t
-                    LEFT JOIN stage_orders so ON so.trip_id = t.id
-                    LEFT JOIN orders o ON o.id = so.order_id 
-                        AND o.status NOT IN ('order_cancelled', 'order_completed', 'order_failed')
-                    WHERE t.status = 'trip_created' AND t.active = 0
-                    GROUP BY t.id, t.created_at
-                    """
-                )
-            ).fetchall()
+            rows = session.execute(text("""
+                SELECT t.id, t.created_at
+                FROM trips t
+                WHERE t.status = 'trip_created'
+                AND t.active = 0
+                AND t.created_at < :threshold
+            """), {"threshold": threshold}).fetchall()
 
             updated = 0
-            for trip_id, created_at, order_count in rows:
-                make_active = False
-
-                if max_orders > 0 and order_count >= max_orders:
-                    make_active = True
-                    logger.debug("Рейс %s: %s активных заказов → активируем", trip_id, order_count)
-                elif wait_hours > 0 and created_at and created_at < threshold:
-                    make_active = True
-                    logger.debug("Рейс %s: ожидание более %s ч.", trip_id, wait_hours)
-
-                if make_active:
-                    session.execute(
-                        text("UPDATE trips SET active = 1 WHERE id = :trip_id"),
-                        {"trip_id": trip_id},
-                    )
-                    updated += 1
+            for trip_id, _ in rows:
+                logger.info("Рейс %s активирован по таймауту (%s ч)", trip_id, wait_hours)
+                session.execute(text("UPDATE trips SET active = 1 WHERE id = :trip_id"), {"trip_id": trip_id})
+                updated += 1
 
             if updated > 0:
-                logger.info("Активировано %s рейсов", updated)
-
+                logger.info("Активировано %s рейсов по таймауту", updated)
             return updated
-
         except Exception as e:
             logger.error("update_trip_active_flags завершился с ошибкой: %s", e)
             raise DbLayerError(f"Failed to update trip active flags: {e}") from e

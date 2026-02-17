@@ -464,7 +464,7 @@ async def get_all_orders(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-# ==================== БИРЖИ КУРЬЕРОВ (НОВЫЕ) ====================
+# ==================== БИРЖИ ====================
 
 @app.get("/api/courier/exchange", response_model=dict)
 async def get_courier_exchange(
@@ -489,6 +489,24 @@ async def get_courier_exchange(
                 "total": len(all_orders)
             }
         }
+
+@app.get("/api/driver/exchange", response_model=List[dict])
+async def get_driver_exchange_trips(
+    city: str,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Возвращает рейсы, доступные для взятия водителем из указанного города.
+    Условия:
+    - trips.from_city = :city
+    - trips.status = 'trip_created'
+    - trips.active = 1
+    """
+    with get_db_session(read_only=True) as session:
+        trips = db.get_available_trips_for_driver_exchange(session, city)
+    return trips
+
+# ==================== Универсальное действие ====================
 
 @app.post("/api/fsm/enqueue", response_model=ApiResponse)
 async def enqueue_fsm(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(get_db)):

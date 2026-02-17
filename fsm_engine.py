@@ -17,6 +17,7 @@ from fsm_actions import (
     RecipientActions,
     DriverActions,
     AccessCodeActions,
+    TripActions,
 )
 
 logger = logging.getLogger(__name__)
@@ -433,6 +434,30 @@ def _handle_request_locker_access_code(
     logger.info(f"[FSM] request_locker_access_code COMPLETED: order={order_id}")
     return FsmStepResult(new_state="COMPLETED")
 
+# ==================== РЕЙСЫ ====================
+def _handle_bind_order_to_trip(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Создает новый рейс, либо после того как заказ положат в ячейку и закроют ее
+    """
+    order_id = instance["entity_id"]
+    logger.info(f"[FSM] bind_order_to_trip for order {order_id}")
+    
+    success, error = ctx["trip_actions"].bind_order_to_trip(
+        session, order_id
+    )
+
+    if not success:
+        logger.error(f"[FSM] bind_order_to_trip FAILED: order={order_id}, error={error}")
+        return FsmStepResult(new_state="FAILED", last_error=error)
+
+    logger.info(f"[FSM] bind_order_to_trip COMPLETED: order={order_id}")
+    return FsmStepResult(new_state="COMPLETED")
+
 # ==================== PROCESS REGISTRY ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "order_creation": {"PENDING": _handle_order_creation_pending},
@@ -447,6 +472,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "cancel_order": {"PENDING": _handle_cancel_order},
     "locker_error": {"PENDING": _handle_locker_error},
     "request_locker_access_code": {"PENDING": _handle_request_locker_access_code},
+    "bind_order_to_trip": {"PENDING": _handle_bind_order_to_trip},
 }
 
 
@@ -461,6 +487,7 @@ def build_actions_context(db: DatabaseLayer) -> Dict[str, Any]:
         "recipient_actions": RecipientActions(db),
         "driver_actions": DriverActions(db),
         "access_code_actions": AccessCodeActions(db),
+        "trip_actions": TripActions(db),
     }
 
 

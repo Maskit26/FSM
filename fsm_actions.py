@@ -25,12 +25,8 @@ class OrderCreationActions:
 
         try:
             req = self.db.get_order_request(session, request_id)
-
-            if not req:
-                return False, None, "REQ_NOT_FOUND"
-
-            if req["status"] != "PENDING":
-                return False, None, "INVALID_STATE"
+            if not req or req["status"] != "PENDING":
+                return False, None, "REQ_NOT_FOUND_OR_INVALID"
 
             client_user_id = req["client_user_id"]
             if not client_user_id:
@@ -49,7 +45,7 @@ class OrderCreationActions:
             # Получаем город клиента
             client_city = self.db.get_user_city(session, client_user_id)
 
-            # Определяем направление маршрута
+            # Определяем маршрут
             if client_city == "МСК":
                 source_city = "МСК"
                 dest_city = "СПБ"
@@ -59,19 +55,15 @@ class OrderCreationActions:
             else:
                 return False, None, f"UNSUPPORTED_CITY: {client_city}"
 
-            # 🔒 поиск + резерв ячеек по городам
+            # 🔒 поиск + резерв ячеек
             ok, src_id, dst_id = self.db.find_and_reserve_cells_by_cities(
-                session,
-                source_city=source_city,
-                dest_city=dest_city,
-                cell_size=cell_size,
+                session, source_city, dest_city, cell_size
             )
-
             if not ok:
                 logger.info("[ORDER_CREATE] no free cells in route %s → %s", source_city, dest_city)
                 return False, None, "NO_FREE_CELLS"
 
-            # 🧾 создание заказа 
+            # 🧾 создание заказа
             order_id = self.db.create_order_record(
                 session,
                 description=description,
@@ -83,20 +75,21 @@ class OrderCreationActions:
                 dest_cell_id=dst_id,
             )
 
-            # 🚚 привязка к рейсу с реальными городами
-            try:
-                self.db.assign_order_to_trip_smart(
-                    session,
-                    order_id,
-                    source_city,  # ← реальный город отправителя
-                    dest_city,    # ← реальный город получателя
-                )
-            except Exception as e:
-                logger.warning(
-                    "[ORDER_CREATE] trip assign failed order_id=%s err=%s",
-                    order_id,
-                    e,
-                )
+            # ✅ СОЗДАЁМ stage_orders с trip_id = NULL
+            self.db.create_stage_order(
+                session,
+                trip_id=None,  # ← разрешено после ALTER TABLE
+                order_id=order_id,
+                leg="pickup",
+                courier_user_id=None,
+            )
+            self.db.create_stage_order(
+                session,
+                trip_id=None,
+                order_id=order_id,
+                leg="delivery",
+                courier_user_id=None,
+            )
 
             logger.info("[ORDER_CREATE] success order_id=%s", order_id)
             return True, order_id, ""
@@ -991,4 +984,40 @@ class AccessCodeActions:
 
         except Exception as e:
             logger.exception(f"request_access_code failed for order {order_id}: {e}")
+            return False, str(e)
+
+# ==================== РЕЙСЫ ====================
+class TripActions:
+    """Действия, связанные с управлением рейсами."""
+
+    def __init__(self, db: DatabaseLayer):
+        self.db = db
+
+    def bind_order_to_trip(self, session: Session, order_id: int) -> Tuple[bool, str]:
+        try:
+            order = self.db.get_order(session, order_id)
+            if not order or order["status"] != "order_parcel_confirmed":
+                return False, "ORDER_NOT_CONFIRMED"
+
+            # Получаем locker_id
+            pickup_locker_id = self.db.get_locker_id_by_cell(session, order["source_cell_id"])
+            delivery_locker_id = self.db.get_locker_id_by_cell(session, order["dest_cell_id"])
+
+            # Получаем города
+            from_city = self.db.get_locker_city_by_cell(session, order["source_cell_id"])
+            to_city = self.db.get_locker_city_by_cell(session, order["dest_cell_id"])
+
+            # Передаём ВСЁ в assign_order_to_trip_smart
+            trip_id, success, msg = self.db.assign_order_to_trip_smart(
+                session,
+                order_id=order_id,
+                pickup_locker_id=pickup_locker_id,
+                delivery_locker_id=delivery_locker_id,
+                from_city=from_city,
+                to_city=to_city,
+            )
+            return success, msg
+
+        except Exception as e:
+            logger.exception("bind_order_to_trip failed for order %s: %s", order_id, e)
             return False, str(e)

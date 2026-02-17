@@ -243,10 +243,23 @@ def main():
 
     logger.info("[FSM] worker started")
     logger.info("[FSM] processes: %s", list(PROCESS_DEFS.keys()))
-
+    last_trip_activation_check = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while True:
             try:
+                # ПЕРИОДИЧЕСКАЯ АКТИВАЦИЯ РЕЙСОВ (каждые 5 минут)
+                now = time.time()
+                if now - last_trip_activation_check >= 300:  # 300 сек = 5 минут
+                    with get_db_session() as session_inner:
+                        activated = db.update_trip_active_flags(
+                            session_inner,
+                            max_orders=5,
+                            wait_hours=48.0
+                        )
+                        if activated > 0:
+                            logger.info(f"[AUTO_ACTIVATE] Активировано {activated} рейсов")
+                    last_trip_activation_check = now
+
                 # Получаем готовые инстансы
                 with get_db_session() as session:
                     rows = db.fetch_ready_fsm_instances(
@@ -268,7 +281,7 @@ def main():
                     f.result()  # проброс исключений
 
                 # Проверяем зависшие инстансы
-                check_stuck_instances(db)
+                check_stuck_instances(db)                
 
             except DbLayerError:
                 logger.exception("[FSM] DbLayerError")
