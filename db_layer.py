@@ -59,55 +59,52 @@ class DatabaseLayer:
         user_id: int,
         extra_id: Optional[str] = None,
     ) -> bool:
-        """Вызов FSM процедуры fsm_perform_action."""
-        logger.debug(
-            "call_fsm_action: entity_type=%s, entity_id=%s, action_name=%s, user_id=%s, extra_id=%s",
-            entity_type, entity_id, action_name, user_id, extra_id
-        )
+        """Стабильный вызов процедуры через raw_cursor с очисткой протокола."""
+        
+        # Защита от NULL (SQLAlchemy None -> MySQL NULL может вешать драйвер)
+        safe_extra_id = extra_id if extra_id is not None else ""
 
         try:
-            conn = session.connection().connection
-            cursor = conn.cursor()
+            # Используем DBAPI курсор для прямого взаимодействия
+            connection = session.connection().connection
+            cursor = connection.cursor()
 
-            cursor.callproc(
-                "fsm_perform_action",
-                [entity_type, entity_id, action_name, user_id, extra_id or None],
-            )
+            try:
+                # Вызываем процедуру
+                cursor.callproc("fsm_perform_action", [
+                    entity_type, 
+                    entity_id, 
+                    action_name, 
+                    user_id, 
+                    safe_extra_id
+                ])
 
-            results = []
-            for result in cursor.stored_results():
-                results.extend(result.fetchall())
+                # Вычитываем первый набор данных (результат SELECT из процедуры)
+                results = []
+                for result in cursor.stored_results():
+                    results.extend(result.fetchall())
 
-            if results:
-                first = results[0]
-                if isinstance(first, tuple) and first:
-                    result_text = str(first[0])
-                    if result_text.startswith("FSM action "):
-                        logger.debug(
-                            "call_fsm_action успешно: %s → %s", action_name, result_text
-                        )
+                # Важно: поглощаем все оставшиеся наборы данных, чтобы не было 'Commands out of sync'
+                while cursor.nextset():
+                    pass
+
+                if results:
+                    result_text = str(results[0][0])
+                    if "FSM action completed" in result_text:
+                        logger.debug("[FSM] Success: %s", result_text)
                         return True
                     else:
-                        logger.warning(
-                            "call_fsm_action вернул неуспешный результат: %s → %s",
-                            action_name, result_text
-                        )
-                        raise FsmCallError(result_text)
+                        # Если процедура вернула текст ошибки через SELECT
+                        raise DbLayerError(f"FSM Procedure returned: {result_text}")
+                
+                raise DbLayerError("FSM Procedure: No result returned")
 
-            logger.error(
-                "call_fsm_action: нет результата от хранимой процедуры. "
-                "entity_type=%s, entity_id=%s, action_name=%s",
-                entity_type, entity_id, action_name
-            )
-            raise FsmCallError(f"FSM {action_name}: нет результата")
+            finally:
+                cursor.close()
 
-        except Error as e:
-            logger.error(
-                "call_fsm_action завершился с DB ошибкой: "
-                "entity_type=%s, entity_id=%s, action_name=%s, error=%s",
-                entity_type, entity_id, action_name, e
-            )
-            raise FsmCallError(f"FSM {action_name}: {e}") from e
+        except Exception as e:            
+            logger.error("[FSM] Call failed: %s", e)
+            raise DbLayerError(f"FSM {action_name} failed: {e}") from e
 
     # ==================== FSM ОБЁРТКИ (TRIP / ORDER / LOCKER) ====================
 
@@ -1536,70 +1533,45 @@ class DatabaseLayer:
             )
             raise DbLayerError(f"Failed to reserve cells for order {order_id}: {e}") from e
 
-    def reserve_cells_for_order(
+    def bind_cells_for_order(
         self,
         session: Session,
         order_id: int,
         source_cell_id: int,
         dest_cell_id: int,
-        source_code: Optional[str] = None,
-        dest_code: Optional[str] = None,
     ) -> bool:
-        """Зарезервировать ячейки под заказ (обновить статус и current_order_id, опционально unlock_code)."""
+        """
+        Привязывает заказ к двум ячейкам через current_order_id.
+        Не меняет статус ячеек — они уже зарезервированы.
+        """
         logger.debug(
-            "reserve_cells_for_order вызван: order_id=%s, src=%s, dst=%s, src_code=%s, dst_code=%s",
-            order_id, source_cell_id, dest_cell_id, source_code, dest_code
+            "bind_cells_for_order вызван: order_id=%s, source_cell_id=%s, dest_cell_id=%s",
+            order_id, source_cell_id, dest_cell_id
         )
         try:
-            # Обновление статуса и привязки к заказу
             session.execute(
-                text(
-                    "UPDATE locker_cells "
-                    "SET status = 'locker_reserved', current_order_id = :order_id "
-                    "WHERE id IN (:source_id, :dest_id)"
-                ),
+                text("""
+                    UPDATE locker_cells
+                    SET current_order_id = :order_id
+                    WHERE id IN (:source_id, :dest_id)
+                """),
                 {
                     "order_id": order_id,
                     "source_id": source_cell_id,
                     "dest_id": dest_cell_id,
-                },
+                }
             )
-
-            # Опциональное обновление кодов разблокировки
-            if source_code is not None:
-                session.execute(
-                    text(
-                        "UPDATE locker_cells "
-                        "SET unlock_code = :code "
-                        "WHERE id = :cell_id"
-                    ),
-                    {"code": source_code, "cell_id": source_cell_id},
-                )
-                logger.debug("reserve_cells_for_order: установлен source_code для cell_id=%s", source_cell_id)
-
-            if dest_code is not None:
-                session.execute(
-                    text(
-                        "UPDATE locker_cells "
-                        "SET unlock_code = :code "
-                        "WHERE id = :cell_id"
-                    ),
-                    {"code": dest_code, "cell_id": dest_cell_id},
-                )
-                logger.debug("reserve_cells_for_order: установлен dest_code для cell_id=%s", dest_cell_id)
-
             logger.info(
-                "Ячейки %s и %s зарезервированы для заказа %s",
+                "Ячейки %s и %s привязаны к заказу %s",
                 source_cell_id, dest_cell_id, order_id
             )
             return True
-
         except Exception as e:
             logger.error(
-                "reserve_cells_for_order завершился с ошибкой: order_id=%s, error=%s",
+                "bind_cells_for_order завершился с ошибкой: order_id=%s, error=%s",
                 order_id, e
             )
-            raise DbLayerError(f"Резерв ячеек для заказа {order_id}: {e}") from e
+            raise DbLayerError(f"Привязка ячеек к заказу {order_id}: {e}") from e
 
     def enqueue_fsm_instance(
         self,
@@ -2715,18 +2687,27 @@ class DatabaseLayer:
         session: Session,
         driver_id: int
     ) -> List[Dict[str, Any]]:
-        """Активные незавершённые рейсы водителя."""
         logger.debug("get_active_trips_for_driver вызван: driver_id=%s", driver_id)
         try:
             rows = session.execute(
-                text(
-                    "SELECT id, status, active, from_city, to_city, driver_user_id "
-                    "FROM trips "
-                    "WHERE driver_user_id = :driver_id AND active = 1 "
-                    "  AND status != 'trip_completed'"
-                ),
+                text("""
+                    SELECT 
+                        id, 
+                        status, 
+                        active, 
+                        from_city, 
+                        to_city, 
+                        driver_user_id,
+                        pickup_locker_id, 
+                        delivery_locker_id 
+                    FROM trips  
+                    WHERE driver_user_id = :driver_id 
+                    AND active = 1  
+                    AND status != 'trip_completed'
+                """),
                 {"driver_id": driver_id},
             ).fetchall()
+
             trips = [
                 {
                     "id": row[0],
@@ -2735,6 +2716,8 @@ class DatabaseLayer:
                     "from_city": row[3],
                     "to_city": row[4],
                     "driver_user_id": row[5],
+                    "pickup_locker_id": row[6],      # Теперь есть
+                    "delivery_locker_id": row[7],    # Теперь есть
                 }
                 for row in rows
             ]
@@ -2765,6 +2748,19 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("get_trip_orders завершился с ошибкой для trip_id=%s: %s", trip_id, e)
             raise DbLayerError(f"Failed to fetch orders for trip {trip_id}: {e}") from e
+
+    def get_trip_id_by_order_id(self, session: Session, order_id: int) -> Optional[int]:
+        """Возвращает trip_id из stage_orders по order_id."""
+        logger.debug("get_trip_id_by_order_id вызван: order_id=%s", order_id)
+        try:
+            result = session.execute(
+                text("SELECT trip_id FROM stage_orders WHERE order_id = :order_id LIMIT 1"),
+                {"order_id": order_id}
+            ).scalar()
+            return result  # может быть int или None
+        except Exception as e:
+            logger.error("get_trip_id_by_order_id завершился с ошибкой для order_id=%s: %s", order_id, e)
+            raise DbLayerError(f"Failed to get trip_id for order {order_id}: {e}") from e
 
     def assign_order_to_trip(
         self,

@@ -40,7 +40,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "6eF1zb")
 
 DATABASE_URL = f"mysql+mysqlconnector://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
 
-engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True, isolation_level="READ COMMITTED")
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # ================== LOGGING ==================
@@ -150,10 +150,6 @@ def process_instance(
                     actions_ctx=actions_ctx,
                     instance=instance,
                 )
-
-                if result is None:
-                    raise RuntimeError("run_fsm_step returned None")
-
             except Exception as step_error:
                 logger.exception("[FSM] step error instance_id=%s", instance["id"])
                 result = FsmStepResult(
@@ -161,9 +157,26 @@ def process_instance(
                     last_error=str(step_error),
                     attempts_increment=1,
                     payload=None,
-                )
+                )            
 
             # ================= UPDATE INSTANCE =================
+            if result.new_state == "FAILED":
+                logger.warning("[FSM] Step failed. Rolling back everything for instance %s", instance["id"])
+                session.rollback() # Это отменит И открытие ячейки, И смену статуса заказа
+                
+                # Теперь нам нужно записать ошибку в базу, но в НОВОЙ транзакции, 
+                # чтобы не потерять запись о провале.
+                db.update_fsm_instance(
+                    session=session,
+                    instance_id=instance["id"],
+                    new_state="FAILED",
+                    last_error=result.last_error,
+                    attempts_increment=result.attempts_increment or 0,
+                )
+                # Контекст-менеджер сделает commit этого апдейта при выходе
+                return # Выходим из функции, чтобы не идти в логику COMPLETED
+            
+            # Если всё SUCCESS - просто обновляем инстанс (commit сделает контекст-менеджер)
             db.update_fsm_instance(
                 session=session,
                 instance_id=instance["id"],
@@ -172,7 +185,6 @@ def process_instance(
                 next_timer_at=result.next_timer_at,
                 attempts_increment=result.attempts_increment or 0,
             )
-
             # ================= HANDLE ORDER REQUEST =================
             if instance["process_name"] == "order_creation":
                 if result.new_state == "COMPLETED":

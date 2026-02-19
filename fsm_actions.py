@@ -42,18 +42,20 @@ class OrderCreationActions:
             pickup_type = "self" if sender_delivery == "self" else "courier"
             delivery_type = "self" if recipient_delivery == "self" else "courier"
 
-            # Получаем город клиента
+            # Получаем город клиента и получателя
             client_city = self.db.get_user_city(session, client_user_id)
+            if not recipient_user_id:
+                return False, None, "RECIPIENT_USER_ID_REQUIRED"
 
-            # Определяем маршрут
-            if client_city == "МСК":
-                source_city = "МСК"
-                dest_city = "СПБ"
-            elif client_city == "СПБ":
-                source_city = "СПБ"
-                dest_city = "МСК"
-            else:
-                return False, None, f"UNSUPPORTED_CITY: {client_city}"
+            recipient_city = self.db.get_user_city(session, recipient_user_id)
+
+            # Определяем маршрут: от клиента → к получателю
+            source_city = client_city
+            dest_city = recipient_city
+
+            # Запрещаем отправку в тот же город
+            if source_city == dest_city:
+                return False, None, f"SELF_CITY_NOT_ALLOWED: {source_city}"
 
             # 🔒 поиск + резерв ячеек
             ok, src_id, dst_id = self.db.find_and_reserve_cells_by_cities(
@@ -75,10 +77,13 @@ class OrderCreationActions:
                 dest_cell_id=dst_id,
             )
 
-            # ✅ СОЗДАЁМ stage_orders с trip_id = NULL
+            # привязываем ячейки к заказу
+            self.db.bind_cells_for_order(session, order_id, src_id, dst_id)
+
+            # ✅ СОЗДАЁМ stage_orders с trip_id
             self.db.create_stage_order(
                 session,
-                trip_id=None,  # ← разрешено после ALTER TABLE
+                trip_id=None, 
                 order_id=order_id,
                 leg="pickup",
                 courier_user_id=None,
@@ -438,41 +443,49 @@ class DriverActions:
         logger.error("[DRIVER] cell_id=%s не относится к рейсу trip_id=%s", cell_id, trip["id"])
         raise DbLayerError("Ячейка не относится к рейсу")
 
-    def open_cell_for_driver(
-        self,
-        session: Session,
-        cell_id: int,
-        user_id: int
-    ) -> Tuple[bool, str]:
-        """
-        Водитель открывает ячейку.
-        """
+    def open_cell_for_driver(self, session: Session, cell_id: int, user_id: int) -> Tuple[bool, str]:
         logger.info("[DRIVER] open_cell cell=%s user=%s", cell_id, user_id)
 
         try:
-            trip = self._get_active_trip_for_driver(session, user_id)
-            logger.debug("[DRIVER] active trip %s found for driver %s", trip["id"], user_id)
-            
-            intent = self._determine_intent(session, cell_id, trip)
-            logger.debug("[DRIVER] cell %s intent determined as %s for trip %s", cell_id, intent, trip["id"])
+            # 1. Получаем order_id по cell_id
+            order_id = self.db.get_order_id_by_cell_id(session, cell_id)
+            if not order_id:
+                raise DbLayerError(f"Ячейка {cell_id} не привязана ни к одному заказу")
 
+            # 2. Получаем trip_id из stage_orders
+            trip_id = self.db.get_trip_id_by_order_id(session, order_id)
+            if not trip_id:
+                raise DbLayerError(f"Заказ {order_id} не привязан к рейсу")
+
+            # 3. Проверяем, что водитель назначен на этот рейс
+            trip = self.db.get_trip(session, trip_id)
+            if not trip or trip["driver_user_id"] != user_id:
+                raise DbLayerError(f"Водитель {user_id} не назначен на рейс {trip_id}")
+
+            # 4. Определяем intent: pickup или delivery
+            order = self.db.get_order(session, order_id)
+            if cell_id == order["source_cell_id"]:
+                intent = "pickup"
+            elif cell_id == order["dest_cell_id"]:
+                intent = "delivery"
+            else:
+                raise DbLayerError(f"Ячейка {cell_id} не совпадает ни с source, ни с dest для заказа {order_id}")
+
+            # 5. Открываем ячейку
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
 
-            order_id = self.db.get_order_id_by_cell_id(session, cell_id)
-
-            if order_id:
-                logger.debug("[DRIVER] order %s found for cell %s", order_id, cell_id)
-                if intent == "pickup":
-                    logger.info("[DRIVER] processing pickup for order %s in trip %s", order_id, trip["id"])
-                    self.db.order_parcel_submitted(session, order_id, user_id)
-                    self.db.trip_assign_voditel(session, trip["id"], user_id)
-                else:
-                    logger.info("[DRIVER] processing delivery for order %s in trip %s", order_id, trip["id"])
-                    self.db.order_confirm_parcel_in(session, order_id, user_id)
+            # 6. Обрабатываем бизнес-логику (как сейчас)
+            if intent == "pickup":
+                logger.info("[DRIVER] processing pickup for order %s in trip %s", order_id, trip_id)
+                self.db.order_mark_parcel_submitted(session, order_id, user_id)
+                self.db.trip_assign_driver(session, trip_id, user_id)
+            else:
+                logger.info("[DRIVER] processing delivery for order %s in trip %s", order_id, trip_id)
+                self.db.order_confirm_parcel_in(session, order_id, user_id)
 
             logger.info("[DRIVER] cell %s opened successfully for driver %s", cell_id, user_id)
             return True, ""
-            
+
         except Exception as e:
             logger.error("[DRIVER] failed to open cell %s for driver %s: %s", cell_id, user_id, str(e))
             return False, str(e)
@@ -484,31 +497,57 @@ class DriverActions:
         user_id: int
     ) -> Tuple[bool, str]:
         """
-        Водитель закрывает ячейку.
+        Водитель закрывает ячейку. Логика основана на связке Cell -> Order -> Trip.
         """
         logger.info("[DRIVER] close_cell cell=%s user=%s", cell_id, user_id)
 
         try:
-            trip = self._get_active_trip_for_driver(session, user_id)
-            logger.debug("[DRIVER] active trip %s found for driver %s", trip["id"], user_id)
-            
-            intent = self._determine_intent(session, cell_id, trip)
-            logger.debug("[DRIVER] closing cell %s with intent %s for trip %s", cell_id, intent, trip["id"])
-
+            # 1. Находим заказ по ячейке
             order_id = self.db.get_order_id_by_cell_id(session, cell_id)
-
-            if intent == "pickup":
-                self.db.close_locker_pickup(session, cell_id, user_id)
-                if order_id:
-                    logger.info("[DRIVER] processing pickup completion for order %s", order_id)
-                    self.db.order_pickup_by_voditel(session, order_id, user_id)
-                    self.db.trip_confirm_pickup(session, trip["id"], user_id)
-            else:
+            if not order_id:
+                # Если ячейка пустая/не привязана, просто закрываем её без бизнес-логики
+                logger.warning("[DRIVER] cell %s not linked to any order, just closing", cell_id)
                 self.db.close_locker(session, cell_id, user_id)
+                return True, ""
 
-            logger.info("[DRIVER] cell %s closed successfully for driver %s", cell_id, user_id)
+            # 2. Находим рейс через заказ
+            trip_id = self.db.get_trip_id_by_order_id(session, order_id)
+            if not trip_id:
+                raise DbLayerError(f"Заказ {order_id} не привязан к рейсу")
+
+            # 3. Проверяем водителя и получаем данные рейса
+            trip = self.db.get_trip(session, trip_id)
+            if not trip or trip["driver_user_id"] != user_id:
+                raise DbLayerError(f"Водитель {user_id} не назначен на рейс {trip_id} для ячейки {cell_id}")
+
+            # 4. Получаем данные заказа для определения intent (pickup/delivery)
+            order = self.db.get_order(session, order_id)
+            if cell_id == order["source_cell_id"]:
+                intent = "pickup"
+            elif cell_id == order["dest_cell_id"]:
+                intent = "delivery"
+            else:
+                intent = "unknown"
+
+            logger.debug("[DRIVER] closing cell %s with intent %s for trip %s", cell_id, intent, trip_id)
+
+            # 5. Обрабатываем бизнес-логику в зависимости от намерения
+            if intent == "pickup":
+                logger.info("[DRIVER] Finishing PICKUP: cell %s will be EMPTY", cell_id)                
+                self.db.close_locker_pickup(session, cell_id, user_id)                
+                self.db.order_pickup_by_driver(session, order_id, user_id)                
+                self.db.trip_confirm_pickup(session, trip_id, user_id)
+
+            elif intent == "delivery":
+                logger.info("[DRIVER] Finishing DELIVERY: cell %s will be OCCUPIED", cell_id)
+                self.db.close_locker_delivery(session, cell_id, user_id)  
+                            
+                
+            else:                
+                raise DbLayerError(f"Не удалось определить тип операции (pickup/delivery) для ячейки {cell_id}")
+                
             return True, ""
-            
+
         except Exception as e:
             logger.error("[DRIVER] failed to close cell %s for driver %s: %s", cell_id, user_id, str(e))
             return False, str(e)
