@@ -331,6 +331,40 @@ class DatabaseLayer:
             courier_user_id,
         )
 
+    def create_order_issue(
+        self,
+        session: Session,
+        order_id: Optional[int],  # ← Сделать Optional
+        trip_id: Optional[int],
+        user_id: int,
+        issue_type: str,
+        description: str = ""
+    ) -> int:
+        """Создать запись об инциденте в таблице report_issues."""
+        logger.debug("create_order_issue вызван: order_id=%s, type=%s", order_id, issue_type)
+        
+        try:
+            session.execute(
+                text("""
+                    INSERT INTO report_issues (order_id, trip_id, user_id, issue_type, description)
+                    VALUES (:order_id, :trip_id, :user_id, :issue_type, :description)
+                """),
+                {
+                    "order_id": order_id,  
+                    "trip_id": trip_id,
+                    "user_id": user_id,
+                    "issue_type": issue_type,
+                    "description": description,
+                }
+            )
+            issue_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+            logger.info("Создан инцидент %s для заказа %s", issue_id, order_id)
+            return issue_id
+            
+        except Exception as e:
+            logger.error("create_order_issue завершился с ошибкой: %s", e)
+            raise DbLayerError(f"create_order_issue failed: {e}") from e
+
     def order_pickup_by_driver(self, session: Session, order_id: int, driver_id: int) -> bool:
         """Водитель забирает заказ из постамата (FSM: order_pickup_by_voditel)."""
         return self.call_fsm_action(session, "order", order_id, "order_pickup_by_voditel", driver_id)
@@ -374,6 +408,11 @@ class DatabaseLayer:
         )
 
         return True
+
+    def order_confirm_post2(self, session: Session, order_id: int, user_id: int) -> bool:
+        """Водитель подтверждает посылку в постамате2."""
+        logger.debug("order_confirm_post2 вызван: order_id=%s, user_id=%s", order_id, user_id)
+        return self.call_fsm_action(session, "order", order_id, "order_confirm_post2", user_id)
 
     def order_mark_parcel_submitted(self, session: Session, order_id: int, user_id: int) -> bool:
         """Фиксация, что посылка сдана (FSM: order_parcel_submitted)."""
@@ -985,6 +1024,11 @@ class DatabaseLayer:
         logger.debug("reset_locker вызван: cell_id=%s, user_id=%s", cell_id, user_id)
         return self.call_fsm_action(session, "locker", cell_id, "locker_reset", user_id)
 
+    def locker_report_failed_to_open(self, session: Session, cell_id: int, user_id: int) -> bool:
+        """Ячейка не открылась (FSM: locker_failed_to_open)."""
+        logger.debug("locker_report_failed_to_open вызван: cell_id=%s, user_id=%s", cell_id, user_id)
+        return self.call_fsm_action(session, "locker", cell_id, "locker_failed_to_open", user_id)
+
     def set_locker_maintenance(self, session: Session, cell_id: int, user_id: int) -> bool:
         """Перевод ячейки в обслуживание (FSM: locker_set_locker_to_maintenance)."""
         logger.debug("set_locker_maintenance вызван: cell_id=%s, user_id=%s", cell_id, user_id)
@@ -1230,6 +1274,46 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("get_user_role завершился с ошибкой для user_id=%s: %s", user_id, e)
             raise DbLayerError(f"Failed to get role for user {user_id}: {e}") from e
+
+    def get_all_users(self, session: Session) -> List[Dict[str, Any]]:
+        """
+        Получить всех пользователей из таблицы users.
+        
+        Returns:
+            Список словарей с данными пользователей
+        """
+        logger.debug("get_all_users вызван")
+        
+        try:
+            rows = session.execute(
+                text("""
+                    SELECT
+                        id,
+                        name,
+                        role_name,
+                        city,
+                        phone
+                    FROM users
+                    ORDER BY id ASC
+                """)
+            ).fetchall()
+            
+            users: List[Dict[str, Any]] = []
+            for row in rows:
+                users.append({
+                    "id": row[0],
+                    "name": row[1],
+                    "role_name": row[2],
+                    "city": row[3],
+                    "phone": row[4],
+                })
+            
+            logger.debug("get_all_users: найдено %d пользователей", len(users))
+            return users
+            
+        except Exception as e:
+            logger.error("get_all_users завершился с ошибкой: %s", e)
+            raise DbLayerError(f"get_all_users failed: {e}") from e
 
     def create_locker_model(
         self,
@@ -1852,6 +1936,35 @@ class DatabaseLayer:
             last_error=error,
             attempts_increment=0,
         )
+
+    def get_error_types(self, session: Session) -> List[str]:
+        """
+        Получить список типов ошибок из ENUM report_issues.issue_type.
+        """
+        logger.debug("get_error_types вызван")
+        
+        try:
+            # Читаем ENUM определение из INFORMATION_SCHEMA
+            result = session.execute(
+                text("""
+                    SELECT COLUMN_TYPE
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    AND TABLE_NAME = 'report_issues'
+                    AND COLUMN_NAME = 'issue_type'
+                """)
+            ).scalar_one()
+            
+            # Парсим ENUM: enum('type1','type2',...) → ['type1', 'type2', ...]
+            import re
+            types = re.findall(r"'([^']+)'", result)
+            
+            logger.debug("get_error_types: найдено %d типов", len(types))
+            return types
+            
+        except Exception as e:
+            logger.error("get_error_types завершился с ошибкой: %s", e)
+            raise DbLayerError(f"get_error_types failed: {e}") from e
 
     # ==================== ЗАКАЗЫ ====================
 
@@ -2734,17 +2847,51 @@ class DatabaseLayer:
         self,
         session: Session,
         trip_id: int
-    ) -> List[int]:
-        """Вернуть список order_id, привязанных к рейсу."""
+    ) -> List[Dict[str, Any]]:
+        """
+        Вернуть список заказов рейса с деталями.        
+        
+        """
         logger.debug("get_trip_orders вызван: trip_id=%s", trip_id)
         try:
             rows = session.execute(
-                text("SELECT order_id FROM stage_orders WHERE trip_id = :trip_id"),
+                text("""
+                    SELECT 
+                        o.id,
+                        o.status,
+                        o.description,
+                        o.pickup_type,
+                        o.delivery_type,
+                        o.source_cell_id,
+                        o.dest_cell_id,
+                        o.client_user_id,
+                        o.recipient_user_id
+                    FROM stage_orders so
+                    JOIN orders o ON o.id = so.order_id
+                    WHERE so.trip_id = :trip_id
+                    AND so.leg = 'pickup'
+                """),
                 {"trip_id": trip_id},
             ).fetchall()
-            order_ids = [row[0] for row in rows]
-            logger.debug("get_trip_orders: найдено %d заказов для рейса %s", len(order_ids), trip_id)
-            return order_ids
+            
+            orders = [
+                {
+                    "order_id": row[0],
+                    "status": row[1],
+                    "description": row[2],
+                    "pickup_type": row[3],
+                    "delivery_type": row[4],
+                    "source_cell_id": row[5],
+                    "dest_cell_id": row[6],
+                    "client_user_id": row[7],
+                    "recipient_user_id": row[8],
+                }
+                for row in rows
+            ]
+            
+            logger.debug("get_trip_orders: найдено %d заказов для рейса %s", len(orders), trip_id)
+            return orders
+            
         except Exception as e:
             logger.error("get_trip_orders завершился с ошибкой для trip_id=%s: %s", trip_id, e)
             raise DbLayerError(f"Failed to fetch orders for trip {trip_id}: {e}") from e
@@ -2950,6 +3097,104 @@ class DatabaseLayer:
             logger.error("update_trip_active_flags завершился с ошибкой: %s", e)
             raise DbLayerError(f"Failed to update trip active flags: {e}") from e
 
+    def get_orders_with_status_in_trip(
+        self,
+        session: Session,
+        trip_id: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить все заказы рейса с их FSM-статусами.
+        
+        Args:            
+            trip_id: ID рейса
+        
+        Returns:
+            Список словарей: [{"order_id": int, "status": str}, ...]
+        """
+        logger.debug("get_orders_with_status_in_trip вызван: trip_id=%s", trip_id)
+        
+        try:
+            rows = session.execute(
+                text("""
+                    SELECT 
+                        so.order_id,
+                        o.status
+                    FROM stage_orders so
+                    JOIN orders o ON o.id = so.order_id
+                    WHERE so.trip_id = :trip_id
+                    AND so.leg = 'pickup'
+                """),
+                {"trip_id": trip_id}
+            ).fetchall()
+            
+            orders = [
+                {
+                    "order_id": row[0],
+                    "status": row[1],
+                }
+                for row in rows
+            ]
+            
+            logger.debug("get_orders_with_status_in_trip: найдено %d заказов", len(orders))
+            return orders
+            
+        except Exception as e:
+            logger.error("get_orders_with_status_in_trip завершился с ошибкой: %s", e)
+            raise DbLayerError(f"get_orders_with_status_in_trip failed: {e}") from e
+
+    def validate_and_get_orders_for_trip_start(
+        self,
+        session: Session,
+        trip_id: int
+    ) -> Tuple[bool, List[int], List[int], str]:
+        """
+        Проверка готовности рейса к старту + получение списков заказов.
+        
+        Returns:
+            (can_start: bool, blocked_ids: List[int], transit_ids: List[int], error: str)
+            - can_start: True если все заказы готовы
+            - blocked_ids: ID заказов, которые блокируют старт
+            - transit_ids: ID заказов для перевода в транзит
+            - error: текст ошибки если can_start=False
+        """
+        logger.debug("validate_and_get_orders_for_trip_start вызван: trip_id=%s", trip_id)
+        
+        try:
+            orders = self.get_orders_with_status_in_trip(session, trip_id)
+            if not orders:
+                return False, [], [], "В рейсе нет заказов"
+
+            # ⚠️ ТОЛЬКО DB_LAYER знает эти статусы
+            allowed_statuses = [
+                "order_picked_up_from_post1",      # ✅ Забран успешно
+                "order_manual_intervention_required", # ⚠️ Проблема
+                "order_parcel_missing",            # ⚠️ Посылки нет
+                "order_cancelled",                 # ⚠️ Отменён
+            ]
+            transit_status = "order_picked_up_from_post1"
+            
+            blocked_ids = []
+            transit_ids = []
+            
+            for o in orders:
+                if o["status"] not in allowed_statuses:
+                    blocked_ids.append(o["order_id"])
+                elif o["status"] == transit_status:
+                    transit_ids.append(o["order_id"])
+            
+            if blocked_ids:
+                return False, blocked_ids, [], f"Нельзя начать путь: заказы {blocked_ids} не готовы"
+            
+            logger.debug(
+                "validate_and_get_orders_for_trip_start: trip_id=%s — OK, transit=%d заказов",
+                trip_id, len(transit_ids)
+            )
+            return True, [], transit_ids, ""
+            
+        except Exception as e:
+            logger.error("validate_and_get_orders_for_trip_start завершился с ошибкой: %s", e)
+            raise DbLayerError(f"validate_and_get_orders_for_trip_start failed: {e}") from e
+
     # ==================== АВТОМАТИЧЕСКАЯ ОБРАБОТКА ТАЙМАУТОВ ====================
 
     def check_and_process_reservation_timeouts(
@@ -3016,7 +3261,7 @@ class DatabaseLayer:
             raise DbLayerError(f"clear_test_data: {e}") from e
 
     def get_log_counters(self, session: Session) -> Tuple[int, int, int]:
-        """Вернуть счётчики логов: (fsm_errors_log, fsm_action_logs, hardware_command_log)."""
+        """Вернуть счётчики логов: (fsm_errors_log, fsm_action_logs, report_issues)."""
         logger.debug("get_log_counters вызван")
         try:
             error_count = session.execute(
@@ -3025,19 +3270,19 @@ class DatabaseLayer:
             fsm_count = session.execute(
                 text("SELECT COALESCE(MAX(id), 0) FROM fsm_action_logs")
             ).scalar()
-            hw_count = session.execute(
-                text("SELECT COALESCE(MAX(id), 0) FROM hardware_command_log")
+            # ✅ Заменили hardware_command_log на report_issues
+            issues_count = session.execute(
+                text("SELECT COALESCE(MAX(id), 0) FROM report_issues")
             ).scalar()
 
             counters = (
                 int(error_count or 0),
                 int(fsm_count or 0),
-                int(hw_count or 0)
+                int(issues_count or 0)
             )
             logger.debug("get_log_counters: %s", counters)
             return counters
         except Exception as e:
             logger.error("get_log_counters завершился с ошибкой: %s", e)
-            # Возвращаем нули вместо падения — это диагностический метод
             return 0, 0, 0
     

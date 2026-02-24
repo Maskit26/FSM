@@ -458,6 +458,57 @@ def _handle_bind_order_to_trip(
     logger.info(f"[FSM] bind_order_to_trip COMPLETED: order={order_id}")
     return FsmStepResult(new_state="COMPLETED")
 
+# ==================== Универсальный обработчик ошибок ====================
+def _handle_report_error(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Универсальный обработчик ошибок для ВСЕХ ролей и сущностей.
+    Поддерживает: order, locker, trip
+    """
+    user_role = instance["requested_user_role"]
+    entity_type = instance["entity_type"]  # ← 'order', 'locker', или 'trip'
+    entity_id = instance["entity_id"]
+    metadata = instance.get("metadata", {})
+    
+    error_type = metadata.get("error_type")
+    order_id = metadata.get("order_id")
+    trip_id = metadata.get("trip_id")
+    
+    logger.info(f"[FSM] report_error: role={user_role}, type={error_type}, entity={entity_type}:{entity_id}")
+
+    if not error_type:
+        return FsmStepResult(new_state="FAILED", last_error="MISSING_ERROR_TYPE_IN_METADATA")   
+   
+    if entity_type != "trip" and not order_id:
+        return FsmStepResult(new_state="FAILED", last_error="MISSING_ORDER_ID_IN_METADATA")
+
+    # Выбираем actions по роли
+    if user_role == "driver":
+        actions = ctx["driver_actions"]
+    elif user_role == "courier":
+        actions = ctx["courier_actions"]
+    elif user_role == "client":
+        actions = ctx["client_actions"]
+    elif user_role == "recipient":
+        actions = ctx["recipient_actions"]
+    elif user_role == "operator":
+        actions = ctx["operator_actions"]
+    else:
+        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ROLE_{user_role}")    
+    success, error = actions.report_error(
+        session, entity_id, order_id, instance["requested_by_user_id"], error_type, trip_id
+    )
+    
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+        
+    return FsmStepResult(new_state="COMPLETED")
+
+
 # ==================== PROCESS REGISTRY ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "order_creation": {"PENDING": _handle_order_creation_pending},
@@ -473,6 +524,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "locker_error": {"PENDING": _handle_locker_error},
     "request_locker_access_code": {"PENDING": _handle_request_locker_access_code},
     "bind_order_to_trip": {"PENDING": _handle_bind_order_to_trip},
+    "report_error": {"PENDING": _handle_report_error},
 }
 
 

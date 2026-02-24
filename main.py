@@ -586,13 +586,13 @@ async def get_trip(trip_id: int, db: DatabaseLayer = Depends(get_db)):
             raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/trips/{trip_id}/orders", response_model=List[int])
+@app.get("/api/trips/{trip_id}/orders", response_model=List[dict])
 async def get_trip_orders(trip_id: int, db: DatabaseLayer = Depends(get_db)):
-    """Получить список order_id рейса"""
+    """Получить заказы рейса (для драйвера на бирже)."""
     with get_db_session(read_only=True) as session:
         try:
-            order_ids = db.get_trip_orders(session, trip_id)
-            return order_ids
+            orders = db.get_trip_orders(session, trip_id)
+            return orders
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -671,7 +671,7 @@ async def activate_trip(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Ошибка активации рейса: {str(e)}")
 
-# ==================== TIMEOUTS (НОВЫЙ РАЗДЕЛ) ====================
+# ==================== TIMEOUTS/Ошибки ====================
 
 @app.post("/api/timeouts/process", response_model=dict)
 async def process_timeouts(
@@ -708,6 +708,15 @@ async def process_timeouts(
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Ошибка обработки таймаутов: {str(e)}")
+
+@app.get("/api/error-types", response_model=List[str])
+async def get_error_types(db: DatabaseLayer = Depends(get_db)):
+    """Получить список доступных типов ошибок."""
+    with get_db_session(read_only=True) as session:
+        try:
+            return db.get_error_types(session)
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 # ==================== FSM ACTIONS ====================
 
@@ -855,6 +864,23 @@ async def get_user_role(user_id: int, db: DatabaseLayer = Depends(get_db)):
             if not role:
                 raise HTTPException(status_code=404, detail=f"User {user_id} not found")
             return {"user_id": user_id, "role": role}
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/users", response_model=List[dict])
+async def get_all_users(
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить всех пользователей из таблицы users.
+    
+    Returns:
+        Список всех пользователей с полями: id, name, role_name, city, phone
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            users = db.get_all_users(session)
+            return users
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
