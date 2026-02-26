@@ -389,6 +389,36 @@ def _handle_cancel_trip(
     logger.info(f"[FSM] cancel_trip COMPLETED: trip_id={trip_id}")
     return FsmStepResult(new_state="COMPLETED")
 
+def _handle_complete_trip(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Завершение поездки водителем.
+    Только роль driver разрешена.
+    """
+    user_role = instance["requested_user_role"]
+    trip_id = instance["entity_id"]
+    user_id = instance["requested_by_user_id"]
+    logger.info(f"[FSM] complete_trip: role={user_role}, trip_id={trip_id}, user_id={user_id}")
+    
+    if user_role != "driver":
+        logger.warning(f"[FSM] complete_trip: not allowed for role {user_role}")
+        return FsmStepResult(
+            new_state="FAILED", 
+            last_error=f"NOT_ALLOWED_FOR_{user_role}"
+        )
+    
+    success, error = ctx["driver_actions"].complete_trip(session, trip_id, user_id)
+    if not success:
+        logger.error(f"[FSM] complete_trip FAILED: trip_id={trip_id}, error={error}")
+        return FsmStepResult(new_state="FAILED", last_error=error)
+    
+    logger.info(f"[FSM] complete_trip COMPLETED: trip_id={trip_id}")
+    return FsmStepResult(new_state="COMPLETED")
+
 # ==================== Access Code ====================
 def _handle_request_locker_access_code(
     db: DatabaseLayer,
@@ -518,6 +548,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "start_trip": {"PENDING": _handle_start_trip},
     "arrive_at_destination": {"PENDING": _handle_arrive_at_destination},
     "cancel_trip": {"PENDING": _handle_cancel_trip},
+    "complete_trip": {"PENDING": _handle_complete_trip},
     "open_cell": {"PENDING": _handle_open_cell},
     "close_cell": {"PENDING": _handle_close_cell},
     "cancel_order": {"PENDING": _handle_cancel_order},

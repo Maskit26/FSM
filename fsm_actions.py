@@ -728,26 +728,19 @@ class DriverActions:
             return False, str(e)
 
     def start_trip(self, session: Session, trip_id: int, user_id: int) -> Tuple[bool, str]:
-        """
-        Старт рейса.
-        НЕ знает статусы заказов. Вся валидация в db_layer.
-        """
         logger.info("[DRIVER] start_trip trip=%s user=%s", trip_id, user_id)
 
         try:            
             can_start, blocked, transit_ids, error = (
                 self.db.validate_and_get_orders_for_trip_start(session, trip_id)
-            )
+            ) 
             
             if not can_start:
                 logger.warning("[DRIVER] start_trip blocked: %s", error)
                 return False, error
 
-            # Запускаем рейс
             self.db.start_trip(session, trip_id, user_id)
-            logger.debug("[DRIVER] trip %s FSM transition completed", trip_id)
 
-            # Переводим заказы в транзит
             for order_id in transit_ids:
                 self.db.order_start_transit(session, order_id, user_id)
 
@@ -810,6 +803,25 @@ class DriverActions:
             logger.error("[DRIVER] failed to cancel trip %s: %s", trip_id, str(e))
             return False, str(e)
 
+    def complete_trip(self, session: Session, trip_id: int, user_id: int) -> Tuple[bool, str]:
+        logger.info("[DRIVER] complete_trip trip=%s user=%s", trip_id, user_id)
+        
+        try:
+            can_complete, blocked, completed_ids, error = (
+                self.db.validate_trip_for_completion(session, trip_id)
+            )
+            if not can_complete:
+                logger.warning("[DRIVER] complete_trip blocked: %s", error)
+                return False, error
+            
+            self.db.complete_trip(session, trip_id, user_id)
+            
+            logger.info("[DRIVER] trip %s completed: %d orders", trip_id, len(completed_ids))
+            return True, ""
+            
+        except Exception as e:
+            logger.error("[DRIVER] failed to complete trip %s: %s", trip_id, str(e))
+            return False, str(e)
 
 # =========================================================
 # COURIER

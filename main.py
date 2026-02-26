@@ -395,6 +395,8 @@ async def get_orders_by_route(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+
+# == получение информации о заказах/рейсах для клиента/курьера/водителя ====
 @app.get("/api/orders/user/{user_id}", response_model=List[dict])
 async def get_user_orders(
     user_id: int,
@@ -412,6 +414,46 @@ async def get_user_orders(
     with get_db_session(read_only=True) as session:
         try:
             return db.get_user_orders(session, user_id)
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/orders/courier/{courier_id}", response_model=List[dict])
+async def get_courier_orders_endpoint(
+    courier_id: int,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить все заказы курьера по его ID.
+    
+    Args:
+        courier_id: ID курьера
+    
+    Returns:
+        Список заказов курьера с информацией о плече (pickup/delivery)
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            return db.get_courier_orders(session, courier_id)
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/trips/driver/{driver_id}", response_model=List[dict])
+async def get_driver_trips_endpoint(
+    driver_id: int,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить активные рейсы водителя с заказами внутри.
+    
+    Args:
+        driver_id: ID водителя
+    
+    Returns:
+        Список рейсов, внутри каждого — список заказов
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            return db.get_driver_trips_with_orders(session, driver_id)
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 

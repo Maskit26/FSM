@@ -153,10 +153,22 @@ class DatabaseLayer:
         return self.call_fsm_action(session, "trip", trip_id, "trip_confirm_delivery", driver_id)
 
 
-    def trip_complete_trip(self, session: Session, trip_id: int, driver_id: int) -> bool:
-        """Завершение рейса (FSM: trip_complete_trip)."""
-        return self.call_fsm_action(session, "trip", trip_id, "trip_complete_trip", driver_id)
-
+    def complete_trip(self, session: Session, trip_id: int, driver_id: int) -> bool:
+        """
+        Завершение рейса водителем (FSM: trip_complete_trip).        
+        
+        """
+        logger.debug("complete_trip вызван: trip_id=%s, driver_id=%s", trip_id, driver_id)
+        
+        trip_data = self.get_trip(session, trip_id)
+        
+        if not trip_data or trip_data.get("active", 0) == 0:
+            raise FsmCallError(f"Рейс {trip_id} неактивен")
+        
+        if trip_data.get("driver_user_id") != driver_id:
+            raise DbLayerError(f"Водитель {driver_id} не назначен на рейс {trip_id}")
+        
+        return self.call_fsm_action(session, "trip", trip_id, "trip_complete_trip", driver_id)    
 
     def trip_end_delivery(self, session: Session, trip_id: int, driver_id: int) -> bool:
         """Завершение этапа доставки (FSM: trip_end_delivery)."""
@@ -589,6 +601,7 @@ class DatabaseLayer:
             user_id,
         )
 
+    # == выдача информации о заказах/рейсах для клиента/курьера/водителя ====
     def get_user_orders(self, session: Session, user_id: int) -> List[Dict[str, Any]]:
         """
         Получить все заказы пользователя.
@@ -643,6 +656,192 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("get_user_orders завершился с ошибкой для user_id=%s: %s", user_id, e)
             raise DbLayerError(f"get_user_orders failed: {e}") from e
+
+    def get_courier_orders(
+        self, 
+        session: Session, 
+        courier_id: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить все заказы курьера с полной информацией.
+        
+        Источник истины:
+        - stage_orders (courier_user_id)
+        - orders (данные заказа)
+                 
+        """
+        logger.debug("get_courier_orders вызван для courier_id=%s", courier_id)
+        
+        if courier_id <= 0:
+            raise DbLayerError("Invalid courier_id")
+        
+        try:
+            rows = session.execute(
+                text("""
+                    SELECT
+                        o.id,
+                        o.status,
+                        o.description,
+                        o.parcel_type,
+                        o.pickup_type,
+                        o.delivery_type,
+                        o.source_cell_id,
+                        o.dest_cell_id,
+                        o.client_user_id,
+                        o.recipient_user_id,
+                        o.created_at,
+                        o.updated_at,
+                        so.leg
+                    FROM orders o
+                    JOIN stage_orders so ON so.order_id = o.id
+                    WHERE so.courier_user_id = :courier_id
+                    ORDER BY o.created_at DESC
+                """),
+                {"courier_id": courier_id},
+            ).fetchall()
+            
+            orders: List[Dict[str, Any]] = []
+            for row in rows:
+                orders.append({
+                    "id": row[0],
+                    "status": row[1],
+                    "description": row[2],
+                    "parcel_type": row[3],
+                    "pickup_type": row[4],
+                    "delivery_type": row[5],
+                    "source_cell_id": row[6],
+                    "dest_cell_id": row[7],
+                    "client_user_id": row[8],
+                    "recipient_user_id": row[9],
+                    "created_at": row[10].isoformat() if row[10] else None,
+                    "updated_at": row[11].isoformat() if row[11] else None,
+                    "leg": row[12],                    
+                })
+            
+            logger.debug("get_courier_orders: найдено %d заказов для courier_id=%s", len(orders), courier_id)
+            return orders
+            
+        except Exception as e:
+            logger.error("get_courier_orders завершился с ошибкой для courier_id=%s: %s", courier_id, e)
+            raise DbLayerError(f"get_courier_orders failed: {e}") from e
+
+    def get_driver_trips_with_orders(
+        self, 
+        session: Session, 
+        driver_id: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить активные рейсы водителя со всеми заказами внутри.
+        
+        Источник истины:
+        - trips (driver_user_id, active, status)
+        - stage_orders (trip_id → order_id)
+        - orders (данные заказа)
+        
+        Args:
+            session: активная сессия SQLAlchemy
+            driver_id: ID водителя
+        
+        Returns:
+            Список словарей с данными рейсов и заказов внутри.
+            Водители видят trip_id — они работают с рейсами.
+            БЕЗ leg — чтобы избежать дублирования заказов.
+        
+        Raises:
+            DbLayerError: при ошибке выполнения запроса
+        """
+        logger.debug("get_driver_trips_with_orders вызван для driver_id=%s", driver_id)
+        
+        if driver_id <= 0:
+            raise DbLayerError("Invalid driver_id")
+        
+        try:
+            # Получаем активные рейсы водителя
+            trips_rows = session.execute(
+                text("""
+                    SELECT
+                        t.id,
+                        t.status,
+                        t.active,
+                        t.from_city,
+                        t.to_city,
+                        t.pickup_locker_id,
+                        t.delivery_locker_id,
+                        t.created_at
+                    FROM trips t
+                    WHERE t.driver_user_id = :driver_id
+                    AND t.active = 1
+                    AND t.status != 'trip_completed'
+                    ORDER BY t.created_at DESC
+                """),
+                {"driver_id": driver_id},
+            ).fetchall()
+            
+            trips: List[Dict[str, Any]] = []
+            
+            for trip_row in trips_rows:
+                trip_id = trip_row[0]
+                
+                # Получаем заказы этого рейса (БЕЗ leg, чтобы не дублировать)
+                orders_rows = session.execute(
+                    text("""
+                        SELECT
+                            o.id,
+                            o.status,
+                            o.description,
+                            o.parcel_type,
+                            o.pickup_type,
+                            o.delivery_type,
+                            o.source_cell_id,
+                            o.dest_cell_id,
+                            o.client_user_id,
+                            o.recipient_user_id,
+                            o.created_at,
+                            o.updated_at
+                        FROM orders o
+                        WHERE o.id IN (
+                            SELECT order_id FROM stage_orders WHERE trip_id = :trip_id
+                        )
+                        ORDER BY o.created_at ASC
+                    """),
+                    {"trip_id": trip_id},
+                ).fetchall()
+                
+                orders: List[Dict[str, Any]] = []
+                for order_row in orders_rows:
+                    orders.append({
+                        "id": order_row[0],
+                        "status": order_row[1],
+                        "description": order_row[2],
+                        "parcel_type": order_row[3],
+                        "pickup_type": order_row[4],
+                        "delivery_type": order_row[5],
+                        "source_cell_id": order_row[6],
+                        "dest_cell_id": order_row[7],
+                        "client_user_id": order_row[8],
+                        "recipient_user_id": order_row[9],
+                        "created_at": order_row[10].isoformat() if order_row[10] else None,
+                        "updated_at": order_row[11].isoformat() if order_row[11] else None,
+                    })
+                
+                trips.append({
+                    "id": trip_row[0],
+                    "status": trip_row[1],
+                    "active": trip_row[2],
+                    "from_city": trip_row[3],
+                    "to_city": trip_row[4],
+                    "pickup_locker_id": trip_row[5],
+                    "delivery_locker_id": trip_row[6],
+                    "created_at": trip_row[7].isoformat() if trip_row[7] else None,
+                    "orders": orders,
+                })
+            
+            logger.debug("get_driver_trips_with_orders: найдено %d рейсов для driver_id=%s", len(trips), driver_id)
+            return trips
+            
+        except Exception as e:
+            logger.error("get_driver_trips_with_orders завершился с ошибкой для driver_id=%s: %s", driver_id, e)
+            raise DbLayerError(f"get_driver_trips_with_orders failed: {e}") from e
 
     def get_order_request(self, session: Session, request_id: int, max_retries: int = 3) -> Optional[Dict[str, Any]]:
         logger.debug("get_order_request вызван для request_id=%s", request_id)
@@ -1059,16 +1258,42 @@ class DatabaseLayer:
         logger.debug("locker_not_closed вызван: cell_id=%s, user_id=%s", cell_id, user_id)
         return self.call_fsm_action(session, "locker", cell_id, "locker_dont_closed", user_id)
 
-    def get_order_id_by_cell_id(self, session: Session, cell_id: int) -> Optional[int]:
-        """Возвращает ID заказа, привязанного к ячейке (current_order_id)."""
+    def get_order_id_by_cell_id(
+        self,
+        session: Session,
+        cell_id: int
+    ) -> Optional[int]:
+        """
+        Возвращает ID заказа, привязанного к ячейке.
+        Ищет в:
+        1. locker_cells.current_order_id (для source ячеек)
+        2. orders.source_cell_id или orders.dest_cell_id (для destination ячеек)
+        """
         logger.debug("get_order_id_by_cell_id вызван: cell_id=%s", cell_id)
         try:
+            # 1. Сначала пробуем current_order_id
             result = session.execute(
                 text("SELECT current_order_id FROM locker_cells WHERE id = :cell_id"),
                 {"cell_id": cell_id}
             ).scalar()
-            logger.debug("get_order_id_by_cell_id: cell_id=%s → order_id=%s", cell_id, result)
+            
+            if result:
+                logger.debug("get_order_id_by_cell_id: найдено через current_order_id: %s", result)
+                return result
+            
+            # 2. Если NULL, ищем в orders (для destination ячеек)
+            result = session.execute(
+                text("""
+                    SELECT id FROM orders 
+                    WHERE source_cell_id = :cell_id OR dest_cell_id = :cell_id
+                    LIMIT 1
+                """),
+                {"cell_id": cell_id}
+            ).scalar()
+            
+            logger.debug("get_order_id_by_cell_id: найдено через orders: %s", result)
             return result
+            
         except Exception as e:
             logger.error("get_order_id_by_cell_id завершился с ошибкой для cell_id=%s: %s", cell_id, e)
             raise DbLayerError(f"Failed to get order_id for cell_id {cell_id}: {e}") from e
@@ -2621,23 +2846,39 @@ class DatabaseLayer:
     ) -> List[Dict[str, Any]]:
         """
         Возвращает рейсы, доступные для взятия водителем из указанного города.
+        
         Условия:
         - trips.from_city = :city
         - trips.status = 'trip_created'
         - trips.active = 1
+        - trips.driver_user_id IS NULL (ещё не назначен водитель)
+        
+        Args:
+            session: активная сессия SQLAlchemy
+            city: город отправления
+        
+        Returns:
+            Список словарей с данными рейсов
+        
+        Raises:
+            DbLayerError: при ошибке выполнения запроса
         """
-        logger.debug("get_available_trips_for_driver_exchange вызван для города: {}", city)
+        logger.debug("get_available_trips_for_driver_exchange вызван для города: %s", city)
 
         query = text("""
             SELECT
                 t.id,
                 t.from_city,
-                t.to_city
+                t.to_city,
+                t.pickup_locker_id,
+                t.delivery_locker_id,
+                t.created_at
             FROM trips t
             WHERE
                 t.from_city = :city
                 AND t.status = 'trip_created'
                 AND t.active = 1
+                AND t.driver_user_id IS NULL
             ORDER BY t.created_at ASC;
         """)
 
@@ -2648,16 +2889,19 @@ class DatabaseLayer:
                 {
                     "id": row[0],
                     "from_city": row[1],
-                    "to_city": row[2]
+                    "to_city": row[2],
+                    "pickup_locker_id": row[3],
+                    "delivery_locker_id": row[4],
+                    "created_at": row[5].isoformat() if row[5] else None,
                 }
                 for row in result
             ]
 
-            logger.debug("Найдено {} рейсов для города {}", len(trips), city)
+            logger.debug("Найдено %d рейсов для города %s", len(trips), city)
             return trips
 
         except Exception as e:
-            logger.error("get_available_trips_for_driver_exchange завершился с ошибкой: {}", e)
+            logger.error("get_available_trips_for_driver_exchange завершился с ошибкой: %s", e)
             raise DbLayerError(f"Ошибка получения рейсов для биржи: {e}") from e
 
     # ==================== РЕЙСЫ ====================
@@ -3148,44 +3392,111 @@ class DatabaseLayer:
         trip_id: int
     ) -> Tuple[bool, List[int], List[int], str]:
         """
-        Проверка готовности рейса к старту + получение списков заказов.
+        Проверка готовности рейса к старту (забор посылок из Пост1).    
         
-        Returns:
-            (can_start: bool, blocked_ids: List[int], transit_ids: List[int], error: str)
-            - can_start: True если все заказы готовы
-            - blocked_ids: ID заказов, которые блокируют старт
-            - transit_ids: ID заказов для перевода в транзит
-            - error: текст ошибки если can_start=False
         """
         logger.debug("validate_and_get_orders_for_trip_start вызван: trip_id=%s", trip_id)
         
-        try:
+        try:        
+            # 1. Проверка статуса рейса        
+            trip = self.get_trip(session, trip_id)
+            if not trip:
+                return False, [], [], f"Рейс {trip_id} не найден"
+            
+            if trip["status"] != "trip_assigned":
+                return False, [], [], (
+                    f"Рейс в статусе '{trip['status']}', ожидается 'trip_assigned'"
+                )       
+            
+            # 2. Получаем все заказы рейса с их статусами        
             orders = self.get_orders_with_status_in_trip(session, trip_id)
             if not orders:
-                return False, [], [], "В рейсе нет заказов"
-
-            # ⚠️ ТОЛЬКО DB_LAYER знает эти статусы
-            allowed_statuses = [
-                "order_picked_up_from_post1",      # ✅ Забран успешно
-                "order_manual_intervention_required", # ⚠️ Проблема
-                "order_parcel_missing",            # ⚠️ Посылки нет
-                "order_cancelled",                 # ⚠️ Отменён
-            ]
-            transit_status = "order_picked_up_from_post1"
+                return False, [], [], "В рейсе нет заказов"        
             
-            blocked_ids = []
-            transit_ids = []
+            # 3. Статусы заказов        
+            expected_order_status = "order_picked_up_from_post1"       
+            
+            excluded_order_statuses = [
+                "order_manual_intervention_required",
+                "order_parcel_missing",
+                "order_cancelled",
+            ]        
+            
+            # 4. Статусы ячеек        
+            expected_cell_status = "locker_occupied"       
+        
+            excluded_cell_statuses = [
+                "locker_error",
+                "locker_maintenance",
+            ]        
+            
+            # 5. Проверка заказов       
+            blocked_ids: List[int] = []
+            transit_ids: List[int] = []
             
             for o in orders:
-                if o["status"] not in allowed_statuses:
-                    blocked_ids.append(o["order_id"])
-                elif o["status"] == transit_status:
-                    transit_ids.append(o["order_id"])
+                order_id = o["order_id"]
+                order_status = o["status"]
+                
+                # Пропускаем проблемные заказы
+                if order_status in excluded_order_statuses:
+                    logger.debug(
+                        "validate_and_get_orders_for_trip_start: заказ %s в статусе '%s' — исключён",
+                        order_id, order_status
+                    )
+                    continue
+                
+                # Проверяем успешные заказы
+                if order_status == expected_order_status:
+                    transit_ids.append(order_id)
+                else:
+                    blocked_ids.append(order_id)
             
             if blocked_ids:
-                return False, blocked_ids, [], f"Нельзя начать путь: заказы {blocked_ids} не готовы"
+                return False, blocked_ids, [], (
+                    f"Нельзя начать путь: заказы {blocked_ids} не готовы "
+                    f"(ожидался статус '{expected_order_status}')"
+                )        
             
-            logger.debug(
+            # 6. Проверка pickup ячеек (Пост1)        
+            pickup_cells = session.execute(
+                text("""
+                    SELECT 
+                        lc.id,
+                        lc.status,
+                        o.id as order_id
+                    FROM locker_cells lc
+                    JOIN orders o ON o.id = lc.current_order_id
+                    JOIN stage_orders so ON so.order_id = o.id
+                    WHERE so.trip_id = :trip_id
+                    AND lc.id = o.source_cell_id
+                    AND o.status NOT IN :excluded_order_statuses
+                """),
+                {
+                    "trip_id": trip_id,
+                    "excluded_order_statuses": tuple(excluded_order_statuses)
+                }
+            ).fetchall()
+            
+            for cell_row in pickup_cells:
+                cell_id, cell_status, order_id = cell_row
+                
+                # Пропускаем проблемные ячейки
+                if cell_status in excluded_cell_statuses:
+                    logger.debug(
+                        "validate_and_get_orders_for_trip_start: ячейка %s в статусе '%s' — исключена",
+                        cell_id, cell_status
+                    )
+                    continue
+                
+                # Проверяем успешные ячейки
+                if cell_status != expected_cell_status:
+                    return False, [], [], (
+                        f"Pickup ячейка {cell_id} (заказ {order_id}) в статусе '{cell_status}', "
+                        f"ожидается '{expected_cell_status}'"
+                    )
+            
+            logger.info(
                 "validate_and_get_orders_for_trip_start: trip_id=%s — OK, transit=%d заказов",
                 trip_id, len(transit_ids)
             )
@@ -3194,6 +3505,125 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("validate_and_get_orders_for_trip_start завершился с ошибкой: %s", e)
             raise DbLayerError(f"validate_and_get_orders_for_trip_start failed: {e}") from e
+
+    def validate_trip_for_completion(
+        self,
+        session: Session,
+        trip_id: int
+    ) -> Tuple[bool, List[int], List[int], str]:
+        """
+        Проверка готовности рейса к завершению (посылки размещены в Пост2).
+        
+        """
+        logger.debug("validate_trip_for_completion вызван: trip_id=%s", trip_id)
+        
+        try:            
+            # 1. Проверка статуса рейса            
+            trip = self.get_trip(session, trip_id)
+            if not trip:
+                return False, [], [], f"Рейс {trip_id} не найден"
+            
+            if trip["status"] != "trip_in_progress":
+                return False, [], [], (
+                    f"Рейс в статусе '{trip['status']}', ожидается 'trip_in_progress'"
+                )            
+            
+            # 2. Получаем все заказы рейса с их статусами            
+            orders = self.get_orders_with_status_in_trip(session, trip_id)
+            if not orders:
+                return False, [], [], "В рейсе нет заказов"            
+            
+            # 3. Статусы заказов            
+            expected_order_status = "order_parcel_confirmed_post2"           
+            
+            excluded_order_statuses = [
+                "order_manual_intervention_required",
+                "order_parcel_missing",
+                "order_cancelled",
+            ]            
+            # 4. Статусы ячеек            
+            expected_cell_status = "locker_occupied"            
+            
+            excluded_cell_statuses = [
+                "locker_error",
+                "locker_maintenance",
+            ]            
+            
+            # 5. Проверка заказов            
+            blocked_ids: List[int] = []
+            completed_ids: List[int] = []
+            
+            for o in orders:
+                order_id = o["order_id"]
+                order_status = o["status"]
+                
+                # Пропускаем проблемные заказы
+                if order_status in excluded_order_statuses:
+                    logger.debug(
+                        "validate_trip_for_completion: заказ %s в статусе '%s' — исключён",
+                        order_id, order_status
+                    )
+                    continue
+                
+                # Проверяем успешные заказы
+                if order_status == expected_order_status:
+                    completed_ids.append(order_id)
+                else:
+                    blocked_ids.append(order_id)
+            
+            if blocked_ids:
+                return False, blocked_ids, [], (
+                    f"Нельзя завершить рейс: заказы {blocked_ids} не размещены в Пост2 "
+                    f"(ожидался статус '{expected_order_status}')"
+                )            
+            
+            # 6. Проверка delivery ячеек (Пост2)            
+            delivery_cells = session.execute(
+                text("""
+                    SELECT 
+                        lc.id,
+                        lc.status,
+                        o.id as order_id
+                    FROM locker_cells lc
+                    JOIN orders o ON o.id = lc.current_order_id
+                    JOIN stage_orders so ON so.order_id = o.id
+                    WHERE so.trip_id = :trip_id
+                    AND lc.id = o.dest_cell_id
+                    AND o.status NOT IN :excluded_order_statuses
+                """),
+                {
+                    "trip_id": trip_id,
+                    "excluded_order_statuses": tuple(excluded_order_statuses)
+                }
+            ).fetchall()
+            
+            for cell_row in delivery_cells:
+                cell_id, cell_status, order_id = cell_row
+                
+                # Пропускаем проблемные ячейки
+                if cell_status in excluded_cell_statuses:
+                    logger.debug(
+                        "validate_trip_for_completion: ячейка %s в статусе '%s' — исключена",
+                        cell_id, cell_status
+                    )
+                    continue
+                
+                # Проверяем успешные ячейки
+                if cell_status != expected_cell_status:
+                    return False, [], [], (
+                        f"Delivery ячейка {cell_id} (заказ {order_id}) в статусе '{cell_status}', "
+                        f"ожидается '{expected_cell_status}'"
+                    )
+            
+            logger.info(
+                "validate_trip_for_completion: trip_id=%s — OK, completed=%d заказов",
+                trip_id, len(completed_ids)
+            )
+            return True, [], completed_ids, ""
+            
+        except Exception as e:
+            logger.error("validate_trip_for_completion завершился с ошибкой: %s", e)
+            raise DbLayerError(f"validate_trip_for_completion failed: {e}") from e
 
     # ==================== АВТОМАТИЧЕСКАЯ ОБРАБОТКА ТАЙМАУТОВ ====================
 
