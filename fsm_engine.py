@@ -464,6 +464,45 @@ def _handle_request_locker_access_code(
     logger.info(f"[FSM] request_locker_access_code COMPLETED: order={order_id}")
     return FsmStepResult(new_state="COMPLETED")
 
+def _handle_confirm_courier2_delivery(
+        db: DatabaseLayer,
+        session: Session,
+        ctx: Dict[str, Any],
+        instance: Dict[str, Any]
+    ) -> FsmStepResult:
+        """
+        Подтверждение доставки курьером2 с кодом от получателя.
+        Только роль courier разрешена.
+        Ожидает код в instance["metadata"]["pin"].
+        """
+        user_role = instance["requested_user_role"]
+        order_id = instance["entity_id"]
+        user_id = instance["requested_by_user_id"]
+        metadata = instance.get("metadata", {})
+        pin = metadata.get("pin")
+        
+        logger.info(f"[FSM] confirm_courier2_delivery: role={user_role}, order_id={order_id}, user_id={user_id}")
+        
+        # 1. Проверка роли
+        if user_role != "courier":
+            logger.warning(f"[FSM] confirm_courier2_delivery: not allowed for role {user_role}")
+            return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
+        
+        # 2. Проверка наличия кода
+        if not pin:
+            logger.warning(f"[FSM] confirm_courier2_delivery: missing pin in metadata")
+            return FsmStepResult(new_state="FAILED", last_error="MISSING_PIN_IN_METADATA")
+        
+        # 3. Вызов экшена
+        success, error = ctx["courier_actions"].confirm_delivery_with_code(session, order_id, user_id, pin)
+        
+        if not success:
+            logger.error(f"[FSM] confirm_courier2_delivery FAILED: order_id={order_id}, error={error}")
+            return FsmStepResult(new_state="FAILED", last_error=error)
+        
+        logger.info(f"[FSM] confirm_courier2_delivery COMPLETED: order_id={order_id}")
+        return FsmStepResult(new_state="COMPLETED")
+
 # ==================== РЕЙСЫ ====================
 def _handle_bind_order_to_trip(
     db: DatabaseLayer,
@@ -554,6 +593,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "cancel_order": {"PENDING": _handle_cancel_order},
     "locker_error": {"PENDING": _handle_locker_error},
     "request_locker_access_code": {"PENDING": _handle_request_locker_access_code},
+    "confirm_courier2_delivery": {"PENDING": _handle_confirm_courier2_delivery},
     "bind_order_to_trip": {"PENDING": _handle_bind_order_to_trip},
     "report_error": {"PENDING": _handle_report_error},
 }

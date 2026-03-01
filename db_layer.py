@@ -30,6 +30,9 @@ import time
 import traceback
 import json
 import requests
+import secrets
+import hashlib
+from cryptography.fernet import Fernet
 
 logger = logging.getLogger(__name__)
 
@@ -2551,34 +2554,88 @@ class DatabaseLayer:
         ).scalar()
         return int(result) if result else 0
 
-    def create_access_token(
+    def generate_and_store_access_token(
         self,
         session: Session,
         order_id: int,
         leg: str,
         cell_id: int,
         actor_user_id: int,
-        pin_hash: str,
-        expires_at: datetime
-    ) -> int:
-        session.execute(
-            text("""
-                INSERT INTO cell_access_tokens (
-                    order_id, leg, cell_id, actor_user_id, pin_hash, expires_at
-                ) VALUES (
-                    :order_id, :leg, :cell_id, :actor_user_id, :pin_hash, :expires_at
-                )
-            """),
-            {
-                "order_id": order_id,
-                "leg": leg,
-                "cell_id": cell_id,
-                "actor_user_id": actor_user_id,
-                "pin_hash": pin_hash,
-                "expires_at": expires_at,
-            }
+        expires_minutes: int = 15
+    ) -> Tuple[str, int]:
+        """
+        Генерирует PIN-код, создаёт хэш и сохраняет токен в cell_access_tokens.
+        
+        """
+        logger.debug(
+            "generate_and_store_access_token вызван: order_id=%s, leg=%s, cell_id=%s, actor=%s",
+            order_id, leg, cell_id, actor_user_id
         )
-        return session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+        
+        try:
+            # 1. Отозвать предыдущие ACTIVE токены
+            revoked_result = session.execute(
+                text("""
+                    UPDATE cell_access_tokens
+                    SET status = 'REVOKED'
+                    WHERE order_id = :order_id
+                    AND leg = :leg
+                    AND actor_user_id = :actor_user_id
+                    AND status = 'ACTIVE'
+                """),
+                {
+                    "order_id": order_id,
+                    "leg": leg,
+                    "actor_user_id": actor_user_id,
+                }
+            )
+            revoked_count = revoked_result.rowcount
+            if revoked_count > 0:
+                logger.info(
+                    "generate_and_store_access_token: отозвано %d предыдущих токенов",
+                    revoked_count
+                )
+            
+            # 2. Генерация 6-значного PIN
+            pin = f"{secrets.randbelow(900000) + 100000:06d}"
+            
+            # 3. Создание хэша: SHA256(pin + order_id + cell_id)
+            pin_hash = hashlib.sha256(f"{pin}{order_id}{cell_id}".encode()).hexdigest()
+            
+            # 4. Время истечения
+            expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
+            
+            # 5. Сохранение в базу
+            session.execute(
+                text("""
+                    INSERT INTO cell_access_tokens (
+                        order_id, leg, cell_id, actor_user_id, pin_hash, expires_at
+                    ) VALUES (
+                        :order_id, :leg, :cell_id, :actor_user_id, :pin_hash, :expires_at
+                    )
+                """),
+                {
+                    "order_id": order_id,
+                    "leg": leg,
+                    "cell_id": cell_id,
+                    "actor_user_id": actor_user_id,
+                    "pin_hash": pin_hash,
+                    "expires_at": expires_at,
+                }
+            )
+            
+            token_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+            
+            logger.info(
+                "generate_and_store_access_token: создан токен %s для заказа %s (leg=%s, actor=%s)",
+                token_id, order_id, leg, actor_user_id
+            )
+            
+            return pin, token_id
+            
+        except Exception as e:
+            logger.error("generate_and_store_access_token завершился с ошибкой: %s", e)
+            raise DbLayerError(f"generate_and_store_access_token failed: {e}") from e
 
     def send_code_to_user(self, session: Session, user_id: int, pin: str) -> bool:
         """
@@ -2600,6 +2657,97 @@ class DatabaseLayer:
         except Exception as e:
             logger.exception(f"send_code_to_user mock failed for user_id={user_id}: {e}")
             return False
+
+    def validate_courier2_delivery_code(
+        self,
+        session: Session,
+        order_id: int,
+        courier_id: int,
+        pin: str
+    ) -> Tuple[bool, str]:
+        """
+        Проверка PIN-кода подтверждения доставки для курьера2.
+        
+        Код должен быть выдан ПОЛУЧАТЕЛЕМ (actor_user_id = recipient_user_id)
+        
+        Проверки:
+        1. Токен существует для этого заказа и leg='delivery'
+        2. Токен выдан получателю (actor_user_id = recipient_user_id из заказа)
+        3. PIN совпадает (по хэшу SHA256(pin + order_id + cell_id))
+        4. Токен активен (status='ACTIVE')
+        5. Токен не истёк (expires_at > NOW())
+        
+        """
+        logger.debug("validate_courier2_delivery_code вызван: order_id=%s, courier_id=%s", order_id, courier_id)
+        
+        try:
+            # 1. Получаем заказ для получения recipient_user_id и dest_cell_id
+            order = self.get_order(session, order_id)
+            if not order:
+                return False, "Заказ не найден"
+            
+            recipient_user_id = order.get("recipient_user_id")
+            dest_cell_id = order.get("dest_cell_id")
+            
+            if not recipient_user_id:
+                return False, "У заказа нет получателя"
+            
+            if not dest_cell_id:
+                return False, "У заказа нет dest_cell_id"
+            
+            # 2. Находим токен для этого заказа (leg='delivery', выдан получателю)
+            token_row = session.execute(
+                text("""
+                    SELECT id, pin_hash, status, expires_at, actor_user_id, cell_id
+                    FROM cell_access_tokens
+                    WHERE order_id = :order_id
+                    AND leg = 'delivery'
+                    AND actor_user_id = :recipient_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """),
+                {
+                    "order_id": order_id,
+                    "recipient_id": recipient_user_id,
+                }
+            ).fetchone()
+            
+            if not token_row:
+                return False, "Код подтверждения не найден для этого заказа"
+            
+            token_id, stored_pin_hash, token_status, expires_at, actor_user_id, cell_id = token_row
+            
+            # 3. Проверка статуса токена
+            if token_status != 'ACTIVE':
+                return False, f"Код неактивен (статус: {token_status})"
+            
+            # 4. Проверка срока действия
+            if expires_at < datetime.utcnow():
+                return False, "Код истёк"
+            
+            # 5. Проверка PIN (сравниваем хэш)
+            # Формат: SHA256(pin + order_id + cell_id) — как в AccessCodeActions.request_access_code()
+            expected_hash = hashlib.sha256(f"{pin}{order_id}{dest_cell_id}".encode()).hexdigest()
+            
+            if expected_hash != stored_pin_hash:
+                return False, "Неверный код"
+            
+            # 6. Помечаем токен как использованный
+            session.execute(
+                text("""
+                    UPDATE cell_access_tokens
+                    SET status = 'USED', used_at = NOW()
+                    WHERE id = :token_id
+                """),
+                {"token_id": token_id}
+            )
+            
+            logger.info("validate_courier2_delivery_code: код принят для заказа %s (курьер %s)", order_id, courier_id)
+            return True, ""
+            
+        except Exception as e:
+            logger.error("validate_courier2_delivery_code завершился с ошибкой: %s", e)
+            raise DbLayerError(f"validate_courier2_delivery_code failed: {e}") from e
 
 
     # ==================== НОВЫЕ МЕТОДЫ: РАЗВИЛКИ FSM ====================

@@ -1013,6 +1013,37 @@ class CourierActions:
             logger.error("[COURIER] report_error failed: %s", e)
             return False, str(e)
 
+    def confirm_delivery_with_code(
+        self,
+        session: Session,
+        order_id: int,
+        user_id: int,
+        pin: str
+    ) -> Tuple[bool, str]:
+        """
+        Курьер2 подтверждает доставку с кодом от получателя.        
+        
+        """
+        logger.info("[COURIER] confirm_delivery_with_code order=%s user=%s", order_id, user_id)
+        
+        try:
+            # 1. Проверка кода
+            valid, error = self.db.validate_courier2_delivery_code(session, order_id, user_id, pin)
+            if not valid:
+                logger.warning("[COURIER] confirm_delivery_with_code: код не прошёл проверку: %s", error)
+                return False, f"INVALID_CODE: {error}"
+            
+            # 2. FSM переход: order_courier2_parcel_delivered → order_completed
+            logger.info("[COURIER] executing FSM transition: order_recipient_confirmed for order %s", order_id)
+            self.db.order_recipient_confirmed(session, order_id, user_id)
+            
+            logger.info("[COURIER] order %s completed successfully with code confirmation", order_id)
+            return True, ""
+            
+        except Exception as e:
+            logger.error("[COURIER] confirm_delivery_with_code failed: %s", e)
+            return False, str(e)
+
 # ================= РАБОТА ОПЕРАТОРА =====================
 class OperatorActions:
     """Действия оператора: технические операции с заказами и ячейками."""
@@ -1235,31 +1266,26 @@ class AccessCodeActions:
         user_id: int,
         leg: str
     ) -> Tuple[bool, str]:
-        """
-        Генерирует и выдаёт PIN-код для открытия ячейки.
-        Проверяет:
-          - статус заказа
-          - право пользователя на доступ
-          - лимит ≤3 за 15 минут
-        Сохраняет хэш PIN в cell_access_tokens.
-        Отправляет PIN пользователю (SMS/push).
-        """
         try:
             # 1. Загрузить заказ
             order = self.db.get_order(session, order_id)
             if not order:
                 return False, "ORDER_NOT_FOUND"
 
-            # 2. Проверить статус (разрешённые состояния)
+            # 2. Проверить статус
             allowed_statuses = {
                 "pickup": ["order_created", "order_courier1_assigned"],
-                "delivery": ["order_parcel_confirmed_post2", "order_courier2_assigned"]
+                "delivery": ["order_parcel_confirmed_post2", "order_courier2_assigned", "order_courier2_parcel_delivered"]
             }
             if order["status"] not in allowed_statuses[leg]:
                 return False, f"CODE_NOT_ALLOWED_IN_{order['status']}"
 
             # 3. Определить, кто авторизован
             authorized_user_id = None
+            
+            # 🔥 ПОЛУЧИТЬ РОЛЬ ИЗ БАЗЫ
+            user_role = self.db.get_user_role(session, user_id)
+            
             if leg == "pickup":
                 if order["pickup_type"] == "self":
                     authorized_user_id = order["client_user_id"]
@@ -1268,10 +1294,17 @@ class AccessCodeActions:
                     authorized_user_id = stage.courier_user_id if stage else None
             else:  # delivery
                 if order["delivery_type"] == "self":
+                    # Самовывоз: только получатель
                     authorized_user_id = order.get("recipient_user_id")
                 else:
-                    stage = self.db.get_stage_order(session, order_id, "delivery")
-                    authorized_user_id = stage.courier_user_id if stage else None
+                    # 🔥 КУРЬЕР2: И курьер, И получатель могут запросить код
+                    if user_role == "courier":
+                        stage = self.db.get_stage_order(session, order_id, "delivery")
+                        authorized_user_id = stage.courier_user_id if stage else None
+                    elif user_role == "recipient":
+                        authorized_user_id = order.get("recipient_user_id")
+                    else:
+                        return False, "USER_NOT_AUTHORIZED"
 
             if authorized_user_id != user_id:
                 return False, "USER_NOT_AUTHORIZED"
@@ -1286,23 +1319,14 @@ class AccessCodeActions:
             if not cell_id:
                 return False, "CELL_ID_MISSING"
 
-            # 6. Генерация PIN            
-            pin = f"{secrets.randbelow(900000) + 100000:06d}"
-            pin_hash = hashlib.sha256(f"{pin}{order_id}{cell_id}".encode()).hexdigest()
-            expires_at = datetime.utcnow() + timedelta(minutes=15)
-
-            # 7. Сохранить в cell_access_tokens
-            token_id = self.db.create_access_token(
-                session, order_id, leg, cell_id, user_id, pin_hash, expires_at
+            # 6. Генерация PIN и запись в базу
+            pin, token_id = self.db.generate_and_store_access_token(
+                session, order_id, leg, cell_id, user_id, expires_minutes=15
             )
 
-            # 8. Отправить PIN
-            try:
-                success_send = self.db.send_code_to_user(session, user_id, pin)
-                if not success_send:
-                    logger.warning(f"Failed to deliver code to user {user_id}")
-            except Exception as e:
-                logger.error(f"Error in send_code_to_user: {e}")
+            # 7. Отправить PIN
+            self.db.send_code_to_user(session, user_id, pin)
+            
             logger.info(f"Access code issued: order={order_id}, leg={leg}, user={user_id}, token={token_id}")
             return True, ""
 
