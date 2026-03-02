@@ -1297,7 +1297,7 @@ class AccessCodeActions:
                     # Самовывоз: только получатель
                     authorized_user_id = order.get("recipient_user_id")
                 else:
-                    # 🔥 КУРЬЕР2: И курьер, И получатель могут запросить код
+                    # Курьер и получатель могут запросить код
                     if user_role == "courier":
                         stage = self.db.get_stage_order(session, order_id, "delivery")
                         authorized_user_id = stage.courier_user_id if stage else None

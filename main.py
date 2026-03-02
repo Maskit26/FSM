@@ -1,5 +1,5 @@
 import os
-from typing import Generator, List, Optional, Dict
+from typing import Generator, List, Optional, Dict, Any
 from contextlib import contextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request
@@ -473,6 +473,56 @@ async def get_request_status(
 
         # Возвращаем информацию о статусе
         return status_info
+
+# Для получения 6-тизначного пин кода. Для теста, удалить на продакшне
+@app.post("/api/access-code/view", response_model=Dict[str, Any])
+async def view_access_code(
+    order_id: int,
+    leg: str,
+    user_id: int,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить PIN-код для доступа к ячейке (кнопка 'Посмотреть код'). 
+    Для тетса. Удалить на продакшене
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            # Проверка авторизации
+            order = db.get_order(session, order_id)
+            if not order:
+                raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND")
+            
+            if leg == "pickup":
+                if order["pickup_type"] == "self":
+                    authorized_id = order["client_user_id"]
+                else:
+                    stage = db.get_stage_order(session, order_id, "pickup")
+                    authorized_id = stage.courier_user_id if stage else None
+            else:
+                if order["delivery_type"] == "self":
+                    authorized_id = order.get("recipient_user_id")
+                else:
+                    stage = db.get_stage_order(session, order_id, "delivery")
+                    authorized_id = stage.courier_user_id if stage else None
+            
+            if authorized_id != user_id:
+                raise HTTPException(status_code=403, detail="USER_NOT_AUTHORIZED")
+            
+            pin = db.get_access_token_pin(session, order_id, leg, user_id)
+            
+            if not pin:
+                raise HTTPException(status_code=404, detail="CODE_NOT_FOUND_OR_EXPIRED")
+            
+            return {
+                "success": True,
+                "pin": pin,
+                "order_id": order_id,
+                "leg": leg
+            }
+            
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/orders/{order_id}", response_model=dict)

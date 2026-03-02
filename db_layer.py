@@ -32,7 +32,6 @@ import json
 import requests
 import secrets
 import hashlib
-from cryptography.fernet import Fernet
 
 logger = logging.getLogger(__name__)
 
@@ -2564,8 +2563,8 @@ class DatabaseLayer:
         expires_minutes: int = 15
     ) -> Tuple[str, int]:
         """
-        Генерирует PIN-код, создаёт хэш и сохраняет токен в cell_access_tokens.
-        
+        Генерирует PIN-код, создаёт хэш и сохраняет токен.
+        Для тестирования: PIN хранится в открытом виде в pin_encrypted.
         """
         logger.debug(
             "generate_and_store_access_token вызван: order_id=%s, leg=%s, cell_id=%s, actor=%s",
@@ -2605,13 +2604,13 @@ class DatabaseLayer:
             # 4. Время истечения
             expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
             
-            # 5. Сохранение в базу
+            # 5. Сохранение в базу (PIN в открытом виде для тестирования)
             session.execute(
                 text("""
                     INSERT INTO cell_access_tokens (
-                        order_id, leg, cell_id, actor_user_id, pin_hash, expires_at
+                        order_id, leg, cell_id, actor_user_id, pin_hash, pin_encrypted, expires_at
                     ) VALUES (
-                        :order_id, :leg, :cell_id, :actor_user_id, :pin_hash, :expires_at
+                        :order_id, :leg, :cell_id, :actor_user_id, :pin_hash, :pin_encrypted, :expires_at
                     )
                 """),
                 {
@@ -2620,6 +2619,7 @@ class DatabaseLayer:
                     "cell_id": cell_id,
                     "actor_user_id": actor_user_id,
                     "pin_hash": pin_hash,
+                    "pin_encrypted": pin,  # ← Удалить после этапа теста
                     "expires_at": expires_at,
                 }
             )
@@ -2636,6 +2636,52 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("generate_and_store_access_token завершился с ошибкой: %s", e)
             raise DbLayerError(f"generate_and_store_access_token failed: {e}") from e
+
+    def get_access_token_pin(
+        self,
+        session: Session,
+        order_id: int,
+        leg: str,
+        user_id: int
+    ) -> Optional[str]:
+        """
+        Получить PIN-код для доступа к ячейке.
+        Для тестирования: удалить после этапа теста
+        """
+        logger.debug("get_access_token_pin вызван: order_id=%s, leg=%s, user_id=%s", order_id, leg, user_id)
+        
+        try:
+            row = session.execute(
+                text("""
+                    SELECT pin_encrypted, expires_at, status
+                    FROM cell_access_tokens
+                    WHERE order_id = :order_id
+                    AND leg = :leg
+                    AND actor_user_id = :user_id
+                    AND status = 'ACTIVE'
+                    AND expires_at > NOW()
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """),
+                {
+                    "order_id": order_id,
+                    "leg": leg,
+                    "user_id": user_id,
+                }
+            ).fetchone()
+            
+            if not row:
+                logger.debug("get_access_token_pin: активный токен не найден")
+                return None
+            
+            pin, expires_at, status = row
+            
+            logger.info("get_access_token_pin: PIN получен для заказа %s", order_id)
+            return pin
+            
+        except Exception as e:
+            logger.error("get_access_token_pin завершился с ошибкой: %s", e)
+            return None
 
     def send_code_to_user(self, session: Session, user_id: int, pin: str) -> bool:
         """
