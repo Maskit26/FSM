@@ -1154,39 +1154,7 @@ class DatabaseLayer:
                     f"General error in mark_request_failed for request_id {request_id}: {e}"
                 ) from e
 
-    def get_order_request_status(self, session: Session, request_id: int) -> Optional[Dict[str, Any]]:
-        logger.debug("get_order_request_status вызван для request_id=%s", request_id)
-
-        try:
-            row = session.execute(
-                text("""
-                    SELECT status, order_id, error_code, error_message
-                    FROM order_requests
-                    WHERE id = :request_id
-                """),
-                {"request_id": request_id}
-            ).fetchone()
-
-            if not row:
-                logger.debug("get_order_request_status: заявка request_id=%s не найдена", request_id)
-                return None
-
-            result = {
-                "status": row[0],
-                "order_id": row[1],
-                "error_code": row[2],
-                "error_message": row[3]
-            }
-            logger.debug("get_order_request_status: получен статус=%s для request_id=%s", result["status"], request_id)
-            return result
-
-        except SQLAlchemyError as e:
-            logger.error("get_order_request_status: SQLAlchemy ошибка для request_id=%s: %s", request_id, e)
-            raise DbLayerError(f"Failed to get status for order request {request_id}: {e}") from e
-        except Exception as e:
-            logger.error("get_order_request_status: неизвестная ошибка для request_id=%s: %s", request_id, e)
-            raise DbLayerError(f"General error getting status for order request {request_id}: {e}") from e
-
+    
     # ---------- LOCKER / ЯЧЕЙКИ ----------
 
     def open_locker_for_recipient(
@@ -1975,51 +1943,71 @@ class DatabaseLayer:
                 entity_type, entity_id, process_name, e
             )
             raise DbLayerError(f"enqueue_fsm_instance failed: {e}") from e
-
-    def get_last_instance_status_for_request(
+    
+    def get_user_fsm_errors(
         self,
         session: Session,
-        request_id: int
-    ) -> Optional[Dict[str, Any]]:
+        user_id: int,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
         """
-        Получает статус и last_error самого свежего инстанса для заявки.
-        Возвращает {'fsm_state': ..., 'last_error': ...} или None
+        Получить последние FSM-ошибки для пользователя.
+        
+        Возвращает ошибки из server_fsm_instances где:
+        - requested_by_user_id = user_id
+        - fsm_state = 'FAILED'
+        - last_error IS NOT NULL
+        
         """
-        logger.debug("get_last_instance_status_for_request вызван: request_id=%s", request_id)
+        logger.debug("get_user_fsm_errors вызван: user_id=%s", user_id)
+        
         try:
-            row = session.execute(
+            rows = session.execute(
                 text("""
-                    SELECT fsm_state, last_error
+                    SELECT 
+                        id,
+                        entity_type,
+                        entity_id,
+                        process_name,
+                        fsm_state,
+                        last_error,
+                        created_at,
+                        updated_at,
+                        metadata_json
                     FROM server_fsm_instances
-                    WHERE entity_type = 'order_request'
-                      AND entity_id = :request_id
-                      AND process_name = 'order_creation'
-                    ORDER BY created_at DESC
-                    LIMIT 1
+                    WHERE requested_by_user_id = :user_id
+                    AND fsm_state = 'FAILED'
+                    AND last_error IS NOT NULL
+                    ORDER BY updated_at DESC
+                    LIMIT :limit
                 """),
-                {"request_id": request_id}
-            ).fetchone()
-
-            if row:
-                result = {
-                    "fsm_state": row[0],
-                    "last_error": row[1]
+                {
+                    "user_id": user_id,
+                    "limit": limit,
                 }
-                logger.debug(
-                    "get_last_instance_status_for_request: request_id=%s → state=%s, error=%s",
-                    request_id, result["fsm_state"], result["last_error"]
-                )
-                return result
-
-            logger.debug("get_last_instance_status_for_request: инстанс для request_id=%s не найден", request_id)
-            return None
-
+            ).fetchall()
+            
+            errors = [
+                {
+                    "instance_id": row[0],
+                    "entity_type": row[1],
+                    "entity_id": row[2],
+                    "process_name": row[3],
+                    "fsm_state": row[4],
+                    "last_error": row[5],
+                    "created_at": row[6].isoformat() if row[6] else None,
+                    "updated_at": row[7].isoformat() if row[7] else None,
+                    "metadata": json.loads(row[8]) if row[8] else None,
+                }
+                for row in rows
+            ]
+            
+            logger.debug("get_user_fsm_errors: найдено %d ошибок для user_id=%s", len(errors), user_id)
+            return errors
+            
         except Exception as e:
-            logger.error(
-                "get_last_instance_status_for_request завершился с ошибкой для request_id=%s: %s",
-                request_id, e
-            )
-            raise DbLayerError(f"Failed to get FSM instance status for request {request_id}: {e}") from e
+            logger.error("get_user_fsm_errors завершился с ошибкой: %s", e)
+            raise DbLayerError(f"get_user_fsm_errors failed: {e}") from e
 
     def fetch_ready_fsm_instances(
         self,
@@ -3020,8 +3008,7 @@ class DatabaseLayer:
         """
         pickup = self.get_available_orders_for_pickup(session, courier_city)
         delivery = self.get_available_orders_for_delivery(session, courier_city)
-
-        # Добавляем тип прямо здесь — чтобы не дублировать логику в API
+        
         for order in pickup:
             order["type"] = "pickup"
         for order in delivery:
@@ -3030,7 +3017,7 @@ class DatabaseLayer:
         return {
             "pickup": pickup,
             "delivery": delivery,
-            "all": pickup + delivery  # ← удобно для фронта: один список
+            "all": pickup + delivery  
         }
 
     def get_available_trips_for_driver_exchange(
@@ -3267,8 +3254,8 @@ class DatabaseLayer:
                     "from_city": row[3],
                     "to_city": row[4],
                     "driver_user_id": row[5],
-                    "pickup_locker_id": row[6],      # Теперь есть
-                    "delivery_locker_id": row[7],    # Теперь есть
+                    "pickup_locker_id": row[6],      
+                    "delivery_locker_id": row[7],    
                 }
                 for row in rows
             ]
