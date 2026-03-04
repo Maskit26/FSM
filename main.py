@@ -457,22 +457,30 @@ async def get_driver_trips_endpoint(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-
-@app.get("/api/order_requests/status/{request_id}", response_model=dict)
-async def get_request_status(
-    request_id: int,
+@app.get("/api/fsm/user-errors", response_model=dict)
+async def get_user_fsm_errors(
+    user_id: int,
+    limit: int = 50,
     db: DatabaseLayer = Depends(get_db)
 ):
     """
-    Получить статус заявки.
+    Получить последние FSM-ошибки для пользователя.
+    
     """
     with get_db_session(read_only=True) as session:
-        status_info = db.get_order_request_status(session, request_id)
-        if not status_info:
-            raise HTTPException(status_code=404, detail="Order request not found")
-
-        # Возвращаем информацию о статусе
-        return status_info
+        try:
+            errors = db.get_user_fsm_errors(session, user_id, limit)
+            
+            return {
+                "success": True,
+                "errors": errors,
+                "count": len(errors)
+            }
+            
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 # Для получения 6-тизначного пин кода. Для теста, удалить на продакшне
 @app.post("/api/access-code/view", response_model=Dict[str, Any])
