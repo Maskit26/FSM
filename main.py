@@ -2,7 +2,7 @@ import os
 from typing import Generator, List, Optional, Dict, Any
 from contextlib import contextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Query
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fsm_engine import PROCESS_DEFS
@@ -981,6 +981,120 @@ async def get_all_users(
         try:
             users = db.get_all_users(session)
             return users
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+# ==================== FSM ЭМУЛЯТОР ====================
+@app.get("/api/fsm/emulator/entities", response_model=List[dict])
+async def get_emulator_entities(
+    entity_type: Optional[str] = Query(default="all", description="Тип сущности: order, trip, locker, all"),
+    status: Optional[str] = Query(default="all", description="Статус: order_created, trip_assigned, all"),
+    limit: int = Query(default=50, ge=1, le=100),
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить список сущностей для таблицы эмулятора.
+    
+    Args:
+        entity_type: Тип сущности ('order', 'trip', 'locker', 'all')
+        status: Фильтр по статусу ('all' = без фильтрации)
+        limit: Максимальное количество записей
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            # Если "all" — получаем все типы сущностей
+            if entity_type == "all" or not entity_type:
+                all_entities = []
+                
+                # Получаем заказы
+                orders = db.get_emulator_entities(session, "order", limit)
+                for order in orders:
+                    order["entity_type"] = "order"  # ← Добавляем entity_type в ответ
+                    all_entities.append(order)
+                
+                # Получаем рейсы
+                trips = db.get_emulator_entities(session, "trip", limit // 2)
+                for trip in trips:
+                    trip["entity_type"] = "trip"
+                    all_entities.append(trip)
+                
+                # Получаем ячейки
+                lockers = db.get_emulator_entities(session, "locker", limit // 2)
+                for locker in lockers:
+                    locker["entity_type"] = "locker"
+                    all_entities.append(locker)
+                
+                # Фильтр по статусу
+                if status != "all" and status:
+                    all_entities = [e for e in all_entities if e.get("status") == status]
+                
+                # Сортировка и лимит
+                all_entities.sort(key=lambda x: x.get("id", 0), reverse=True)
+                entities = all_entities[:limit]
+            else:
+                # Один тип сущности
+                entities = db.get_emulator_entities(session, entity_type, limit)
+                for entity in entities:
+                    entity["entity_type"] = entity_type  # ← Добавляем entity_type в ответ
+                
+                # Фильтр по статусу
+                if status != "all" and status:
+                    entities = [e for e in entities if e.get("status") == status]
+            
+            return entities
+            
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/fsm/emulator/entities/{entity_type}/{entity_id}/actions", response_model=dict)
+async def get_entity_actions(
+    entity_type: str,
+    entity_id: int,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить доступные FSM-действия для сущности.
+    Заполняет dropdown в колонке Available Actions.
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            current_state = db.get_entity_current_state(session, entity_type, entity_id)
+            
+            if not current_state:
+                raise HTTPException(status_code=404, detail=f"Сущность {entity_type}/{entity_id} не найдена")
+            
+            actions = db.get_available_fsm_actions(session, entity_type, current_state)
+            
+            return {
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "current_state": current_state,
+                "available_actions": actions
+            }
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/fsm/emulator/entities/{entity_type}/{entity_id}/history", response_model=dict)
+async def get_entity_history(
+    entity_type: str,
+    entity_id: int,
+    limit: int = 50,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить историю FSM-переходов.
+    Открывается при клике на Current State в таблице.
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            history = db.get_fsm_action_history(session, entity_type, entity_id, limit)
+            
+            return {
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "history": history,
+                "count": len(history)
+            }
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 

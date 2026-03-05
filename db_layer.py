@@ -3846,6 +3846,257 @@ class DatabaseLayer:
             logger.error("check_and_process_reservation_timeouts завершился с ошибкой: %s", e)
             raise DbLayerError(f"Failed to process reservation timeouts: {e}") from e
 
+    # ==================== FSM ЭМУЛЯТОР ====================
+
+    def get_emulator_entities(
+        self,
+        session: Session,
+        entity_type: str,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Возвращает список сущностей для эмулятора.
+        """
+        logger.debug(
+            "get_emulator_entities вызван: entity_type=%s, limit=%s",
+            entity_type, limit
+        )
+        
+        try:
+            if entity_type == "order":
+                rows = session.execute(
+                    text("""
+                        SELECT id, status, description, created_at
+                        FROM orders
+                        ORDER BY id DESC
+                        LIMIT :limit
+                    """),
+                    {"limit": limit}
+                ).fetchall()
+            elif entity_type == "trip":
+                rows = session.execute(
+                    text("""
+                        SELECT id, status, 
+                            CONCAT(from_city, ' → ', to_city) AS description,
+                            created_at
+                        FROM trips
+                        ORDER BY id DESC
+                        LIMIT :limit
+                    """),
+                    {"limit": limit}
+                ).fetchall()
+            elif entity_type == "locker":
+                rows = session.execute(
+                    text("""
+                        SELECT id, status, cell_code AS description, created_at
+                        FROM locker_cells
+                        ORDER BY id DESC
+                        LIMIT :limit
+                    """),
+                    {"limit": limit}
+                ).fetchall()
+            else:
+                logger.error("get_emulator_entities: неизвестный entity_type=%s", entity_type)
+                raise DbLayerError(f"Неизвестный entity_type: {entity_type}")
+            
+            entities = []
+            for row in rows:
+                entities.append({
+                    "id": row[0],
+                    "status": row[1],
+                    "description": row[2] if row[2] else f"{entity_type} #{row[0]}",
+                    "created_at": row[3].isoformat() if row[3] else None,
+                })
+            
+            logger.debug(
+                "get_emulator_entities: %s → %d сущностей",
+                entity_type, len(entities)
+            )
+            return entities
+            
+        except Exception as e:
+            logger.error(
+                "get_emulator_entities завершился с ошибкой: %s, error=%s",
+                entity_type, e
+            )
+            raise DbLayerError(f"Failed to get entities for emulator: {e}") from e
+
+
+    def get_entity_current_state(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int,
+    ) -> Optional[str]:
+        """
+        Возвращает текущее состояние сущности (order/trip/locker).
+        """
+        logger.debug(
+            "get_entity_current_state вызван: entity_type=%s, entity_id=%s",
+            entity_type, entity_id
+        )
+        
+        try:
+            if entity_type == "order":
+                result = session.execute(
+                    text("SELECT status FROM orders WHERE id = :id"),
+                    {"id": entity_id}
+                ).scalar()
+            elif entity_type == "trip":
+                result = session.execute(
+                    text("SELECT status FROM trips WHERE id = :id"),
+                    {"id": entity_id}
+                ).scalar()
+            elif entity_type == "locker":
+                result = session.execute(
+                    text("SELECT status FROM locker_cells WHERE id = :id"),
+                    {"id": entity_id}
+                ).scalar()
+            else:
+                logger.error("get_entity_current_state: неизвестный entity_type=%s", entity_type)
+                raise DbLayerError(f"Неизвестный entity_type: {entity_type}")
+            
+            if result:
+                logger.debug(
+                    "get_entity_current_state: %s:%s → %s",
+                    entity_type, entity_id, result
+                )
+            else:
+                logger.warning(
+                    "get_entity_current_state: сущность %s:%s не найдена",
+                    entity_type, entity_id
+                )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                "get_entity_current_state завершился с ошибкой: %s:%s, error=%s",
+                entity_type, entity_id, e
+            )
+            raise DbLayerError(f"Failed to get state for {entity_type}:{entity_id}: {e}") from e
+
+
+    def get_available_fsm_actions(
+        self,
+        session: Session,
+        entity_type: str,
+        current_state: str,
+    ) -> List[str]:
+        """
+        Возвращает все доступные FSM-действия для текущего состояния.
+        """
+        logger.debug(
+            "get_available_fsm_actions вызван: entity_type=%s, current_state=%s",
+            entity_type, current_state
+        )
+        
+        try:
+            # 1. Получаем ID текущего состояния
+            state_row = session.execute(
+                text("SELECT id FROM fsm_states WHERE name = :name"),
+                {"name": current_state}
+            ).fetchone()
+            
+            if not state_row:
+                logger.warning(
+                    "get_available_fsm_actions: состояние '%s' не найдено в fsm_states",
+                    current_state
+                )
+                return []
+            
+            from_state_id = state_row[0]
+            
+            # 2. Получаем все действия, доступные из этого состояния
+            rows = session.execute(
+                text("""
+                    SELECT fa.name
+                    FROM fsm_transitions ft
+                    JOIN fsm_actions fa ON fa.id = ft.action_id
+                    WHERE ft.from_state_id = :from_state_id
+                    ORDER BY fa.name
+                """),
+                {"from_state_id": from_state_id}
+            ).fetchall()
+            
+            actions = [row[0] for row in rows]
+            
+            logger.debug(
+                "get_available_fsm_actions: %s в состоянии '%s' → %d действий: %s",
+                entity_type, current_state, len(actions), actions
+            )
+            return actions
+            
+        except Exception as e:
+            logger.error(
+                "get_available_fsm_actions завершился с ошибкой: %s:%s, error=%s",
+                entity_type, current_state, e
+            )
+            raise DbLayerError(f"Failed to get available actions: {e}") from e
+
+
+    def get_fsm_action_history(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Возвращает историю FSM-переходов для конкретной сущности из fsm_action_logs.
+        """
+        logger.debug(
+            "get_fsm_action_history вызван: entity_type=%s, entity_id=%s, limit=%s",
+            entity_type, entity_id, limit
+        )
+        
+        try:
+            rows = session.execute(
+                text("""
+                    SELECT 
+                        id,
+                        action_name,
+                        from_state,
+                        to_state,
+                        user_id,
+                        created_at
+                    FROM fsm_action_logs
+                    WHERE entity_type = :entity_type
+                    AND entity_id = :entity_id
+                    ORDER BY id DESC
+                    LIMIT :limit
+                """),
+                {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "limit": limit
+                }
+            ).fetchall()
+            
+            history = []
+            for row in rows:
+                history.append({
+                    "id": row[0],
+                    "action_name": row[1],
+                    "from_state": row[2],
+                    "to_state": row[3],
+                    "user_id": row[4],
+                    "created_at": row[5].isoformat() if row[5] else None,
+                })
+            
+            logger.debug(
+                "get_fsm_action_history: %s:%s → %d записей",
+                entity_type, entity_id, len(history)
+            )
+            return history
+            
+        except Exception as e:
+            logger.error(
+                "get_fsm_action_history завершился с ошибкой: %s:%s, error=%s",
+                entity_type, entity_id, e
+            )
+            raise DbLayerError(f"Failed to get FSM history: {e}") from e
+
     # ==================== СЕРВИСНЫЕ ПРОЦЕДУРЫ ====================
 
     def clear_test_data(self) -> bool:
