@@ -992,34 +992,29 @@ async def get_emulator_entities(
     limit: int = Query(default=50, ge=1, le=100),
     db: DatabaseLayer = Depends(get_db)
 ):
-    """
-    Получить список сущностей для таблицы эмулятора.
-    
-    Args:
-        entity_type: Тип сущности ('order', 'trip', 'locker', 'all')
-        status: Фильтр по статусу ('all' = без фильтрации)
-        limit: Максимальное количество записей
-    """
     with get_db_session(read_only=True) as session:
         try:
             # Если "all" — получаем все типы сущностей
             if entity_type == "all" or not entity_type:
                 all_entities = []
                 
+                # 🔥 Лимит на КАЖДЫЙ тип отдельно
+                per_type_limit = limit // 3 if limit >= 3 else 1
+                
                 # Получаем заказы
-                orders = db.get_emulator_entities(session, "order", limit)
+                orders = db.get_emulator_entities(session, "order", per_type_limit)
                 for order in orders:
-                    order["entity_type"] = "order"  # ← Добавляем entity_type в ответ
+                    order["entity_type"] = "order"
                     all_entities.append(order)
                 
                 # Получаем рейсы
-                trips = db.get_emulator_entities(session, "trip", limit // 2)
+                trips = db.get_emulator_entities(session, "trip", per_type_limit)
                 for trip in trips:
                     trip["entity_type"] = "trip"
                     all_entities.append(trip)
                 
                 # Получаем ячейки
-                lockers = db.get_emulator_entities(session, "locker", limit // 2)
+                lockers = db.get_emulator_entities(session, "locker", per_type_limit)
                 for locker in lockers:
                     locker["entity_type"] = "locker"
                     all_entities.append(locker)
@@ -1028,14 +1023,16 @@ async def get_emulator_entities(
                 if status != "all" and status:
                     all_entities = [e for e in all_entities if e.get("status") == status]
                 
-                # Сортировка и лимит
-                all_entities.sort(key=lambda x: x.get("id", 0), reverse=True)
+                # 🔥 Сортируем по created_at, а не по ID
+                all_entities.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+                
+                # Общий лимит
                 entities = all_entities[:limit]
             else:
                 # Один тип сущности
                 entities = db.get_emulator_entities(session, entity_type, limit)
                 for entity in entities:
-                    entity["entity_type"] = entity_type  # ← Добавляем entity_type в ответ
+                    entity["entity_type"] = entity_type
                 
                 # Фильтр по статусу
                 if status != "all" and status:
