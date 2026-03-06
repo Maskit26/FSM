@@ -233,22 +233,39 @@ class ClientActions:
         user_id: int
     ) -> Tuple[bool, str]:
         """
-        Клиент открывает ячейку отправки.
-
-        FSM: locker_reserved → locker_opened
+        Клиент открывает ячейку отправки.        
         """
-        logger.info("[CLIENT] open_cell_for_client order=%s user=%s", order_id, user_id)
+        logger.info(
+            "[CLIENT] open_cell_for_client order=%s user=%s",
+            order_id, user_id
+        )
 
         try:
+            # 1. Получаем ID ячейки
             cell_id = self._get_source_cell_id(session, order_id)
-            logger.debug("[CLIENT] opening source cell %s for order %s", cell_id, order_id)
-            
+            logger.debug(
+                "[CLIENT] opening source cell %s for order %s",
+                cell_id, order_id
+            )            
+            # 2. FSM переход заказа: order_created → order_client_post1
+            self.db.order_client_deliv_post1(session, order_id, user_id)
+            logger.info(
+                "[CLIENT] order %s transitioned to order_client_post1",
+                order_id
+            )            
+            # 3. Открытие ячейки (Locker FSM)
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
-            logger.info("[CLIENT] cell %s opened successfully for order %s", cell_id, order_id)
-            
+            logger.info(
+                "[CLIENT] cell %s opened successfully for order %s",
+                cell_id, order_id
+            )            
             return True, ""
+            
         except Exception as e:
-            logger.error("[CLIENT] failed to open cell for order %s: %s", order_id, str(e))
+            logger.error(
+                "[CLIENT] failed to open cell for order %s: %s",
+                order_id, str(e)
+            )
             return False, str(e)
 
     def close_cell_for_client(
@@ -404,9 +421,18 @@ class RecipientActions:
         try:
             cell_id = self._get_dest_cell_id(session, order_id)
             logger.debug("[RECIPIENT] opening destination cell %s for order %s", cell_id, order_id)
+            
+            # 1. Locker FSM: открываем ячейку
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
+            logger.debug("[RECIPIENT] locker opened: cell=%s", cell_id)
+            
+            # 2. Order FSM: получатель забрал заказ
+            self.db.order_pickup_by_recipient(session, order_id, user_id)
+            logger.debug("[RECIPIENT] order FSM transitioned: order_id=%s", order_id)
+            
             logger.info("[RECIPIENT] cell %s opened successfully for order %s", cell_id, order_id)
             return True, ""
+            
         except Exception as e:
             logger.error("[RECIPIENT] failed to open cell for order %s: %s", order_id, str(e))
             return False, str(e)
@@ -425,9 +451,18 @@ class RecipientActions:
         try:
             cell_id = self._get_dest_cell_id(session, order_id)
             logger.debug("[RECIPIENT] closing destination cell %s for order %s", cell_id, order_id)
+            
+            # 1. Order FSM: заказ отмечен как доставленный
+            self.db.order_mark_delivered_parcel(session, order_id, user_id)
+            logger.debug("[RECIPIENT] order FSM transitioned: order_id=%s", order_id)
+            
+            # 2. Locker FSM: закрываем ячейку
             self.db.close_locker_pickup(session, cell_id, user_id)
+            logger.debug("[RECIPIENT] locker closed: cell=%s", cell_id)
+            
             logger.info("[RECIPIENT] cell %s closed successfully for order %s", cell_id, order_id)
             return True, ""
+            
         except Exception as e:
             logger.error("[RECIPIENT] failed to close cell for order %s: %s", order_id, str(e))
             return False, str(e)

@@ -564,6 +564,23 @@ async def get_all_orders(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+# ==================== TRACKING ЗАКАЗА ====================
+@app.get("/api/orders/{order_id}/track", response_model=dict)
+async def get_order_tracking(
+    order_id: int,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Треккер заказа по id для Получателя.
+    Показывает все возможные статусы в жизненном цикле заказа.
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            tracking = db.get_order_tracking_path(session, order_id)
+            return tracking
+        except DbLayerError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
 # ==================== БИРЖИ ====================
 
 @app.get("/api/courier/exchange", response_model=dict)

@@ -395,14 +395,10 @@ class DatabaseLayer:
         """Таймаут подтверждения курьером (FSM: order_timeout_confirmation)."""
         return self.call_fsm_action(session, "order", order_id, "order_timeout_confirmation", user_id)
 
-    def order_reserve_for_client_A_to_B(self, session: Session, order_id: int, user_id: int) -> bool:
-        """Резерв слота A→B клиентом (FSM: order_reserve_for_client_A_to_B)."""
-        return self.call_fsm_action(session, "order", order_id, "order_reserve_for_client_A_to_B", user_id)
-
-    def order_reserve_for_courier_A_to_B(self, session: Session, order_id: int, courier_id: int) -> bool:
-        """Резерв слота A→B курьером (FSM: order_reserve_for_courier_A_to_B)."""
-        return self.call_fsm_action(session, "order", order_id, "order_reserve_for_courier_A_to_B", courier_id)
-
+    def order_client_deliv_post1(self, session: Session, order_id: int, user_id: int) -> bool:
+        """Клиент положил посылку в постамат1 (FSM: order_client_deliv_post1)."""
+        return self.call_fsm_action(session, "order", order_id, "order_client_deliv_post1", user_id)
+    
     def order_confirm_parcel_in(self, session: Session, order_id: int, user_id: int) -> bool:
         """Подтверждение, что посылка находится в нужном месте."""
         logger.debug("order_confirm_parcel_in вызван: order_id=%s, user_id=%s", order_id, user_id)
@@ -460,21 +456,9 @@ class DatabaseLayer:
         """Получатель забирает заказ (FSM: order_pickup_poluchatel)."""
         return self.call_fsm_action(session, "order", order_id, "order_pickup_poluchatel", recipient_id)
 
-    def order_mark_delivered_parcel(
-        self,
-        session: Session,
-        order_id: int,
-        user_id: int,
-    ) -> bool:
-        """Заказ отмечен как доставленный (FSM: order_delivered_parcel)."""
-        return self.call_fsm_action(
-            session,
-            "order",
-            order_id,
-            "order_delivered_parcel",
-            user_id,
-        )
-
+    def order_mark_delivered_parcel(self, session: Session, order_id: int, user_id: int) -> bool:
+    """Заказ отмечен как доставленный (FSM: order_delivered_parcel)."""
+    return self.call_fsm_action(session, "order", order_id, "order_delivered_parcel", user_id)
 
     def order_recipient_confirmed(
         self,
@@ -2512,6 +2496,185 @@ class DatabaseLayer:
                 order_id, leg, e
             )
             raise DbLayerError(f"clear_courier_from_stage_order failed: {e}") from e
+
+    # ==================== TRACKING ЗАКАЗА ====================
+
+    def get_order_tracking_path(
+        self,
+        session: Session,
+        order_id: int,
+    ) -> Dict[str, Any]:
+        """
+        Возвращает полный путь статусов заказа с флагами is_current и is_completed.
+        Путь строится динамически на основе pickup_type и delivery_type.
+        """
+        logger.debug("get_order_tracking_path вызван: order_id=%s", order_id)
+        
+        try:
+            # 1. Получаем текущий статус и типы доставки заказа
+            order = self.get_order(session, order_id)
+            if not order:
+                raise DbLayerError(f"Заказ {order_id} не найден")
+            
+            current_status = order.get("status")
+            pickup_type = order.get("pickup_type", "courier")
+            delivery_type = order.get("delivery_type", "courier")
+            
+            # 2. Определяем полный путь статусов в зависимости от сценария
+            status_path = self._build_status_path(pickup_type, delivery_type)
+            
+            # 3. Строим путь с флагами
+            path = []
+            current_index = -1
+            
+            # Находим индекс текущего статуса
+            for i, status in enumerate(status_path):
+                if status == current_status:
+                    current_index = i
+                    break
+            
+            # Если статус не найден в пути (например, order_cancelled), добавляем его
+            if current_index == -1:
+                special_statuses = [
+                    "order_cancelled",
+                    "order_manual_intervention_required",
+                    "order_parcel_missing",
+                    "order_delivery_failed",
+                    "order_courier_failed",
+                    "order_reservation_expired",
+                ]
+                if current_status in special_statuses:
+                    path.append({
+                        "status": current_status,
+                        "is_current": True,
+                        "is_completed": True,
+                    })
+                    return {
+                        "order_id": order_id,
+                        "current_status": current_status,
+                        "pickup_type": pickup_type,
+                        "delivery_type": delivery_type,
+                        "path": path,
+                    }
+                else:
+                    logger.warning("get_order_tracking_path: неизвестный статус %s", current_status)
+                    current_index = len(status_path) - 1
+            
+            # 4. Заполняем путь с флагами
+            for i, status in enumerate(status_path):
+                path.append({
+                    "status": status,
+                    "is_current": (i == current_index),
+                    "is_completed": (i <= current_index),
+                })
+            
+            logger.debug(
+                "get_order_tracking_path: order_id=%s, current=%s, path_length=%d",
+                order_id, current_status, len(path)
+            )
+            
+            return {
+                "order_id": order_id,
+                "current_status": current_status,
+                "pickup_type": pickup_type,
+                "delivery_type": delivery_type,
+                "path": path,
+            }
+            
+        except Exception as e:
+            logger.error("get_order_tracking_path завершился с ошибкой: %s", e)
+            raise DbLayerError(f"Failed to get tracking path for order {order_id}: {e}") from e
+
+    def _build_status_path(self, pickup_type: str, delivery_type: str) -> List[str]:
+        """
+        Строит путь статусов в зависимости от сценария доставки.
+        """
+        
+        # Сценарий 1: courier/courier (полный путь)
+        if pickup_type == "courier" and delivery_type == "courier":
+            return [
+                "order_created",
+                "order_courier1_assigned",
+                "order_courier_has_parcel",
+                "order_parcel_confirmed",
+                "order_parcel_submitted",
+                "order_picked_up_from_post1",
+                "order_in_transit_to_post2",
+                "order_arrived_at_post2",
+                "order_parcel_confirmed_post2",
+                "order_courier2_assigned",
+                "order_courier2_has_parcel",
+                "order_courier2_parcel_delivered",
+                "order_completed",
+            ]
+        
+        # Сценарий 2: self/courier (клиент сам несёт в постамат)
+        elif pickup_type == "self" and delivery_type == "courier":
+            return [
+                "order_created",
+                "order_client_post1",
+                "order_parcel_confirmed",
+                "order_parcel_submitted",
+                "order_picked_up_from_post1",
+                "order_in_transit_to_post2",
+                "order_arrived_at_post2",
+                "order_parcel_confirmed_post2",
+                "order_courier2_assigned",
+                "order_courier2_has_parcel",
+                "order_courier2_parcel_delivered",
+                "order_completed",
+            ]
+        
+        # Сценарий 3: courier/self (курьер1 забирает, получатель сам забирает)
+        elif pickup_type == "courier" and delivery_type == "self":
+            return [
+                "order_created",
+                "order_courier1_assigned",
+                "order_courier_has_parcel",
+                "order_parcel_confirmed",
+                "order_parcel_submitted",
+                "order_picked_up_from_post1",
+                "order_in_transit_to_post2",
+                "order_arrived_at_post2",
+                "order_parcel_confirmed_post2",
+                "order_delivered_to_client",
+                "order_completed",
+            ]
+        
+        # Сценарий 4: self/self (клиент и получатель сами)
+        elif pickup_type == "self" and delivery_type == "self":
+            return [
+                "order_created",
+                "order_client_post1",
+                "order_parcel_confirmed",
+                "order_parcel_submitted",
+                "order_picked_up_from_post1",
+                "order_in_transit_to_post2",
+                "order_arrived_at_post2",
+                "order_parcel_confirmed_post2",
+                "order_delivered_to_client",
+                "order_completed",
+            ]
+        
+        # Fallback: полный путь
+        else:
+            logger.warning("_build_status_path: неизвестный сценарий pickup=%s, delivery=%s", 
+                        pickup_type, delivery_type)
+            return [
+                "order_created",
+                "order_courier1_assigned",
+                "order_courier_has_parcel",
+                "order_parcel_confirmed",
+                "order_parcel_submitted",
+                "order_picked_up_from_post1",
+                "order_in_transit_to_post2",
+                "order_arrived_at_post2",
+                "order_parcel_confirmed_post2",
+                "order_courier2_assigned",
+                "order_courier2_has_parcel",
+                "order_courier2_parcel_delivered",
+                "order_completed",
+            ]
 
     # ==================== Access Code ====================
     def get_stage_order(self, session: Session, order_id: int, leg: str):
