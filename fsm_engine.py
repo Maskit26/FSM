@@ -129,18 +129,62 @@ def _handle_open_cell(
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    """
-    Универсальный обработчик открытия ячейки.
-    Поддерживаемые роли: client, recipient, courier, operator, driver.
-    entity_type: "order" или "locker".
-    """
     user_role = instance["requested_user_role"]
     entity_type = instance["entity_type"]
     entity_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
-
+    metadata = instance.get("metadata", {})
+    
     logger.info(f"[FSM] open_cell: role={user_role}, entity={entity_type}:{entity_id}, user={user_id}")
 
+    # Проверка PIN
+    pin = metadata.get("pin")
+    if not pin:
+        return FsmStepResult(new_state="FAILED", last_error="MISSING_PIN_IN_METADATA")
+    
+    # ОПРЕДЕЛЕНИЕ leg И cell_id
+    if entity_type == "order":
+        leg = metadata.get("leg")
+        if not leg or leg not in ["pickup", "delivery"]:
+            return FsmStepResult(new_state="FAILED", last_error="INVALID_LEG_IN_METADATA")
+        
+        order = db.get_order(session, entity_id)
+        if not order:
+            return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
+        
+        cell_id = order["source_cell_id"] if leg == "pickup" else order["dest_cell_id"]
+        
+    elif entity_type == "locker":
+        cell_id = entity_id
+        
+        order_id = db.get_order_id_by_cell_id(session, cell_id)
+        if not order_id:
+            return FsmStepResult(new_state="FAILED", last_error="CELL_NOT_LINKED_TO_ORDER")
+        
+        order = db.get_order(session, order_id)
+        if not order:
+            return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
+        
+        # Определяем leg: source=pickup, dest=delivery
+        if cell_id == order["source_cell_id"]:
+            leg = "pickup"
+        elif cell_id == order["dest_cell_id"]:
+            leg = "delivery"
+        else:
+            return FsmStepResult(new_state="FAILED", last_error="CELL_NOT_IN_ORDER")
+    else:
+        return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
+    
+    # Валидация PIN
+    valid, error = db.validate_access_code(
+        session, order_id if entity_type == "locker" else entity_id,
+        leg, user_id, pin, cell_id
+    )
+    
+    if not valid:
+        return FsmStepResult(new_state="FAILED", last_error=f"INVALID_ACCESS_CODE: {error}")
+
+    # ОТКРЫТИЕ ЯЧЕЙКИ
     if entity_type == "order":
         if user_role == "client":
             success, error = ctx["client_actions"].open_cell_for_client(session, entity_id, user_id)
@@ -166,10 +210,9 @@ def _handle_open_cell(
     if not success:
         logger.error(f"[FSM] open_cell FAILED: entity={entity_type}:{entity_id}, error={error or 'OPEN_FAILED'}")
         return FsmStepResult(new_state="FAILED", last_error=error or "OPEN_FAILED")
-    
+
     logger.info(f"[FSM] open_cell COMPLETED: entity={entity_type}:{entity_id}")
     return FsmStepResult(new_state="COMPLETED")
-
 
 def _handle_close_cell(
     db: DatabaseLayer,
@@ -539,7 +582,7 @@ def _handle_report_error(
     Поддерживает: order, locker, trip
     """
     user_role = instance["requested_user_role"]
-    entity_type = instance["entity_type"]  # ← 'order', 'locker', или 'trip'
+    entity_type = instance["entity_type"] 
     entity_id = instance["entity_id"]
     metadata = instance.get("metadata", {})
     

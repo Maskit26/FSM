@@ -457,8 +457,8 @@ class DatabaseLayer:
         return self.call_fsm_action(session, "order", order_id, "order_pickup_poluchatel", recipient_id)
 
     def order_mark_delivered_parcel(self, session: Session, order_id: int, user_id: int) -> bool:
-    """Заказ отмечен как доставленный (FSM: order_delivered_parcel)."""
-    return self.call_fsm_action(session, "order", order_id, "order_delivered_parcel", user_id)
+        """Заказ отмечен как доставленный (FSM: order_delivered_parcel)."""
+        return self.call_fsm_action(session, "order", order_id, "order_delivered_parcel", user_id)
 
     def order_recipient_confirmed(
         self,
@@ -2945,6 +2945,115 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("validate_courier2_delivery_code завершился с ошибкой: %s", e)
             raise DbLayerError(f"validate_courier2_delivery_code failed: {e}") from e
+
+    def validate_access_code(
+        self,
+        session: Session,
+        order_id: int,
+        leg: str,
+        user_id: int,
+        pin: str,
+        cell_id: int
+    ) -> Tuple[bool, str]:
+        """
+        Проверка PIN-кода перед открытием ячейки.
+        
+        Проверки:
+        1. Токен существует для этого заказа и leg
+        2. Токен выдан этому пользователю (actor_user_id = user_id)
+        3. PIN совпадает (по хэшу SHA256(pin + order_id + cell_id))
+        4. Токен активен (status='ACTIVE')
+        5. Токен не истёк (expires_at > NOW())
+        
+        Returns:
+            Tuple[bool, str]: (успех, сообщение_об_ошибке)
+        """
+        logger.debug(
+            "validate_access_code вызван: order_id=%s, leg=%s, user_id=%s, cell_id=%s",
+            order_id, leg, user_id, cell_id
+        )
+        
+        try:
+            # 1. Находим токен для этого заказа
+            row = session.execute(
+                text("""
+                    SELECT id, pin_hash, status, expires_at, actor_user_id, cell_id
+                    FROM cell_access_tokens
+                    WHERE order_id = :order_id
+                    AND leg = :leg
+                    AND actor_user_id = :user_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """),
+                {
+                    "order_id": order_id,
+                    "leg": leg,
+                    "user_id": user_id,
+                }
+            ).fetchone()
+            
+            if not row:
+                logger.warning(
+                    "validate_access_code: токен не найден (order_id=%s, leg=%s, user_id=%s)",
+                    order_id, leg, user_id
+                )
+                return False, "ACCESS_CODE_NOT_FOUND"
+            
+            token_id, stored_pin_hash, token_status, expires_at, actor_user_id, token_cell_id = row
+            
+            # 2. Проверка статуса токена
+            if token_status != 'ACTIVE':
+                logger.warning(
+                    "validate_access_code: токен неактивен (status=%s, token_id=%s)",
+                    token_status, token_id
+                )
+                return False, f"ACCESS_CODE_NOT_ACTIVE ({token_status})"
+            
+            # 3. Проверка срока действия
+            if expires_at < datetime.utcnow():
+                logger.warning(
+                    "validate_access_code: токен истёк (expires_at=%s, token_id=%s)",
+                    expires_at, token_id
+                )
+                return False, "ACCESS_CODE_EXPIRED"
+            
+            # 4. Проверка ячейки (cell_id должен совпадать)
+            if token_cell_id != cell_id:
+                logger.warning(
+                    "validate_access_code: ячейка не совпадает (token_cell=%s, request_cell=%s)",
+                    token_cell_id, cell_id
+                )
+                return False, "ACCESS_CODE_WRONG_CELL"
+            
+            # 5. Проверка PIN через хэш ← ТОЛЬКО pin_hash
+            expected_hash = hashlib.sha256(f"{pin}{order_id}{cell_id}".encode()).hexdigest()
+            
+            if expected_hash != stored_pin_hash:
+                # Увеличиваем счётчик неудачных попыток
+                session.execute(
+                    text("""
+                        UPDATE cell_access_tokens
+                        SET failed_attempts = failed_attempts + 1
+                        WHERE id = :token_id
+                    """),
+                    {"token_id": token_id}
+                )
+                
+                logger.warning(
+                    "validate_access_code: PIN неверный (token_id=%s, attempts++)",
+                    token_id
+                )
+                return False, "ACCESS_CODE_INVALID"
+            
+            logger.info(
+                "validate_access_code: PIN верный (token_id=%s, order_id=%s)",
+                token_id, order_id
+            )
+            return True, ""
+            
+        except Exception as e:
+            logger.error("validate_access_code завершился с ошибкой: %s", e)
+            return False, f"VALIDATION_ERROR: {e}"
 
 
     # ==================== НОВЫЕ МЕТОДЫ: РАЗВИЛКИ FSM ====================
