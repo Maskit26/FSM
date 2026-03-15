@@ -3613,186 +3613,115 @@ class DatabaseLayer:
         trip_id: int
     ) -> Tuple[bool, str]:
         """
-        Привязывает заказ к рейсу.
-        Обновляет trip_id в уже существующих записях stage_orders (pickup/delivery).
+        Привязывает заказ к КОНКРЕТНОМУ рейсу (trip_id).
+        Используется при разделении рейса после погрузки.
         """
-        logger.debug("assign_order_to_trip вызван: order_id=%s, trip_id=%s", order_id, trip_id)
-        try:
-            # Проверка: заказ не должен быть в активном рейсе
-            count = session.execute(
-                text("""
-                    SELECT COUNT(*)
-                    FROM stage_orders so
-                    JOIN trips t ON t.id = so.trip_id
-                    WHERE so.order_id = :order_id
-                    AND t.status NOT IN ('trip_completed', 'trip_failed')
-                """),
-                {"order_id": order_id},
-            ).scalar()
-            if count and count > 0:
-                msg = "Заказ уже привязан к активному рейсу"
-                logger.warning("assign_order_to_trip: %s (order_id=%s)", msg, order_id)
-                return False, msg
+        # Обновляет stage_orders.trip_id
+        session.execute(text("""
+            UPDATE stage_orders
+            SET trip_id = :trip_id
+            WHERE order_id = :order_id
+            AND leg IN ('pickup', 'delivery')
+        """), {"trip_id": trip_id, "order_id": order_id})
 
-            # Проверка статуса рейса
-            trip_status = session.execute(
-                text("SELECT status FROM trips WHERE id = :trip_id"),
-                {"trip_id": trip_id},
-            ).scalar()
-            if not trip_status:
-                msg = f"Рейс {trip_id} не найден"
-                logger.warning("assign_order_to_trip: %s", msg)
-                return False, msg
-            if trip_status not in ("trip_created", "trip_assigned"):
-                msg = f"Нельзя привязать к рейсу в статусе '{trip_status}'"
-                logger.warning("assign_order_to_trip: %s", msg)
-                return False, msg
-
-            # Лимит 5 заказов на рейс
-            trip_count = session.execute(
-                text("SELECT COUNT(DISTINCT order_id) FROM stage_orders WHERE trip_id = :trip_id"),
-                {"trip_id": trip_id},
-            ).scalar()
-            logger.debug("assign_order_to_trip: текущее количество заказов в рейсе %s = %s", trip_id, trip_count)
-            if trip_count is not None and trip_count >= 5:
-                msg = "На рейсе уже 5 заказов"
-                logger.warning("assign_order_to_trip: %s (trip_id=%s)", msg, trip_id)
-                return False, msg
-
-            # ОБНОВЛЕНИЕ trip_id в существующих записях
-            result = session.execute(
-                text("""
-                    UPDATE stage_orders
-                    SET trip_id = :trip_id
-                    WHERE order_id = :order_id
-                    AND leg IN ('pickup', 'delivery')
-                """),
-                {"trip_id": trip_id, "order_id": order_id},
+    def get_or_create_direction(
+        self,
+        session: Session,
+        from_city: str,
+        to_city: str,
+        pickup_locker_id: int,
+        delivery_locker_id: int,
+    ) -> int:
+        """
+        Найти или создать направление по маршруту.
+        Возвращает direction_id.
+        """
+        # 1. Ищем существующее
+        existing = session.execute(text("""
+            SELECT id FROM directions
+            WHERE from_city = :from_city
+            AND to_city = :to_city
+            AND pickup_locker_id = :pickup_locker_id
+            AND delivery_locker_id = :delivery_locker_id
+        """), {
+            "from_city": from_city,
+            "to_city": to_city,
+            "pickup_locker_id": pickup_locker_id,
+            "delivery_locker_id": delivery_locker_id,
+        }).fetchone()
+        
+        if existing:
+            logger.debug(f"Направление найдено: direction_id={existing[0]}")
+            return existing[0]
+        
+        # 2. Создаём новое
+        session.execute(text("""
+            INSERT INTO directions (
+                from_city, to_city, pickup_locker_id, delivery_locker_id,
+                orders_total, orders_reserved, orders_available
+            ) VALUES (
+                :from_city, :to_city, :pickup_locker_id, :delivery_locker_id,
+                0, 0, 0
             )
+        """), {
+            "from_city": from_city,
+            "to_city": to_city,
+            "pickup_locker_id": pickup_locker_id,
+            "delivery_locker_id": delivery_locker_id,
+        })
+        
+        direction_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+        logger.info(f"Создано направление: direction_id={direction_id}")
+        
+        return direction_id
 
-            if result.rowcount != 2:
-                logger.warning("assign_order_to_trip: обновлено %d строк вместо 2 для order_id=%s", result.rowcount, order_id)
-
-            logger.info("Заказ %s успешно привязан к рейсу %s", order_id, trip_id)
-            return True, "Заказ привязан к рейсу"
-
-        except Exception as e:
-            logger.error(
-                "assign_order_to_trip завершился с ошибкой: order_id=%s, trip_id=%s, error=%s",
-                order_id, trip_id, e
-            )
-            raise DbLayerError(f"Ошибка привязки заказа {order_id} к рейсу {trip_id}: {e}") from e
-
-    def assign_order_to_trip_smart(
+    def assign_order_to_direction(
         self,
         session: Session,
         order_id: int,
-        pickup_locker_id: int,
-        delivery_locker_id: int,
         from_city: str,
         to_city: str,
+        pickup_locker_id: int,
+        delivery_locker_id: int,
     ) -> Tuple[int, bool, str]:
         """
-        Привязывает заказ к рейсу.
-        Ищет рейсы с <5 заказами, если нет — создаёт новый.
-        Если после привязки стало ровно 5 заказов — сразу активирует рейс.
+        Привязывает заказ к направлению.
         """
-        logger.debug("assign_order_to_trip_smart: order=%s, from=%s, to=%s", order_id, from_city, to_city)
-        try:
-            # 1. Ищем существующий рейс ПО ЛОКЕРАМ
-            existing_trip = session.execute(text("""
-                SELECT t.id
-                FROM trips t
-                LEFT JOIN (
-                    SELECT trip_id, COUNT(DISTINCT order_id) AS cnt
-                    FROM stage_orders
-                    GROUP BY trip_id
-                ) so ON so.trip_id = t.id
-                WHERE t.pickup_locker_id = :pickup_locker_id
-                AND t.delivery_locker_id = :delivery_locker_id
-                AND t.status IN ('trip_created', 'trip_assigned')
-                AND t.active = 0
-                AND (so.cnt IS NULL OR so.cnt < 5)
-                ORDER BY t.id ASC
-                LIMIT 1
-            """), {
-                "pickup_locker_id": pickup_locker_id,
-                "delivery_locker_id": delivery_locker_id,
-            }).fetchone()
-
-            if existing_trip:
-                trip_id = existing_trip[0]
-                logger.debug("Используем существующий рейс %s для заказа %s", trip_id, order_id)
-            else:
-                # 2. Создаём новый рейс
-                trip_id = self.create_trip(
-                    session,
-                    from_city=from_city,
-                    to_city=to_city,
-                    pickup_locker_id=pickup_locker_id,
-                    delivery_locker_id=delivery_locker_id,
-                    driver_user_id=None,
-                    active=0,
-                )
-                logger.debug("Создан новый рейс %s для заказа %s", trip_id, order_id)
-
-            # 3. Привязываем заказ
-            success, msg = self.assign_order_to_trip(session, order_id, trip_id)
-            if not success:
-                return 0, False, msg
-
-            # 4. 🔥 Проверяем: стало ли 5 заказов?
-            current_count = session.execute(text("""
-                SELECT COUNT(DISTINCT order_id)
-                FROM stage_orders
-                WHERE trip_id = :trip_id
-            """), {"trip_id": trip_id}).scalar()
-
-            if current_count == 5:
-                logger.info("Рейс %s набрал 5 заказов — активируем немедленно", trip_id)
-                session.execute(text("UPDATE trips SET active = 1 WHERE id = :trip_id"), {"trip_id": trip_id})
-
-            return trip_id, True, "Заказ привязан"
-        except Exception as e:
-            logger.error("assign_order_to_trip_smart failed for order %s: %s", order_id, e)
-            raise DbLayerError(f"assign_order_to_trip_smart failed: {e}") from e
-
-    def update_trip_active_flags(
-        self,
-        session: Session,
-        max_orders=5,        
-        wait_hours: float = 24.0
-    ) -> int:
-        """
-        Активация рейсов ТОЛЬКО по таймауту (24 часа).
-        Рейсы с 5+ заказами уже активированы в assign_order_to_trip_smart.
-        """
-        logger.debug("update_trip_active_flags (таймаут-режим): wait_hours=%s", wait_hours)
-        if wait_hours <= 0:
-            return 0
-
-        try:
-            threshold = datetime.now() - timedelta(hours=wait_hours)
-            rows = session.execute(text("""
-                SELECT t.id, t.created_at
-                FROM trips t
-                WHERE t.status = 'trip_created'
-                AND t.active = 0
-                AND t.created_at < :threshold
-            """), {"threshold": threshold}).fetchall()
-
-            updated = 0
-            for trip_id, _ in rows:
-                logger.info("Рейс %s активирован по таймауту (%s ч)", trip_id, wait_hours)
-                session.execute(text("UPDATE trips SET active = 1 WHERE id = :trip_id"), {"trip_id": trip_id})
-                updated += 1
-
-            if updated > 0:
-                logger.info("Активировано %s рейсов по таймауту", updated)
-            return updated
-        except Exception as e:
-            logger.error("update_trip_active_flags завершился с ошибкой: %s", e)
-            raise DbLayerError(f"Failed to update trip active flags: {e}") from e
+        # 1. Найти или создать направление
+        direction_id = self.get_or_create_direction(
+            session, from_city, to_city, pickup_locker_id, delivery_locker_id
+        )
+        
+        # 2. Привязать заказ к направлению (через stage_orders)
+        result = session.execute(text("""
+            UPDATE stage_orders
+            SET direction_id = :direction_id
+            WHERE order_id = :order_id
+            AND leg IN ('pickup', 'delivery')
+        """), {
+            "direction_id": direction_id,
+            "order_id": order_id,
+        })
+        
+        if result.rowcount != 2:
+            logger.warning(
+                f"assign_order_to_direction: обновлено {result.rowcount} "
+                f"строк вместо 2 для order_id={order_id}"
+            )
+        
+        # 3. Обновить счётчик в directions
+        session.execute(text("""
+            UPDATE directions
+            SET orders_total = orders_total + 1,
+                orders_available = orders_available + 1
+            WHERE id = :direction_id
+        """), {
+            "direction_id": direction_id,
+        })
+        
+        logger.info(f"Заказ {order_id} привязан к направлению {direction_id}")
+        
+        return direction_id, True, "Заказ привязан к направлению"    
 
     def get_orders_with_status_in_trip(
         self,

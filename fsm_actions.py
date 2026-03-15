@@ -1376,31 +1376,36 @@ class TripActions:
     def __init__(self, db: DatabaseLayer):
         self.db = db
 
-    def bind_order_to_trip(self, session: Session, order_id: int) -> Tuple[bool, str]:
-        try:
-            order = self.db.get_order(session, order_id)
-            if not order or order["status"] != "order_parcel_confirmed":
-                return False, "ORDER_NOT_CONFIRMED"
-
-            # Получаем locker_id
-            pickup_locker_id = self.db.get_locker_id_by_cell(session, order["source_cell_id"])
-            delivery_locker_id = self.db.get_locker_id_by_cell(session, order["dest_cell_id"])
-
-            # Получаем города
-            from_city = self.db.get_locker_city_by_cell(session, order["source_cell_id"])
-            to_city = self.db.get_locker_city_by_cell(session, order["dest_cell_id"])
-
-            # Передаём ВСЁ в assign_order_to_trip_smart
-            trip_id, success, msg = self.db.assign_order_to_trip_smart(
-                session,
-                order_id=order_id,
-                pickup_locker_id=pickup_locker_id,
-                delivery_locker_id=delivery_locker_id,
-                from_city=from_city,
-                to_city=to_city,
-            )
-            return success, msg
-
-        except Exception as e:
-            logger.exception("bind_order_to_trip failed for order %s: %s", order_id, e)
-            return False, str(e)
+    def bind_order_to_trip(
+        self,
+        session: Session,
+        order_id: int
+    ) -> Tuple[bool, str]:
+        """
+        Привязывает заказы к направлению.
+        """
+        order = self.db.get_order(session, order_id)
+        if not order or order["status"] != "order_parcel_confirmed":
+            return False, "ORDER_NOT_CONFIRMED"
+        
+        # Получаем данные маршрута
+        pickup_locker_id = self.db.get_locker_id_by_cell(session, order["source_cell_id"])
+        delivery_locker_id = self.db.get_locker_id_by_cell(session, order["dest_cell_id"])
+        from_city = self.db.get_locker_city_by_cell(session, order["source_cell_id"])
+        to_city = self.db.get_locker_city_by_cell(session, order["dest_cell_id"])
+        
+        # 🔥 Привязка к направлению
+        direction_id, success, msg = self.db.assign_order_to_direction(
+            session,
+            order_id=order_id,
+            from_city=from_city,
+            to_city=to_city,
+            pickup_locker_id=pickup_locker_id,
+            delivery_locker_id=delivery_locker_id,
+        )
+        
+        if not success:
+            return False, msg
+        
+        logger.info(f"bind_order_to_direction: order={order_id}, direction={direction_id}")
+        return True, "Заказ привязан к направлению"
