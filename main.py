@@ -613,15 +613,13 @@ async def get_driver_exchange_trips(
     db: DatabaseLayer = Depends(get_db)
 ):
     """
-    Возвращает рейсы, доступные для взятия водителем из указанного города.
+    Возвращает направления, доступные для взятия водителем из указанного города.
     Условия:
-    - trips.from_city = :city
-    - trips.status = 'trip_created'
-    - trips.active = 1
+    - directions.from_city = :city    
     """
     with get_db_session(read_only=True) as session:
-        trips = db.get_available_trips_for_driver_exchange(session, city)
-    return trips
+        directions = db.get_available_directions_for_driver_exchange(session, city)
+    return directions
 
 # ==================== Универсальное действие ====================
 

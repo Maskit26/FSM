@@ -3292,70 +3292,59 @@ class DatabaseLayer:
             "all": pickup + delivery  
         }
 
-    def get_available_trips_for_driver_exchange(
+    def get_available_directions_for_driver_exchange(
         self,
         session: Session,
         city: str
     ) -> List[Dict[str, Any]]:
         """
-        Возвращает рейсы, доступные для взятия водителем из указанного города.
+        Возвращает направления, доступные для взятия водителем из указанного города.        
         
-        Условия:
-        - trips.from_city = :city
-        - trips.status = 'trip_created'
-        - trips.active = 1
-        - trips.driver_user_id IS NULL (ещё не назначен водитель)
-        
-        Args:
-            session: активная сессия SQLAlchemy
-            city: город отправления
-        
-        Returns:
-            Список словарей с данными рейсов
-        
-        Raises:
-            DbLayerError: при ошибке выполнения запроса
         """
-        logger.debug("get_available_trips_for_driver_exchange вызван для города: %s", city)
+        logger.debug("get_available_directions_for_driver_exchange вызван для города: %s", city)
 
         query = text("""
             SELECT
-                t.id,
-                t.from_city,
-                t.to_city,
-                t.pickup_locker_id,
-                t.delivery_locker_id,
-                t.created_at
-            FROM trips t
+                d.id,
+                d.from_city,
+                d.to_city,
+                d.pickup_locker_id,
+                d.delivery_locker_id,
+                d.orders_total,
+                d.orders_available,
+                d.orders_reserved,
+                d.created_at
+            FROM directions d
             WHERE
-                t.from_city = :city
-                AND t.status = 'trip_created'
-                AND t.active = 1
-                AND t.driver_user_id IS NULL
-            ORDER BY t.created_at ASC;
+                d.from_city = :city
+                AND d.orders_available > 0
+            ORDER BY d.created_at ASC;
         """)
 
         try:
             result = session.execute(query, {"city": city}).fetchall()
 
-            trips = [
+            directions = [
                 {
                     "id": row[0],
                     "from_city": row[1],
                     "to_city": row[2],
                     "pickup_locker_id": row[3],
                     "delivery_locker_id": row[4],
-                    "created_at": row[5].isoformat() if row[5] else None,
+                    "orders_total": row[5],
+                    "orders_available": row[6],
+                    "orders_reserved": row[7],
+                    "created_at": row[8].isoformat() if row[8] else None,
                 }
                 for row in result
             ]
 
-            logger.debug("Найдено %d рейсов для города %s", len(trips), city)
-            return trips
+            logger.debug("Найдено %d направлений для города %s", len(directions), city)
+            return directions
 
-        except Exception as e:
-            logger.error("get_available_trips_for_driver_exchange завершился с ошибкой: %s", e)
-            raise DbLayerError(f"Ошибка получения рейсов для биржи: {e}") from e
+    except Exception as e:
+        logger.error("get_available_directions_for_driver_exchange завершился с ошибкой: %s", e)
+        raise DbLayerError(f"Ошибка получения направлений для биржи: {e}") from e
 
     # ==================== РЕЙСЫ ====================
 
