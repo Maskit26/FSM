@@ -1409,3 +1409,41 @@ class TripActions:
         
         logger.info(f"bind_order_to_direction: order={order_id}, direction={direction_id}")
         return True, "Заказ привязан к направлению"
+
+    def reserve_slot(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+        capacity: int,
+    ) -> Tuple[bool, str]:
+        """
+        Водитель резервирует слот в направлении.        
+        """
+        logger.info(
+            "[TripActions] reserve_slot: direction_id=%s, driver_user_id=%s, capacity=%s",
+            direction_id, driver_user_id, capacity
+        )
+        
+        if capacity <= 0:
+            logger.error("[TripActions] reserve_slot: invalid capacity=%s", capacity)
+            return False, "INVALID_CAPACITY"
+        
+        # 1. Резерв заказов
+        success, reserved_count, msg = self.db.reserve_orders_for_direction(
+            session, direction_id, driver_user_id, capacity
+        )
+        
+        if not success:
+            logger.error("[TripActions] reserve_slot FAILED: direction_id=%s, error=%s", direction_id, msg)
+            return False, msg
+        
+        # 2. FSM переход (direction_open → direction_slot_taken)
+        self.db.direction_reserve_slot(session, direction_id, driver_user_id)
+        
+        logger.info(
+            "[TripActions] reserve_slot COMPLETED: direction_id=%s, driver_user_id=%s, reserved=%s",
+            direction_id, driver_user_id, reserved_count
+        )
+        
+        return True, "Слот зарезервирован: %s заказов" % reserved_count

@@ -620,6 +620,60 @@ def _handle_report_error(
         
     return FsmStepResult(new_state="COMPLETED")
 
+# ==================== Направления ====================
+def _handle_direction_reserve_slot(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Обработчик резервирования слота водителем.
+    """
+    direction_id = instance["entity_id"]
+    driver_user_id = instance["requested_by_user_id"]
+    metadata = instance.get("metadata", {})
+    capacity = metadata.get("capacity", 0)
+    
+    logger.info(
+        "[FSM] direction_reserve_slot: direction_id=%s, driver_user_id=%s, capacity=%s",
+        direction_id, driver_user_id, capacity
+    )
+    
+    if capacity <= 0:
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="INVALID_CAPACITY",
+            attempts_increment=1
+        )
+    
+    actions: TripActions = ctx["trip_actions"]
+    
+    success, msg = actions.reserve_slot(
+        session, direction_id, driver_user_id, capacity
+    )
+    
+    if not success:
+        logger.error(
+            "[FSM] direction_reserve_slot FAILED: direction_id=%s, error=%s",
+            direction_id, msg
+        )
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=msg,
+            attempts_increment=1
+        )
+    
+    logger.info(
+        "[FSM] direction_reserve_slot COMPLETED: direction_id=%s",
+        direction_id
+    )
+    
+    return FsmStepResult(
+        new_state="COMPLETED",
+        last_error=None,
+        attempts_increment=1
+    )
 
 # ==================== PROCESS REGISTRY ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
@@ -639,6 +693,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "confirm_courier2_delivery": {"PENDING": _handle_confirm_courier2_delivery},
     "bind_order_to_trip": {"PENDING": _handle_bind_order_to_trip},
     "report_error": {"PENDING": _handle_report_error},
+    "direction_reserve_slot": {"PENDING": _handle_direction_reserve_slot},
 }
 
 

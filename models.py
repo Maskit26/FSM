@@ -95,3 +95,44 @@ class ApiResponse(BaseModel):
     success: bool
     message: str
     data: Optional[dict] = None
+
+# ========== DIRECTION MODELS ==========
+class DirectionResponse(BaseModel):
+    id: int
+    status: str
+    from_city: str
+    to_city: str
+    pickup_locker_id: int
+    delivery_locker_id: int
+    orders_total: int
+    orders_available: int
+    orders_reserved: int
+    created_at: Optional[str] = None
+
+class DirectionReserveRequest(BaseModel):
+    direction_id: int
+    driver_user_id: int
+    capacity: int
+
+class DirectionReserveResponse(BaseModel):
+    success: bool
+    reservation_id: Optional[int] = None
+    reserved_count: int
+    message: str
+
+class DriverReservationResponse(BaseModel):
+    id: int
+    direction_id: int
+    from_city: str
+    to_city: str
+    reserved_count: int
+    requested_count: int
+    reserved_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    status: str
+    reserved_order_ids: Optional[List[int]] = None
+
+class DirectionSlotActionRequest(BaseModel):
+    direction_id: int
+    driver_user_id: int
+    reservation_id: Optional[int] = None

@@ -202,6 +202,94 @@ class DatabaseLayer:
             user_id,
         )
 
+    def direction_reserve_slot(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+    ) -> bool:
+        """
+        Резервирование слота водителем (FSM: direction_reserve_slot).
+        Переход: direction_open → direction_slot_taken
+        """
+        logger.debug(
+            "direction_reserve_slot вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        return self.call_fsm_action(
+            session,
+            "direction",
+            direction_id,
+            "direction_reserve_slot",
+            driver_user_id,
+        )
+
+    def direction_start_loading(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+    ) -> bool:
+        """
+        Начало погрузки (FSM: direction_start_loading).
+        Переход: direction_slot_taken → direction_loading
+        """
+        logger.debug(
+            "direction_start_loading вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        return self.call_fsm_action(
+            session,
+            "direction",
+            direction_id,
+            "direction_start_loading",
+            driver_user_id,
+        )
+
+    def direction_complete_loading(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+    ) -> bool:
+        """
+        Завершение погрузки (FSM: direction_complete_loading).
+        Переход: direction_loading → direction_loading_finished
+        """
+        logger.debug(
+            "direction_complete_loading вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        return self.call_fsm_action(
+            session,
+            "direction",
+            direction_id,
+            "direction_complete_loading",
+            driver_user_id,
+        )
+
+    def direction_expire_slot(
+        self,
+        session: Session,
+        direction_id: int,
+        user_id: int,
+    ) -> bool:
+        """
+        Таймаут слота (FSM: direction_expire_slot).
+        Переход: direction_slot_taken → direction_open
+        """
+        logger.debug(
+            "direction_expire_slot вызван: direction_id=%s, user_id=%s",
+            direction_id, user_id
+        )
+        return self.call_fsm_action(
+            session,
+            "direction",
+            direction_id,
+            "direction_expire_slot",
+            user_id,
+        )
+
 
     # ---------- ORDER / ЗАКАЗЫ ----------
 
@@ -3345,6 +3433,134 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("get_available_directions_for_driver_exchange завершился с ошибкой: %s", e)
             raise DbLayerError(f"Ошибка получения направлений для биржи: {e}") from e
+
+    # ==================== Направления ====================
+    def reserve_orders_for_direction(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+        capacity: int,
+    ) -> Tuple[bool, int, str]:
+        """
+        Резервирует capacity заказов за водителем в направлении.        
+        """
+        logger.debug(
+            "reserve_orders_for_direction вызван: direction_id=%s, driver_user_id=%s, capacity=%s",
+            direction_id, driver_user_id, capacity
+        )
+        
+        try:
+            # 1. Проверяем лимит активных слотов у водителя на это направление (макс 3)
+            active_slots = session.execute(text("""
+                SELECT COUNT(*) 
+                FROM driver_reservations 
+                WHERE driver_user_id = :driver_user_id 
+                AND direction_id = :direction_id 
+                AND status IN ('active', 'loading')
+            """), {
+                "driver_user_id": driver_user_id,
+                "direction_id": direction_id,
+            }).scalar()
+            
+            if active_slots >= 3:
+                logger.warning(
+                    "reserve_orders_for_direction: лимит слотов превышен у водителя %s",
+                    driver_user_id
+                )
+                return False, 0, "LIMIT_EXCEEDED: Максимум 3 активных слота на направление"
+            
+            # 2. Проверяем сколько доступно заказов в направлении
+            available = session.execute(text("""
+                SELECT COUNT(DISTINCT so.order_id)
+                FROM stage_orders so
+                WHERE so.direction_id = :direction_id
+                AND so.leg = 'pickup'
+                AND so.reserved_by_driver_id IS NULL
+                AND so.trip_id IS NULL
+            """), {"direction_id": direction_id}).scalar()
+            
+            if available == 0:
+                logger.warning(
+                    "reserve_orders_for_direction: нет доступных заказов в направлении %s",
+                    direction_id
+                )
+                return False, 0, "NO_AVAILABLE_ORDERS"
+            
+            # 3. Атомарно резервируем заказы (первые по order_id)
+            # UPDATE сам блокирует строки — SELECT FOR UPDATE не нужен
+            result = session.execute(text("""
+                UPDATE stage_orders so
+                SET so.reserved_by_driver_id = :driver_user_id
+                WHERE so.direction_id = :direction_id
+                AND so.leg = 'pickup'
+                AND so.reserved_by_driver_id IS NULL
+                AND so.trip_id IS NULL
+                ORDER BY so.order_id ASC
+                LIMIT :capacity
+            """), {
+                "driver_user_id": driver_user_id,
+                "direction_id": direction_id,
+                "capacity": capacity,
+            })
+            
+            reserved_count = result.rowcount
+            
+            if reserved_count == 0:
+                logger.warning(
+                    "reserve_orders_for_direction: не удалось зарезервировать заказы direction_id=%s",
+                    direction_id
+                )
+                return False, 0, "RESERVATION_FAILED"
+            
+            if reserved_count < capacity:
+                logger.warning(
+                    "reserve_orders_for_direction: частичный резерв запрошено=%s, зарезервировано=%s",
+                    capacity, reserved_count
+                )
+            
+            # 4. Создаём запись в driver_reservations
+            expires_at = datetime.utcnow() + timedelta(minutes=30)
+            
+            session.execute(text("""
+                INSERT INTO driver_reservations (
+                    driver_user_id, direction_id, reserved_count,
+                    requested_count, expires_at, status
+                ) VALUES (
+                    :driver_user_id, :direction_id, :reserved_count,
+                    :requested_count, :expires_at, 'active'
+                )
+            """), {
+                "driver_user_id": driver_user_id,
+                "direction_id": direction_id,
+                "reserved_count": reserved_count,
+                "requested_count": capacity,
+                "expires_at": expires_at,
+            })
+            
+            reservation_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+            
+            # 5. Обновляем счётчики в directions
+            session.execute(text("""
+                UPDATE directions
+                SET orders_reserved = orders_reserved + :count,
+                    orders_available = orders_available - :count
+                WHERE id = :direction_id
+            """), {
+                "count": reserved_count,
+                "direction_id": direction_id,
+            })
+            
+            logger.info(
+                "reserve_orders_for_direction: direction_id=%s, driver_user_id=%s, reserved=%s, reservation_id=%s",
+                direction_id, driver_user_id, reserved_count, reservation_id
+            )
+            
+            return True, reserved_count, "Заказы зарезервированы"
+            
+        except Exception as e:
+            logger.exception("reserve_orders_for_direction завершился с ошибкой")
+            raise DbLayerError("reserve_orders_for_direction failed: %s" % e) from e
 
     # ==================== РЕЙСЫ ====================
 
