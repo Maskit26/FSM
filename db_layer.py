@@ -3342,9 +3342,9 @@ class DatabaseLayer:
             logger.debug("Найдено %d направлений для города %s", len(directions), city)
             return directions
 
-    except Exception as e:
-        logger.error("get_available_directions_for_driver_exchange завершился с ошибкой: %s", e)
-        raise DbLayerError(f"Ошибка получения направлений для биржи: {e}") from e
+        except Exception as e:
+            logger.error("get_available_directions_for_driver_exchange завершился с ошибкой: %s", e)
+            raise DbLayerError(f"Ошибка получения направлений для биржи: {e}") from e
 
     # ==================== РЕЙСЫ ====================
 
