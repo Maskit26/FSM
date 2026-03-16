@@ -3443,7 +3443,7 @@ class DatabaseLayer:
         capacity: int,
     ) -> Tuple[bool, int, str]:
         """
-        Резервирует capacity заказов за водителем в направлении.        
+        Резервирует capacity заказов за водителем в направлении.
         """
         logger.debug(
             "reserve_orders_for_direction вызван: direction_id=%s, driver_user_id=%s, capacity=%s",
@@ -3451,7 +3451,7 @@ class DatabaseLayer:
         )
         
         try:
-            # 1. Проверяем лимит активных слотов у водителя на это направление (макс 3)
+            # 1. Проверка лимита слотов
             active_slots = session.execute(text("""
                 SELECT COUNT(*) 
                 FROM driver_reservations 
@@ -3464,13 +3464,9 @@ class DatabaseLayer:
             }).scalar()
             
             if active_slots >= 3:
-                logger.warning(
-                    "reserve_orders_for_direction: лимит слотов превышен у водителя %s",
-                    driver_user_id
-                )
-                return False, 0, "LIMIT_EXCEEDED: Максимум 3 активных слота на направление"
+                return False, 0, "LIMIT_EXCEEDED"
             
-            # 2. Проверяем сколько доступно заказов в направлении
+            # 2. Проверка доступных заказов
             available = session.execute(text("""
                 SELECT COUNT(DISTINCT so.order_id)
                 FROM stage_orders so
@@ -3481,17 +3477,33 @@ class DatabaseLayer:
             """), {"direction_id": direction_id}).scalar()
             
             if available == 0:
-                logger.warning(
-                    "reserve_orders_for_direction: нет доступных заказов в направлении %s",
-                    direction_id
-                )
                 return False, 0, "NO_AVAILABLE_ORDERS"
             
-            # 3. Атомарно резервируем заказы (первые по order_id)
-            # UPDATE сам блокирует строки — SELECT FOR UPDATE не нужен
+            # 3. Сначала INSERT → получаем reservation_id
+            expires_at = datetime.utcnow() + timedelta(minutes=30)
+            
+            session.execute(text("""
+                INSERT INTO driver_reservations (
+                    driver_user_id, direction_id, reserved_count,
+                    requested_count, expires_at, status
+                ) VALUES (
+                    :driver_user_id, :direction_id, 0,
+                    :requested_count, :expires_at, 'active'
+                )
+            """), {
+                "driver_user_id": driver_user_id,
+                "direction_id": direction_id,
+                "requested_count": capacity,
+                "expires_at": expires_at,
+            })
+            
+            reservation_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+            
+            # 4. Атомарный UPDATE заказов
             result = session.execute(text("""
                 UPDATE stage_orders so
-                SET so.reserved_by_driver_id = :driver_user_id
+                SET so.reserved_by_driver_id = :driver_user_id,
+                    so.reservation_id = :reservation_id
                 WHERE so.direction_id = :direction_id
                 AND so.leg = 'pickup'
                 AND so.reserved_by_driver_id IS NULL
@@ -3500,6 +3512,7 @@ class DatabaseLayer:
                 LIMIT :capacity
             """), {
                 "driver_user_id": driver_user_id,
+                "reservation_id": reservation_id,
                 "direction_id": direction_id,
                 "capacity": capacity,
             })
@@ -3513,34 +3526,24 @@ class DatabaseLayer:
                 )
                 return False, 0, "RESERVATION_FAILED"
             
+            # 🔥 5. ЧАСТИЧНЫЙ РЕЗЕРВ (логирование)
             if reserved_count < capacity:
                 logger.warning(
                     "reserve_orders_for_direction: частичный резерв запрошено=%s, зарезервировано=%s",
                     capacity, reserved_count
                 )
             
-            # 4. Создаём запись в driver_reservations
-            expires_at = datetime.utcnow() + timedelta(minutes=30)
-            
+            # 6. Обновить driver_reservations.reserved_count
             session.execute(text("""
-                INSERT INTO driver_reservations (
-                    driver_user_id, direction_id, reserved_count,
-                    requested_count, expires_at, status
-                ) VALUES (
-                    :driver_user_id, :direction_id, :reserved_count,
-                    :requested_count, :expires_at, 'active'
-                )
+                UPDATE driver_reservations
+                SET reserved_count = :count
+                WHERE id = :reservation_id
             """), {
-                "driver_user_id": driver_user_id,
-                "direction_id": direction_id,
-                "reserved_count": reserved_count,
-                "requested_count": capacity,
-                "expires_at": expires_at,
+                "count": reserved_count,
+                "reservation_id": reservation_id,
             })
             
-            reservation_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
-            
-            # 5. Обновляем счётчики в directions
+            # 7. Обновить счётчики в directions
             session.execute(text("""
                 UPDATE directions
                 SET orders_reserved = orders_reserved + :count,
