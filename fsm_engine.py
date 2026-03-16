@@ -638,21 +638,18 @@ def _handle_direction_reserve_slot(
     logger.info(
         "[FSM] direction_reserve_slot: direction_id=%s, driver_user_id=%s, capacity=%s",
         direction_id, driver_user_id, capacity
-    )
-    
+    )    
     if capacity <= 0:
         return FsmStepResult(
             new_state="FAILED",
             last_error="INVALID_CAPACITY",
             attempts_increment=1
-        )
-    
+        )    
     actions: TripActions = ctx["trip_actions"]
     
     success, msg = actions.reserve_slot(
         session, direction_id, driver_user_id, capacity
-    )
-    
+    )    
     if not success:
         logger.error(
             "[FSM] direction_reserve_slot FAILED: direction_id=%s, error=%s",
@@ -662,10 +659,77 @@ def _handle_direction_reserve_slot(
             new_state="FAILED",
             last_error=msg,
             attempts_increment=1
+        )    
+    logger.info(
+        "[FSM] direction_reserve_slot COMPLETED: direction_id=%s",
+        direction_id
+    )    
+    return FsmStepResult(
+        new_state="COMPLETED",
+        last_error=None,
+        attempts_increment=1
+    )
+
+def _handle_direction_start_loading(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Обработчик начала погрузки водителем.
+    """
+    direction_id = instance["entity_id"]
+    driver_user_id = instance["requested_by_user_id"]
+    user_role = instance.get("requested_user_role", "")
+    metadata = instance.get("metadata", {})
+    reservation_id = metadata.get("reservation_id")
+    
+    logger.info(
+        "[FSM] direction_start_loading: direction_id=%s, driver_user_id=%s, role=%s, reservation_id=%s",
+        direction_id, driver_user_id, user_role, reservation_id
+    )
+    
+    # 1. Проверка роли (только водитель)
+    if user_role != "driver":
+        logger.error(
+            "[FSM] direction_start_loading: доступ запрещён для роли %s",
+            user_role
+        )
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="ROLE_NOT_ALLOWED: только водитель может начать погрузку",
+            attempts_increment=1
+        )
+    
+    # 2. Проверка reservation_id
+    if not reservation_id or reservation_id <= 0:
+        logger.error("[FSM] direction_start_loading: missing reservation_id in metadata")
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="MISSING_RESERVATION_ID",
+            attempts_increment=1
+        )
+    
+    actions: TripActions = ctx["trip_actions"]
+    
+    success, msg = actions.start_loading(
+        session, direction_id, driver_user_id, reservation_id
+    )
+    
+    if not success:
+        logger.error(
+            "[FSM] direction_start_loading FAILED: direction_id=%s, error=%s",
+            direction_id, msg
+        )
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=msg,
+            attempts_increment=1
         )
     
     logger.info(
-        "[FSM] direction_reserve_slot COMPLETED: direction_id=%s",
+        "[FSM] direction_start_loading COMPLETED: direction_id=%s",
         direction_id
     )
     
@@ -694,6 +758,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "bind_order_to_trip": {"PENDING": _handle_bind_order_to_trip},
     "report_error": {"PENDING": _handle_report_error},
     "direction_reserve_slot": {"PENDING": _handle_direction_reserve_slot},
+    "direction_start_loading": {"PENDING": _handle_direction_start_loading},
 }
 
 

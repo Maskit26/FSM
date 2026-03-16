@@ -1447,3 +1447,58 @@ class TripActions:
         )
         
         return True, "Слот зарезервирован: %s заказов" % reserved_count
+
+    def start_loading(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+        reservation_id: int,
+    ) -> Tuple[bool, str]:
+        """
+        Водитель начинает погрузку (нажал кнопку "Начать загрузку").
+        """
+        logger.info(
+            "[TripActions] start_loading: direction_id=%s, driver_user_id=%s, reservation_id=%s",
+            direction_id, driver_user_id, reservation_id
+        )
+        
+        try:
+            # 1. Получаем список заказов из резерва
+            orders = self.db.get_orders_by_reservation(session, reservation_id)
+            
+            if not orders:
+                logger.error("[TripActions] start_loading: нет заказов в резерве %s", reservation_id)
+                return False, "NO_ORDERS_IN_RESERVATION"
+            
+            logger.info(
+                "[TripActions] start_loading: reservation_id=%s, orders=%d",
+                reservation_id, len(orders)
+            )
+            
+            # 2. Обновляем статусы заказов через FSM (используем готовую обёртку!)
+            for order in orders:
+                order_id = order["order_id"]
+                self.db.order_mark_parcel_submitted(session, order_id, driver_user_id)
+            
+            logger.info(
+                "[TripActions] start_loading: updated %d orders to order_parcel_submitted",
+                len(orders)
+            )
+            
+            # 3. FSM переход направления (используем готовую обёртку!)
+            self.db.direction_start_loading(session, direction_id, driver_user_id)
+            
+            # 4. Обновляем статус резерва (прямой UPDATE, не FSM)
+            self.db.update_driver_reservation_status(session, reservation_id, "loading")
+            
+            logger.info(
+                "[TripActions] start_loading COMPLETED: direction_id=%s, driver_user_id=%s, orders=%d",
+                direction_id, driver_user_id, len(orders)
+            )
+            
+            return True, "Погрузка начата: %d заказов" % len(orders)
+            
+        except Exception as e:
+            logger.exception("[TripActions] start_loading failed")
+            return False, "START_LOADING_FAILED: %s" % e

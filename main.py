@@ -437,23 +437,18 @@ async def get_courier_orders_endpoint(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/api/trips/driver/{driver_id}", response_model=List[dict])
-async def get_driver_trips_endpoint(
+@app.get("/api/driver/{driver_id}/reservations", response_model=List[dict])
+async def get_driver_reservations_endpoint(
     driver_id: int,
     db: DatabaseLayer = Depends(get_db)
 ):
     """
-    Получить активные рейсы водителя с заказами внутри.
-    
-    Args:
-        driver_id: ID водителя
-    
-    Returns:
-        Список рейсов, внутри каждого — список заказов
+    Получить активные резервы (слоты) водителя.    
     """
     with get_db_session(read_only=True) as session:
         try:
-            return db.get_driver_trips_with_orders(session, driver_id)
+            reservations = db.get_driver_reservations(session, driver_id)
+            return reservations
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -483,16 +478,16 @@ async def get_user_fsm_errors(
             raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 # Для получения 6-тизначного пин кода. Для теста, удалить на продакшне
-@app.post("/api/access-code/view", response_model=Dict[str, Any])
+@app.get("/api/access-code/view", response_model=Dict[str, Any])
 async def view_access_code(
-    order_id: int,
-    leg: str,
-    user_id: int,
+    order_id: int = Query(...),
+    leg: str = Query(...),
+    user_id: int = Query(...),
     db: DatabaseLayer = Depends(get_db)
 ):
     """
-    Получить PIN-код для доступа к ячейке (кнопка 'Посмотреть код'). 
-    Для тетса. Удалить на продакшене
+    Получить PIN-код для доступа к ячейке (кнопка 'Посмотреть код').
+    Для теста. Удалить на продакшене
     """
     with get_db_session(read_only=True) as session:
         try:
@@ -531,7 +526,6 @@ async def view_access_code(
             
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.get("/api/orders/{order_id}", response_model=dict)
 async def get_order(order_id: int, db: DatabaseLayer = Depends(get_db)):
@@ -599,7 +593,7 @@ async def get_courier_exchange(
         return {
             "courier_id": courier_id,
             "city": user["city"],
-            "orders": all_orders,  # ← каждый заказ содержит "type": "pickup" или "delivery"
+            "orders": all_orders,
             "counts": {
                 "pickup": len(orders_data["pickup"]),
                 "delivery": len(orders_data["delivery"]),
@@ -661,7 +655,7 @@ async def enqueue_fsm(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(ge
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
-# ==================== TRIPS ENDPOINTS ====================
+# ==================== TRIPS / Направления ====================
 
 @app.post("/api/trips", response_model=ApiResponse)
 async def create_trip(request: TripCreateRequest, db: DatabaseLayer = Depends(get_db)):
@@ -672,8 +666,8 @@ async def create_trip(request: TripCreateRequest, db: DatabaseLayer = Depends(ge
                 session,
                 from_city=request.from_city,
                 to_city=request.to_city,
-                pickup_locker_id=request.pickup_locker_id,  # ← добавлено (предполагается, что есть в модели)
-                delivery_locker_id=request.delivery_locker_id,  # ← добавлено
+                pickup_locker_id=request.pickup_locker_id,  
+                delivery_locker_id=request.delivery_locker_id,  
                 driver_user_id=request.driver_user_id,
                 description=request.description,
                 active=request.active

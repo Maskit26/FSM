@@ -799,123 +799,61 @@ class DatabaseLayer:
             logger.error("get_courier_orders завершился с ошибкой для courier_id=%s: %s", courier_id, e)
             raise DbLayerError(f"get_courier_orders failed: {e}") from e
 
-    def get_driver_trips_with_orders(
-        self, 
-        session: Session, 
-        driver_id: int
+    def get_driver_reservations(
+        self,
+        session: Session,
+        driver_user_id: int,
     ) -> List[Dict[str, Any]]:
         """
-        Получить активные рейсы водителя со всеми заказами внутри.
-        
-        Источник истины:
-        - trips (driver_user_id, active, status)
-        - stage_orders (trip_id → order_id)
-        - orders (данные заказа)
-        
-        Args:
-            session: активная сессия SQLAlchemy
-            driver_id: ID водителя
-        
-        Returns:
-            Список словарей с данными рейсов и заказов внутри.
-            Водители видят trip_id — они работают с рейсами.
-            БЕЗ leg — чтобы избежать дублирования заказов.
-        
-        Raises:
-            DbLayerError: при ошибке выполнения запроса
+        Получить активные резервы (слоты) водителя.        
         """
-        logger.debug("get_driver_trips_with_orders вызван для driver_id=%s", driver_id)
-        
-        if driver_id <= 0:
-            raise DbLayerError("Invalid driver_id")
+        logger.debug("get_driver_reservations вызван для driver_user_id=%s", driver_user_id)
         
         try:
-            # Получаем активные рейсы водителя
-            trips_rows = session.execute(
+            reservations_rows = session.execute(
                 text("""
                     SELECT
-                        t.id,
-                        t.status,
-                        t.active,
-                        t.from_city,
-                        t.to_city,
-                        t.pickup_locker_id,
-                        t.delivery_locker_id,
-                        t.created_at
-                    FROM trips t
-                    WHERE t.driver_user_id = :driver_id
-                    AND t.active = 1
-                    AND t.status != 'trip_completed'
-                    ORDER BY t.created_at DESC
+                        dr.id,
+                        dr.direction_id,
+                        dr.reserved_count,
+                        dr.requested_count,
+                        dr.reserved_at,
+                        dr.expires_at,
+                        dr.status,
+                        d.from_city,
+                        d.to_city,
+                        d.pickup_locker_id,
+                        d.delivery_locker_id
+                    FROM driver_reservations dr
+                    JOIN directions d ON d.id = dr.direction_id
+                    WHERE dr.driver_user_id = :driver_user_id
+                    AND dr.status IN ('active', 'loading')
+                    ORDER BY dr.reserved_at DESC
                 """),
-                {"driver_id": driver_id},
+                {"driver_user_id": driver_user_id},
             ).fetchall()
             
-            trips: List[Dict[str, Any]] = []
-            
-            for trip_row in trips_rows:
-                trip_id = trip_row[0]
-                
-                # Получаем заказы этого рейса (БЕЗ leg, чтобы не дублировать)
-                orders_rows = session.execute(
-                    text("""
-                        SELECT
-                            o.id,
-                            o.status,
-                            o.description,
-                            o.parcel_type,
-                            o.pickup_type,
-                            o.delivery_type,
-                            o.source_cell_id,
-                            o.dest_cell_id,
-                            o.client_user_id,
-                            o.recipient_user_id,
-                            o.created_at,
-                            o.updated_at
-                        FROM orders o
-                        WHERE o.id IN (
-                            SELECT order_id FROM stage_orders WHERE trip_id = :trip_id
-                        )
-                        ORDER BY o.created_at ASC
-                    """),
-                    {"trip_id": trip_id},
-                ).fetchall()
-                
-                orders: List[Dict[str, Any]] = []
-                for order_row in orders_rows:
-                    orders.append({
-                        "id": order_row[0],
-                        "status": order_row[1],
-                        "description": order_row[2],
-                        "parcel_type": order_row[3],
-                        "pickup_type": order_row[4],
-                        "delivery_type": order_row[5],
-                        "source_cell_id": order_row[6],
-                        "dest_cell_id": order_row[7],
-                        "client_user_id": order_row[8],
-                        "recipient_user_id": order_row[9],
-                        "created_at": order_row[10].isoformat() if order_row[10] else None,
-                        "updated_at": order_row[11].isoformat() if order_row[11] else None,
-                    })
-                
-                trips.append({
-                    "id": trip_row[0],
-                    "status": trip_row[1],
-                    "active": trip_row[2],
-                    "from_city": trip_row[3],
-                    "to_city": trip_row[4],
-                    "pickup_locker_id": trip_row[5],
-                    "delivery_locker_id": trip_row[6],
-                    "created_at": trip_row[7].isoformat() if trip_row[7] else None,
-                    "orders": orders,
+            reservations = []
+            for res_row in reservations_rows:
+                reservations.append({
+                    "reservation_id": res_row[0],
+                    "direction_id": res_row[1],
+                    "reserved_count": res_row[2],
+                    "requested_count": res_row[3],
+                    "reserved_at": res_row[4].isoformat() if res_row[4] else None,
+                    "expires_at": res_row[5].isoformat() if res_row[5] else None,
+                    "status": res_row[6],
+                    "from_city": res_row[7],
+                    "to_city": res_row[8],
+                    "pickup_locker_id": res_row[9],
+                    "delivery_locker_id": res_row[10],                    
                 })
             
-            logger.debug("get_driver_trips_with_orders: найдено %d рейсов для driver_id=%s", len(trips), driver_id)
-            return trips
+            return reservations
             
         except Exception as e:
-            logger.error("get_driver_trips_with_orders завершился с ошибкой для driver_id=%s: %s", driver_id, e)
-            raise DbLayerError(f"get_driver_trips_with_orders failed: {e}") from e
+            logger.error("get_driver_reservations завершился с ошибкой: %s", e)
+            raise DbLayerError(f"get_driver_reservations failed: {e}") from e    
 
     def get_order_request(self, session: Session, request_id: int, max_retries: int = 3) -> Optional[Dict[str, Any]]:
         logger.debug("get_order_request вызван для request_id=%s", request_id)
@@ -3386,27 +3324,26 @@ class DatabaseLayer:
         city: str
     ) -> List[Dict[str, Any]]:
         """
-        Возвращает направления, доступные для взятия водителем из указанного города.        
-        
+        Возвращает направления, доступные для взятия водителем из указанного города.
         """
         logger.debug("get_available_directions_for_driver_exchange вызван для города: %s", city)
 
         query = text("""
             SELECT
                 d.id,
+                d.status,
                 d.from_city,
                 d.to_city,
                 d.pickup_locker_id,
                 d.delivery_locker_id,
                 d.orders_total,
                 d.orders_available,
-                d.orders_reserved,
-                d.created_at
+                d.orders_reserved
             FROM directions d
             WHERE
                 d.from_city = :city
                 AND d.orders_available > 0
-            ORDER BY d.created_at ASC;
+            ORDER BY d.id ASC
         """)
 
         try:
@@ -3415,14 +3352,15 @@ class DatabaseLayer:
             directions = [
                 {
                     "id": row[0],
-                    "from_city": row[1],
-                    "to_city": row[2],
-                    "pickup_locker_id": row[3],
-                    "delivery_locker_id": row[4],
-                    "orders_total": row[5],
-                    "orders_available": row[6],
-                    "orders_reserved": row[7],
-                    "created_at": row[8].isoformat() if row[8] else None,
+                    "status": row[1],
+                    "from_city": row[2],
+                    "to_city": row[3],
+                    "pickup_locker_id": row[4],
+                    "delivery_locker_id": row[5],
+                    "orders_total": row[6],
+                    "orders_available": row[7],
+                    "orders_reserved": row[8],
+                    # ❌ created_at удалён — нет такой колонки в directions
                 }
                 for row in result
             ]
@@ -3526,7 +3464,7 @@ class DatabaseLayer:
                 )
                 return False, 0, "RESERVATION_FAILED"
             
-            # 🔥 5. ЧАСТИЧНЫЙ РЕЗЕРВ (логирование)
+            # 5. ЧАСТИЧНЫЙ РЕЗЕРВ (логирование)
             if reserved_count < capacity:
                 logger.warning(
                     "reserve_orders_for_direction: частичный резерв запрошено=%s, зарезервировано=%s",
@@ -3564,6 +3502,96 @@ class DatabaseLayer:
         except Exception as e:
             logger.exception("reserve_orders_for_direction завершился с ошибкой")
             raise DbLayerError("reserve_orders_for_direction failed: %s" % e) from e
+
+    def get_orders_by_reservation(
+        self,
+        session: Session,
+        reservation_id: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить список заказов для конкретного резерва (слота).
+        Вызывается при нажатии "Начать загрузку" для отображения в блоке "Активный рейс".
+        """
+        logger.debug("get_orders_by_reservation вызван: reservation_id=%s", reservation_id)
+        
+        try:
+            rows = session.execute(text("""
+                SELECT DISTINCT
+                    so.order_id,
+                    o.status,
+                    o.description,
+                    o.parcel_type,
+                    o.pickup_type,
+                    o.delivery_type,
+                    o.source_cell_id,
+                    o.dest_cell_id,
+                    o.client_user_id,
+                    o.recipient_user_id,
+                    lc.cell_code as source_cell_code,
+                    l.city as from_city
+                FROM stage_orders so
+                JOIN orders o ON o.id = so.order_id
+                JOIN locker_cells lc ON lc.id = o.source_cell_id
+                JOIN lockers l ON l.id = lc.locker_id
+                WHERE so.reservation_id = :reservation_id
+                AND so.leg = 'pickup'
+                ORDER BY o.created_at ASC
+            """), {
+                "reservation_id": reservation_id,
+            }).fetchall()
+            
+            orders = [
+                {
+                    "order_id": row[0],
+                    "status": row[1],
+                    "description": row[2],
+                    "parcel_type": row[3],
+                    "pickup_type": row[4],
+                    "delivery_type": row[5],
+                    "source_cell_id": row[6],
+                    "dest_cell_id": row[7],
+                    "client_user_id": row[8],
+                    "recipient_user_id": row[9],
+                    "source_cell_code": row[10],
+                    "from_city": row[11],
+                }
+                for row in rows
+            ]
+            
+            logger.info("get_orders_by_reservation: reservation_id=%s, orders=%d", reservation_id, len(orders))
+            return orders
+            
+        except Exception as e:
+            logger.error("get_orders_by_reservation завершился с ошибкой: %s", e)
+            raise DbLayerError("get_orders_by_reservation failed: %s" % e) from e
+
+    def update_driver_reservation_status(
+        self,
+        session: Session,
+        reservation_id: int,
+        new_status: str,
+    ) -> None:
+        """
+        Обновить статус резерва водителя (active → loading → completed).
+        """
+        logger.debug("update_driver_reservation_status вызван: reservation_id=%s, status=%s", reservation_id, new_status)
+        
+        try:
+            session.execute(text("""
+                UPDATE driver_reservations
+                SET status = :status
+                WHERE id = :reservation_id
+            """), {
+                "status": new_status,
+                "reservation_id": reservation_id,
+            })
+            
+            logger.info("update_driver_reservation_status: reservation_id=%s → status=%s", reservation_id, new_status)
+            
+        except Exception as e:
+            logger.error("update_driver_reservation_status завершился с ошибкой: %s", e)
+            raise DbLayerError("update_driver_reservation_status failed: %s" % e) from e
+
 
     # ==================== РЕЙСЫ ====================
 

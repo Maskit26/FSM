@@ -107,7 +107,6 @@ class DirectionResponse(BaseModel):
     orders_total: int
     orders_available: int
     orders_reserved: int
-    created_at: Optional[str] = None
 
 class DirectionReserveRequest(BaseModel):
     direction_id: int
