@@ -1318,7 +1318,7 @@ class AccessCodeActions:
             # 3. Определить, кто авторизован
             authorized_user_id = None
             
-            # 🔥 ПОЛУЧИТЬ РОЛЬ ИЗ БАЗЫ
+            # ПОЛУЧИТЬ РОЛЬ ИЗ БАЗЫ
             user_role = self.db.get_user_role(session, user_id)
             
             if leg == "pickup":
@@ -1394,7 +1394,7 @@ class TripActions:
         from_city = self.db.get_locker_city_by_cell(session, order["source_cell_id"])
         to_city = self.db.get_locker_city_by_cell(session, order["dest_cell_id"])
         
-        # 🔥 Привязка к направлению
+        # Привязка к направлению
         direction_id, success, msg = self.db.assign_order_to_direction(
             session,
             order_id=order_id,
@@ -1438,7 +1438,7 @@ class TripActions:
             logger.error("[TripActions] reserve_slot FAILED: direction_id=%s, error=%s", direction_id, msg)
             return False, msg
         
-        # 2. FSM переход (direction_open → direction_slot_taken)
+        # 2. FSM переход (direction_open → direction_open)
         self.db.direction_reserve_slot(session, direction_id, driver_user_id)
         
         logger.info(
@@ -1461,13 +1461,11 @@ class TripActions:
             "[TripActions] start_loading: direction_id=%s, driver_user_id=%s",
             direction_id, driver_user_id
         )
-        
         try:
             # 1. Находим ВСЕ активные резервы водителя на направлении
             reservation_ids = self.db.get_driver_active_reservations(
                 session, direction_id, driver_user_id
             )
-            
             if not reservation_ids:
                 logger.error(
                     "[TripActions] start_loading: нет активных резервов у водителя %s на направлении %s",
@@ -1479,17 +1477,14 @@ class TripActions:
                 "[TripActions] start_loading: found %d reservations for driver %s",
                 len(reservation_ids), driver_user_id
             )
-            
             # 2. Получаем список заказов из ВСЕХ резервов (для отображения, НЕ для смены статуса)
             orders = self.db.get_orders_by_driver_and_direction(
                 session, direction_id, driver_user_id
             )
-            
             logger.info(
                 "[TripActions] start_loading: direction_id=%s, orders=%d",
                 direction_id, len(orders)
             )
-            
             # 3. FSM переход направления (direction_open → direction_loading)
             self.db.direction_start_loading(session, direction_id, driver_user_id)
             
@@ -1497,12 +1492,10 @@ class TripActions:
             self.db.update_driver_reservations_to_loading(
                 session, direction_id, driver_user_id
             )
-            
             logger.info(
                 "[TripActions] start_loading COMPLETED: direction_id=%s, driver_user_id=%s, orders=%d",
                 direction_id, driver_user_id, len(orders)
             )
-            
             return True, "Погрузка начата: %d заказов" % len(orders)
             
         except Exception as e:

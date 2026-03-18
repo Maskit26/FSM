@@ -682,14 +682,11 @@ def _handle_direction_start_loading(
     direction_id = instance["entity_id"]
     driver_user_id = instance["requested_by_user_id"]
     user_role = instance.get("requested_user_role", "")
-    metadata = instance.get("metadata", {})
-    reservation_id = metadata.get("reservation_id")
     
     logger.info(
-        "[FSM] direction_start_loading: direction_id=%s, driver_user_id=%s, role=%s, reservation_id=%s",
-        direction_id, driver_user_id, user_role, reservation_id
+        "[FSM] direction_start_loading: direction_id=%s, driver_user_id=%s, role=%s",
+        direction_id, driver_user_id, user_role
     )
-    
     # 1. Проверка роли (только водитель)
     if user_role != "driver":
         logger.error(
@@ -701,22 +698,12 @@ def _handle_direction_start_loading(
             last_error="ROLE_NOT_ALLOWED: только водитель может начать погрузку",
             attempts_increment=1
         )
-    
-    # 2. Проверка reservation_id
-    if not reservation_id or reservation_id <= 0:
-        logger.error("[FSM] direction_start_loading: missing reservation_id in metadata")
-        return FsmStepResult(
-            new_state="FAILED",
-            last_error="MISSING_RESERVATION_ID",
-            attempts_increment=1
-        )
-    
     actions: TripActions = ctx["trip_actions"]
     
+    # 2. Вызываем экшен (БЕЗ reservation_id — найдёт все резервы сам)
     success, msg = actions.start_loading(
-        session, direction_id, driver_user_id, reservation_id
+        session, direction_id, driver_user_id  # ← ← ← Без reservation_id
     )
-    
     if not success:
         logger.error(
             "[FSM] direction_start_loading FAILED: direction_id=%s, error=%s",
@@ -727,12 +714,10 @@ def _handle_direction_start_loading(
             last_error=msg,
             attempts_increment=1
         )
-    
     logger.info(
         "[FSM] direction_start_loading COMPLETED: direction_id=%s",
         direction_id
     )
-    
     return FsmStepResult(
         new_state="COMPLETED",
         last_error=None,
