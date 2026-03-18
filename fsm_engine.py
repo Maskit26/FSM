@@ -739,6 +739,65 @@ def _handle_direction_start_loading(
         attempts_increment=1
     )
 
+def _handle_direction_complete_loading(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Обработчик завершения погрузки водителем.
+    """
+    direction_id = instance["entity_id"]
+    driver_user_id = instance["requested_by_user_id"]
+    user_role = instance.get("requested_user_role", "")
+    
+    logger.info(
+        "[FSM] direction_complete_loading: direction_id=%s, driver_user_id=%s, role=%s",
+        direction_id, driver_user_id, user_role
+    )
+    
+    # 1. Проверка роли (только водитель)
+    if user_role != "driver":
+        logger.error(
+            "[FSM] direction_complete_loading: доступ запрещён для роли %s",
+            user_role
+        )
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="ROLE_NOT_ALLOWED: только водитель может завершить погрузку",
+            attempts_increment=1
+        )
+    
+    actions: TripActions = ctx["trip_actions"]
+    
+    # 2. Вызываем экшен (БЕЗ reservation_id — найдёт все резервы сам)
+    success, msg = actions.complete_loading(
+        session, direction_id, driver_user_id
+    )
+    
+    if not success:
+        logger.error(
+            "[FSM] direction_complete_loading FAILED: direction_id=%s, error=%s",
+            direction_id, msg
+        )
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=msg,
+            attempts_increment=1
+        )
+    
+    logger.info(
+        "[FSM] direction_complete_loading COMPLETED: direction_id=%s",
+        direction_id
+    )
+    
+    return FsmStepResult(
+        new_state="COMPLETED",
+        last_error=None,
+        attempts_increment=1
+    )
+
 # ==================== PROCESS REGISTRY ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "order_creation": {"PENDING": _handle_order_creation_pending},
@@ -759,6 +818,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "report_error": {"PENDING": _handle_report_error},
     "direction_reserve_slot": {"PENDING": _handle_direction_reserve_slot},
     "direction_start_loading": {"PENDING": _handle_direction_start_loading},
+    "direction_complete_loading": {"PENDING": _handle_direction_complete_loading},
 }
 
 

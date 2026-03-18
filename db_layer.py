@@ -3516,23 +3516,21 @@ class DatabaseLayer:
         
         try:
             rows = session.execute(text("""
-                SELECT DISTINCT
+                SELECT
                     so.order_id,
                     o.status,
                     o.description,
                     o.parcel_type,
-                    o.pickup_type,
-                    o.delivery_type,
                     o.source_cell_id,
                     o.dest_cell_id,
-                    o.client_user_id,
-                    o.recipient_user_id,
-                    lc.cell_code as source_cell_code,
-                    l.city as from_city
+                    l_src.city as from_city,
+                    l_dst.city as to_city
                 FROM stage_orders so
                 JOIN orders o ON o.id = so.order_id
-                JOIN locker_cells lc ON lc.id = o.source_cell_id
-                JOIN lockers l ON l.id = lc.locker_id
+                JOIN locker_cells lc_src ON lc_src.id = o.source_cell_id
+                JOIN lockers l_src ON l_src.id = lc_src.locker_id
+                JOIN locker_cells lc_dst ON lc_dst.id = o.dest_cell_id
+                JOIN lockers l_dst ON l_dst.id = lc_dst.locker_id
                 WHERE so.reservation_id = :reservation_id
                 AND so.leg = 'pickup'
                 ORDER BY o.created_at ASC
@@ -3546,14 +3544,10 @@ class DatabaseLayer:
                     "status": row[1],
                     "description": row[2],
                     "parcel_type": row[3],
-                    "pickup_type": row[4],
-                    "delivery_type": row[5],
-                    "source_cell_id": row[6],
-                    "dest_cell_id": row[7],
-                    "client_user_id": row[8],
-                    "recipient_user_id": row[9],
-                    "source_cell_code": row[10],
-                    "from_city": row[11],
+                    "source_cell_id": row[4],
+                    "dest_cell_id": row[5],
+                    "from_city": row[6],
+                    "to_city": row[7],
                 }
                 for row in rows
             ]
@@ -3591,6 +3585,401 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("update_driver_reservation_status завершился с ошибкой: %s", e)
             raise DbLayerError("update_driver_reservation_status failed: %s" % e) from e
+
+    def check_open_cells_for_driver_reservations(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+    ) -> Tuple[bool, List[int]]:
+        """
+        Проверить есть ли открытые ячейки у водителя в активных резервах направления.
+        """
+        logger.debug(
+            "check_open_cells_for_driver_reservations вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        
+        try:
+            # Находим все активные резервы водителя на направлении
+            reservation_ids = session.execute(text("""
+                SELECT id FROM driver_reservations
+                WHERE driver_user_id = :driver_user_id
+                AND direction_id = :direction_id
+                AND status IN ('active', 'loading')
+            """), {
+                "driver_user_id": driver_user_id,
+                "direction_id": direction_id,
+            }).fetchall()
+            
+            reservation_ids = [row[0] for row in reservation_ids]
+            
+            if not reservation_ids:
+                return False, []
+            
+            # Проверяем ячейки через fsm_action_logs - ищем открытые без закрытия
+            # Ячейка открыта если есть locker_open_locker но нет locker_close_pickup/locker_close_locker
+            open_cells = session.execute(text("""
+                SELECT DISTINCT lc.id
+                FROM fsm_action_logs fal_open
+                JOIN locker_cells lc ON lc.id = fal_open.entity_id
+                WHERE fal_open.entity_type = 'locker'
+                AND fal_open.action_name = 'locker_open_locker'
+                AND fal_open.user_id = :driver_user_id
+                AND lc.id NOT IN (
+                    SELECT fal_close.entity_id
+                    FROM fsm_action_logs fal_close
+                    WHERE fal_close.entity_type = 'locker'
+                    AND fal_close.action_name IN ('locker_close_pickup', 'locker_close_locker')
+                    AND fal_close.user_id = :driver_user_id
+                    AND fal_close.created_at > fal_open.created_at
+                )
+                AND lc.current_order_id IN (
+                    SELECT so.order_id
+                    FROM stage_orders so
+                    WHERE so.reservation_id IN :reservation_ids
+                    AND so.leg = 'pickup'
+                )
+            """), {
+                "driver_user_id": driver_user_id,
+                "reservation_ids": tuple(reservation_ids) if reservation_ids else (0,),
+            }).fetchall()
+            
+            open_cell_ids = [row[0] for row in open_cells]
+            has_open = len(open_cell_ids) > 0
+            
+            logger.info(
+                "check_open_cells_for_driver_reservations: direction_id=%s, driver_user_id=%s, open_cells=%d",
+                direction_id, driver_user_id, len(open_cell_ids)
+            )
+            
+            return has_open, open_cell_ids
+            
+        except Exception as e:
+            logger.error("check_open_cells_for_driver_reservations завершился с ошибкой: %s", e)
+            raise DbLayerError("check_open_cells_for_driver_reservations failed: %s" % e) from e
+
+    def get_driver_active_reservations(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+    ) -> List[int]:
+        """
+        Получить все активные резервы (слоты) водителя на направлении.
+        Возвращает список reservation_id.
+        """
+        logger.debug(
+            "get_driver_active_reservations вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        
+        try:
+            rows = session.execute(text("""
+                SELECT id
+                FROM driver_reservations
+                WHERE driver_user_id = :driver_user_id
+                AND direction_id = :direction_id
+                AND status IN ('active', 'loading')
+                ORDER BY reserved_at ASC
+            """), {
+                "driver_user_id": driver_user_id,
+                "direction_id": direction_id,
+            }).fetchall()
+            
+            reservation_ids = [row[0] for row in rows]
+            
+            logger.info(
+                "get_driver_active_reservations: direction_id=%s, driver_user_id=%s, reservations=%d",
+                direction_id, driver_user_id, len(reservation_ids)
+            )
+            
+            return reservation_ids
+            
+        except Exception as e:
+            logger.error("get_driver_active_reservations завершился с ошибкой: %s", e)
+            raise DbLayerError("get_driver_active_reservations failed: %s" % e) from e
+
+    def get_picked_orders_by_driver_and_direction(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+    ) -> List[int]:
+        """
+        Получить order_id которые водитель фактически забрал (открыл + закрыл ячейки)
+        из ВСЕХ его резервов на направлении.
+        Фильтр по fsm_action_logs: locker_close_pickup.
+        Исключает заказы с ошибкой.
+        """
+        logger.debug(
+            "get_picked_orders_by_driver_and_direction вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        
+        try:
+            # Статусы заказов с ошибкой (исключить) — ← ← ← СПИСОК, НЕ КОРТЕЖ!
+            excluded_statuses = [
+                'order_cancelled',
+                'order_manual_intervention_required',
+                'order_parcel_missing',
+                'order_delivery_failed',
+                'order_courier_failed',
+                'order_reservation_expired',
+            ]
+            
+            # Динамически создаём плейсхолдеры для IN
+            excluded_placeholders = ', '.join([f':excl_{i}' for i in range(len(excluded_statuses))])
+            excluded_params = {f'excl_{i}': status for i, status in enumerate(excluded_statuses)}
+            
+            # Основной запрос
+            query = text(f"""
+                SELECT DISTINCT lc.current_order_id
+                FROM fsm_action_logs fal
+                JOIN locker_cells lc ON lc.id = fal.entity_id
+                WHERE fal.entity_type = 'locker'
+                AND fal.action_name = 'locker_close_pickup'
+                AND fal.user_id = :driver_user_id
+                AND lc.current_order_id IN (
+                    SELECT so.order_id
+                    FROM stage_orders so
+                    WHERE so.direction_id = :direction_id
+                    AND so.leg = 'pickup'
+                    AND so.reserved_by_driver_id = :driver_user_id
+                )
+                AND lc.current_order_id NOT IN (
+                    SELECT o.id
+                    FROM orders o
+                    WHERE o.status IN ({excluded_placeholders})
+                )
+            """)
+            
+            # Объединяем параметры
+            params = {
+                "driver_user_id": driver_user_id,
+                "direction_id": direction_id,
+                **excluded_params,  # ← ← ← Распаковываем excluded_params
+            }
+            
+            result = session.execute(query, params).fetchall()
+            
+            picked_order_ids = [row[0] for row in result if row[0] is not None]
+            
+            logger.info(
+                "get_picked_orders_by_driver_and_direction: direction_id=%s, driver_user_id=%s, picked=%d",
+                direction_id, driver_user_id, len(picked_order_ids)
+            )
+            
+            return picked_order_ids
+            
+        except Exception as e:
+            logger.error("get_picked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
+            raise DbLayerError("get_picked_orders_by_driver_and_direction failed: %s" % e) from e
+
+    def release_unpicked_orders_by_driver_and_direction(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+        picked_order_ids: List[int],
+    ) -> int:
+        """
+        Освободить не забранные заказы из ВСЕХ резервов водителя (вернуть в пул направления).
+        Возвращает количество освобождённых заказов.
+        """
+        logger.debug(
+            "release_unpicked_orders_by_driver_and_direction вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        
+        try:
+            # Находим все зарезервированные заказы водителя на направлении
+            reserved = session.execute(text("""
+                SELECT DISTINCT so.order_id
+                FROM stage_orders so
+                WHERE so.direction_id = :direction_id
+                AND so.reserved_by_driver_id = :driver_user_id
+                AND so.leg = 'pickup'
+            """), {
+                "direction_id": direction_id,
+                "driver_user_id": driver_user_id,
+            }).fetchall()
+            
+            reserved_order_ids = [row[0] for row in reserved]
+            
+            # Находим разницу (не забранные)
+            unpicked = [oid for oid in reserved_order_ids if oid not in picked_order_ids]
+            
+            if not unpicked:
+                logger.info("release_unpicked_orders_by_driver_and_direction: все заказы забраны")
+                return 0
+            
+            # Динамически создаём плейсхолдеры для IN
+            unpicked_placeholders = ', '.join([f':unpicked_{i}' for i in range(len(unpicked))])
+            unpicked_params = {f'unpicked_{i}': oid for i, oid in enumerate(unpicked)}
+            
+            # Освобождаем не забранные
+            query = text(f"""
+                UPDATE stage_orders
+                SET reserved_by_driver_id = NULL,
+                    reservation_id = NULL
+                WHERE direction_id = :direction_id
+                AND reserved_by_driver_id = :driver_user_id
+                AND order_id IN ({unpicked_placeholders})
+            """)
+            
+            params = {
+                "direction_id": direction_id,
+                "driver_user_id": driver_user_id,
+                **unpicked_params,
+            }
+            
+            session.execute(query, params)
+            
+            # Обновляем счётчики в directions
+            session.execute(text("""
+                UPDATE directions
+                SET orders_reserved = orders_reserved - :count,
+                    orders_available = orders_available + :count
+                WHERE id = :direction_id
+            """), {
+                "count": len(unpicked),
+                "direction_id": direction_id,
+            })
+            
+            logger.info(
+                "release_unpicked_orders_by_driver_and_direction: direction_id=%s, released=%d заказов",
+                direction_id, len(unpicked)
+            )
+            
+            return len(unpicked)
+            
+        except Exception as e:
+            logger.error("release_unpicked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
+            raise DbLayerError("release_unpicked_orders_by_driver_and_direction failed: %s" % e) from e
+
+    def update_driver_reservations_to_completed(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+    ) -> int:
+        """
+        Обновить статус ВСЕХ резервов водителя на направлении: active/loading → completed.
+        Возвращает количество обновлённых резервов.
+        """
+        logger.debug(
+            "update_driver_reservations_to_completed вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        
+        try:
+            result = session.execute(text("""
+                UPDATE driver_reservations
+                SET status = 'completed'
+                WHERE driver_user_id = :driver_user_id
+                AND direction_id = :direction_id
+                AND status IN ('active', 'loading')
+            """), {
+                "driver_user_id": driver_user_id,
+                "direction_id": direction_id,
+            })
+            
+            updated_count = result.rowcount
+            
+            logger.info(
+                "update_driver_reservations_to_completed: direction_id=%s, driver_user_id=%s, updated=%d",
+                direction_id, driver_user_id, updated_count
+            )
+            
+            return updated_count
+            
+        except Exception as e:
+            logger.error("update_driver_reservations_to_completed завершился с ошибкой: %s", e)
+            raise DbLayerError("update_driver_reservations_to_completed failed: %s" % e) from e
+
+
+    def create_trip_for_loading(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+        picked_order_ids: List[int],
+    ) -> int:
+        """
+        Создать новый рейс (trip) для фактически забранных заказов.
+        Возвращает trip_id.
+        """
+        logger.debug(
+            "create_trip_for_loading вызван: direction_id=%s, driver_user_id=%s, orders=%d",
+            direction_id, driver_user_id, len(picked_order_ids)
+        )
+        
+        try:
+            direction = session.execute(text("""
+                SELECT from_city, to_city, pickup_locker_id, delivery_locker_id
+                FROM directions
+                WHERE id = :direction_id
+            """), {
+                "direction_id": direction_id,
+            }).fetchone()
+            
+            if not direction:
+                raise DbLayerError(f"Направление {direction_id} не найдено")
+            
+            from_city, to_city, pickup_locker_id, delivery_locker_id = direction
+            
+            session.execute(text("""
+                INSERT INTO trips (
+                    driver_user_id, from_city, to_city,
+                    pickup_locker_id, delivery_locker_id,
+                    status, active, created_at
+                ) VALUES (
+                    :driver_user_id, :from_city, :to_city,
+                    :pickup_locker_id, :delivery_locker_id,
+                    'trip_assigned', 1, NOW()
+                )
+            """), {
+                "driver_user_id": driver_user_id,
+                "from_city": from_city,
+                "to_city": to_city,
+                "pickup_locker_id": pickup_locker_id,
+                "delivery_locker_id": delivery_locker_id,
+            })
+            
+            trip_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+            
+            if picked_order_ids:
+                session.execute(text("""
+                    UPDATE stage_orders
+                    SET trip_id = :trip_id
+                    WHERE order_id IN :order_ids
+                    AND leg = 'pickup'
+                """), {
+                    "trip_id": trip_id,
+                    "order_ids": tuple(picked_order_ids),
+                })
+                
+                for order_id in picked_order_ids:
+                    session.execute(text("""
+                        INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id)
+                        VALUES (:trip_id, :order_id, 'delivery', NULL)
+                        ON DUPLICATE KEY UPDATE trip_id = :trip_id
+                    """), {
+                        "trip_id": trip_id,
+                        "order_id": order_id,
+                    })
+            
+            logger.info(
+                "create_trip_for_loading: direction_id=%s, trip_id=%s, orders=%d",
+                direction_id, trip_id, len(picked_order_ids)
+            )
+            
+            return trip_id
+            
+        except Exception as e:
+            logger.error("create_trip_for_loading завершился с ошибкой: %s", e)
+            raise DbLayerError("create_trip_for_loading failed: %s" % e) from e
 
 
     # ==================== РЕЙСЫ ====================

@@ -1453,44 +1453,50 @@ class TripActions:
         session: Session,
         direction_id: int,
         driver_user_id: int,
-        reservation_id: int,
     ) -> Tuple[bool, str]:
         """
-        Водитель начинает погрузку (нажал кнопку "Начать загрузку").
+        Водитель начинает погрузку по направлению (нажал кнопку "Начать загрузку").
         """
         logger.info(
-            "[TripActions] start_loading: direction_id=%s, driver_user_id=%s, reservation_id=%s",
-            direction_id, driver_user_id, reservation_id
+            "[TripActions] start_loading: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
         )
         
         try:
-            # 1. Получаем список заказов из резерва
-            orders = self.db.get_orders_by_reservation(session, reservation_id)
-            
-            if not orders:
-                logger.error("[TripActions] start_loading: нет заказов в резерве %s", reservation_id)
-                return False, "NO_ORDERS_IN_RESERVATION"
-            
-            logger.info(
-                "[TripActions] start_loading: reservation_id=%s, orders=%d",
-                reservation_id, len(orders)
+            # 1. Находим ВСЕ активные резервы водителя на направлении
+            reservation_ids = self.db.get_driver_active_reservations(
+                session, direction_id, driver_user_id
             )
             
-            # 2. Обновляем статусы заказов через FSM (используем готовую обёртку!)
-            for order in orders:
-                order_id = order["order_id"]
-                self.db.order_mark_parcel_submitted(session, order_id, driver_user_id)
+            if not reservation_ids:
+                logger.error(
+                    "[TripActions] start_loading: нет активных резервов у водителя %s на направлении %s",
+                    driver_user_id, direction_id
+                )
+                return False, "NO_ACTIVE_RESERVATIONS"
             
             logger.info(
-                "[TripActions] start_loading: updated %d orders to order_parcel_submitted",
-                len(orders)
+                "[TripActions] start_loading: found %d reservations for driver %s",
+                len(reservation_ids), driver_user_id
             )
             
-            # 3. FSM переход направления (используем готовую обёртку!)
+            # 2. Получаем список заказов из ВСЕХ резервов (для отображения, НЕ для смены статуса)
+            orders = self.db.get_orders_by_driver_and_direction(
+                session, direction_id, driver_user_id
+            )
+            
+            logger.info(
+                "[TripActions] start_loading: direction_id=%s, orders=%d",
+                direction_id, len(orders)
+            )
+            
+            # 3. FSM переход направления (direction_open → direction_loading)
             self.db.direction_start_loading(session, direction_id, driver_user_id)
             
-            # 4. Обновляем статус резерва (прямой UPDATE, не FSM)
-            self.db.update_driver_reservation_status(session, reservation_id, "loading")
+            # 4. Обновляем ВСЕ резервы водителя: active → loading
+            self.db.update_driver_reservations_to_loading(
+                session, direction_id, driver_user_id
+            )
             
             logger.info(
                 "[TripActions] start_loading COMPLETED: direction_id=%s, driver_user_id=%s, orders=%d",
@@ -1502,3 +1508,100 @@ class TripActions:
         except Exception as e:
             logger.exception("[TripActions] start_loading failed")
             return False, "START_LOADING_FAILED: %s" % e
+
+    def complete_loading(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+    ) -> Tuple[bool, str]:
+        """
+        Водитель завершает погрузку по направлению.
+        
+        1. Проверяет что нет открытых ячеек
+        2. Находит ВСЕ активные резервы водителя на направлении
+        3. Определяет фактически забранные заказы (по fsm_action_logs)
+        4. Проверяет что есть хотя бы 1 забранный заказ
+        5. Создаёт ОДИН рейс (trip) для ВСЕХ забранных заказов
+        6. Освобождает не забранные заказы (возврат в пул направления)
+        7. Обновляет ВСЕ резервы: active/loading → completed
+        8. Делает FSM переход направления: direction_loading → direction_loading_finished
+        """
+        logger.info(
+            "[TripActions] complete_loading: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
+        try:
+            # 1. ПРОВЕРКА ОТКРЫТЫХ ЯЧЕЕК
+            has_open_cells, open_cell_ids = self.db.check_open_cells_for_driver_reservations(
+                session, direction_id, driver_user_id
+            )
+            if has_open_cells:
+                logger.error(
+                    "[TripActions] complete_loading: обнаружены открытые ячейки: %s",
+                    open_cell_ids
+                )
+                return False, f"OPEN_CELLS_DETECTED: Ячейки {open_cell_ids} не закрыты"
+            
+            # 2. Находим ВСЕ активные резервы водителя на направлении
+            reservation_ids = self.db.get_driver_active_reservations(
+                session, direction_id, driver_user_id
+            )
+            if not reservation_ids:
+                logger.error(
+                    "[TripActions] complete_loading: нет активных резервов у водителя %s на направлении %s",
+                    driver_user_id, direction_id
+                )
+                return False, "NO_ACTIVE_RESERVATIONS"
+            
+            logger.info(
+                "[TripActions] complete_loading: found %d reservations for driver %s",
+                len(reservation_ids), driver_user_id
+            )
+            # 3. Определяем фактически забранные заказы (из ВСЕХ резервов)
+            picked_order_ids = self.db.get_picked_orders_by_driver_and_direction(
+                session, direction_id, driver_user_id
+            )
+            logger.info(
+                "[TripActions] complete_loading: picked_orders=%d",
+                len(picked_order_ids)
+            )
+            # 4. ПРОВЕРКА: РЕЙС НЕ МОЖЕТ БЫТЬ СОЗДАН С 0 ЗАКАЗОВ
+            if not picked_order_ids or len(picked_order_ids) == 0:
+                logger.error(
+                    "[TripActions] complete_loading: водитель не забрал ни одного заказа"
+                )
+                return False, "NO_ORDERS_PICKED: Невозможно создать рейс с 0 заказов"
+            
+            # 5. Создаём ОДИН рейс для ВСЕХ забранных заказов
+            trip_id = self.db.create_trip_for_loading(
+                session, direction_id, driver_user_id, picked_order_ids
+            )
+            logger.info(
+                "[TripActions] complete_loading: created trip_id=%s for %d orders",
+                trip_id, len(picked_order_ids)
+            )
+            # 6. Освобождаем не забранные заказы (возврат в пул)
+            released_count = self.db.release_unpicked_orders_by_driver_and_direction(
+                session, direction_id, driver_user_id, picked_order_ids
+            )
+            logger.info(
+                "[TripActions] complete_loading: released %d unpicked orders",
+                released_count
+            )
+            # 7. Обновляем ВСЕ резервы водителя: active/loading → completed
+            self.db.update_driver_reservations_to_completed(
+                session, direction_id, driver_user_id
+            )
+            # 8. FSM переход направления (direction_loading → direction_loading_finished)
+            self.db.direction_complete_loading(session, direction_id, driver_user_id)
+            
+            logger.info(
+                "[TripActions] complete_loading COMPLETED: direction_id=%s, driver_user_id=%s, trip_id=%s, picked=%d, released=%d",
+                direction_id, driver_user_id, trip_id, len(picked_order_ids), released_count
+            )
+            return True, "Погрузка завершена: %d заказов в рейс %s" % (len(picked_order_ids), trip_id)
+            
+        except Exception as e:
+            logger.exception("[TripActions] complete_loading failed")
+            return False, "COMPLETE_LOADING_FAILED: %s" % e
