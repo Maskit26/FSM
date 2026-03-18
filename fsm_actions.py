@@ -568,8 +568,12 @@ class DriverActions:
         user_id: int
     ) -> Tuple[bool, str]:
         """
-        Водитель открывает ячейку.
-                
+        Водитель открывает ячейку для погрузки (до создания рейса).
+        
+        Проверка:
+        1. Ячейка привязана к заказу
+        2. Заказ зарезервирован за этим водителем (stage_orders.reserved_by_driver_id)
+        3. У водителя есть активный резерв на это направление (driver_reservations)
         """
         logger.info("[DRIVER] open_cell cell=%s user=%s", cell_id, user_id)
 
@@ -579,18 +583,12 @@ class DriverActions:
             if not order_id:
                 raise DbLayerError(f"Ячейка {cell_id} не привязана ни к одному заказу")
 
-            # 2. Получаем trip_id из stage_orders
-            trip_id = self.db.get_trip_id_by_order_id(session, order_id)
-            if not trip_id:
-                raise DbLayerError(f"Заказ {order_id} не привязан к рейсу")
-
-            # 3. Проверяем, что водитель назначен на этот рейс
-            trip = self.db.get_trip(session, trip_id)
-            if not trip or trip["driver_user_id"] != user_id:
-                raise DbLayerError(f"Водитель {user_id} не назначен на рейс {trip_id}")
-
-            # 4. Определяем intent: pickup или delivery
+            # 2. Получаем заказ и определяем направление
             order = self.db.get_order(session, order_id)
+            if not order:
+                raise DbLayerError(f"Заказ {order_id} не найден")
+
+            # 3. Определяем intent: pickup или delivery
             if cell_id == order["source_cell_id"]:
                 intent = "pickup"
             elif cell_id == order["dest_cell_id"]:
@@ -598,11 +596,34 @@ class DriverActions:
             else:
                 raise DbLayerError(f"Ячейка {cell_id} не совпадает ни с source, ни с dest для заказа {order_id}")
 
-            # 5. Открываем ячейку
+            # 4. Получаем direction_id из stage_orders
+            stage = self.db.get_stage_order(session, order_id, intent)
+            if not stage or not stage.get("direction_id"):
+                raise DbLayerError(f"Заказ {order_id} не привязан к направлению (leg={intent})")
+            
+            direction_id = stage["direction_id"]
+
+            # 5. ПРОВЕРКА: заказ зарезервирован за этим водителем
+            if stage.get("reserved_by_driver_id") != user_id:
+                raise DbLayerError(
+                    f"Заказ {order_id} не зарезервирован за водителем {user_id} "
+                    f"(reserved_by_driver_id={stage.get('reserved_by_driver_id')})"
+                )
+
+            # 6. ПРОВЕРКА: у водителя есть активный резерв на это направление
+            reservations = self.db.get_driver_active_reservations(
+                session, direction_id, user_id
+            )
+            if not reservations:
+                raise DbLayerError(
+                    f"У водителя {user_id} нет активных резервов на направлении {direction_id}"
+                )
+
+            # 7. Открываем ячейку (Locker FSM)
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
             logger.debug("[DRIVER] cell %s opened (Locker FSM)", cell_id)
 
-            # 6. Order FSM
+            # 8. Order FSM — меняем статус заказа
             if intent == "pickup":
                 logger.info("[DRIVER] processing pickup for order %s", order_id)                
                 self.db.order_mark_parcel_submitted(session, order_id, user_id)
@@ -624,30 +645,29 @@ class DriverActions:
         user_id: int
     ) -> Tuple[bool, str]:
         """
-        Водитель закрывает ячейку. Логика основана на связке Cell -> Order -> Trip.
+        Водитель закрывает ячейку после погрузки (до создания рейса).
+        
+        Проверка:
+        1. Ячейка привязана к заказу
+        2. Заказ зарезервирован за этим водителем
+        3. У водителя есть активный резерв на это направление
         """
         logger.info("[DRIVER] close_cell cell=%s user=%s", cell_id, user_id)
 
         try:
-            # 1. Находим заказ по ячейке
+            # 1. Получаем order_id по cell_id
             order_id = self.db.get_order_id_by_cell_id(session, cell_id)
             if not order_id:
                 logger.warning("[DRIVER] cell %s not linked to any order, just closing", cell_id)
                 self.db.close_locker(session, cell_id, user_id)
                 return True, ""
 
-            # 2. Находим рейс через заказ
-            trip_id = self.db.get_trip_id_by_order_id(session, order_id)
-            if not trip_id:
-                raise DbLayerError(f"Заказ {order_id} не привязан к рейсу")
-
-            # 3. Проверяем водителя и получаем данные рейса
-            trip = self.db.get_trip(session, trip_id)
-            if not trip or trip["driver_user_id"] != user_id:
-                raise DbLayerError(f"Водитель {user_id} не назначен на рейс {trip_id} для ячейки {cell_id}")
-
-            # 4. Получаем данные заказа для определения intent (pickup/delivery)
+            # 2. Получаем заказ
             order = self.db.get_order(session, order_id)
+            if not order:
+                raise DbLayerError(f"Заказ {order_id} не найден")
+
+            # 3. Определяем intent
             if cell_id == order["source_cell_id"]:
                 intent = "pickup"
             elif cell_id == order["dest_cell_id"]:
@@ -655,13 +675,33 @@ class DriverActions:
             else:
                 intent = "unknown"
 
-            logger.debug("[DRIVER] closing cell %s with intent %s for trip %s", cell_id, intent, trip_id)
+            # 4. Получаем direction_id и проверяем резерв
+            stage = self.db.get_stage_order(session, order_id, intent)
+            if stage:
+                direction_id = stage.get("direction_id")
+                
+                # Проверка что заказ зарезервирован за водителем
+                if stage.get("reserved_by_driver_id") != user_id:
+                    raise DbLayerError(
+                        f"Заказ {order_id} не зарезервирован за водителем {user_id}"
+                    )
+                
+                # Проверка что есть активный резерв
+                if direction_id:
+                    reservations = self.db.get_driver_active_reservations(
+                        session, direction_id, user_id
+                    )
+                    if not reservations:
+                        raise DbLayerError(
+                            f"У водителя {user_id} нет активных резервов на направлении {direction_id}"
+                        )
 
-            # 5. Обрабатываем бизнес-логику в зависимости от намерения
+            # 5. Обрабатываем в зависимости от intent
             if intent == "pickup":
                 logger.info("[DRIVER] Finishing PICKUP: cell %s will be EMPTY", cell_id)                
                 self.db.close_locker_pickup(session, cell_id, user_id)                
-                self.db.order_pickup_by_driver(session, order_id, user_id)                
+                # ❌ НЕ меняем статус заказа здесь — он уже изменился при open_cell
+                # self.db.order_pickup_by_driver() вызывается в complete_loading()
 
             elif intent == "delivery":
                 logger.info("[DRIVER] Finishing DELIVERY: cell %s will be OCCUPIED", cell_id)                
