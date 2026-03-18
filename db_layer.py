@@ -202,94 +202,68 @@ class DatabaseLayer:
             user_id,
         )
 
-    def direction_reserve_slot(
+    def driver_reservation_start_loading(
         self,
         session: Session,
-        direction_id: int,
+        reservation_id: int,
         driver_user_id: int,
     ) -> bool:
         """
-        Резервирование слота водителем (FSM: direction_reserve_slot).
-        Переход: direction_open → direction_slot_taken
+        Начать погрузку (FSM: reservation_active → reservation_loading).
         """
         logger.debug(
-            "direction_reserve_slot вызван: direction_id=%s, driver_user_id=%s",
-            direction_id, driver_user_id
+            "driver_reservation_start_loading вызван: reservation_id=%s, driver_user_id=%s",
+            reservation_id, driver_user_id
         )
         return self.call_fsm_action(
             session,
-            "direction",
-            direction_id,
-            "direction_reserve_slot",
+            "driver_reservations",
+            reservation_id,
+            "driver_reservation_start_loading",
             driver_user_id,
         )
 
-    def direction_start_loading(
+    def driver_reservation_complete_loading(
         self,
         session: Session,
-        direction_id: int,
+        reservation_id: int,
         driver_user_id: int,
     ) -> bool:
         """
-        Начало погрузки (FSM: direction_start_loading).
-        Переход: direction_slot_taken → direction_loading
+        Завершить погрузку (FSM: reservation_loading → reservation_completed).
         """
         logger.debug(
-            "direction_start_loading вызван: direction_id=%s, driver_user_id=%s",
-            direction_id, driver_user_id
+            "driver_reservation_complete_loading вызван: reservation_id=%s, driver_user_id=%s",
+            reservation_id, driver_user_id
         )
         return self.call_fsm_action(
             session,
-            "direction",
-            direction_id,
-            "direction_start_loading",
+            "driver_reservations",
+            reservation_id,
+            "driver_reservation_complete_loading",
             driver_user_id,
         )
 
-    def direction_complete_loading(
+    def driver_reservation_expire(
         self,
         session: Session,
-        direction_id: int,
-        driver_user_id: int,
-    ) -> bool:
-        """
-        Завершение погрузки (FSM: direction_complete_loading).
-        Переход: direction_loading → direction_loading_finished
-        """
-        logger.debug(
-            "direction_complete_loading вызван: direction_id=%s, driver_user_id=%s",
-            direction_id, driver_user_id
-        )
-        return self.call_fsm_action(
-            session,
-            "direction",
-            direction_id,
-            "direction_complete_loading",
-            driver_user_id,
-        )
-
-    def direction_expire_slot(
-        self,
-        session: Session,
-        direction_id: int,
+        reservation_id: int,
         user_id: int,
     ) -> bool:
         """
-        Таймаут слота (FSM: direction_expire_slot).
-        Переход: direction_slot_taken → direction_open
+        Таймаут резерва (FSM: reservation_active/loading → reservation_expired).
         """
         logger.debug(
-            "direction_expire_slot вызван: direction_id=%s, user_id=%s",
-            direction_id, user_id
+            "driver_reservation_expire вызван: reservation_id=%s, user_id=%s",
+            reservation_id, user_id
         )
         return self.call_fsm_action(
             session,
-            "direction",
-            direction_id,
-            "direction_expire_slot",
+            "driver_reservations",
+            reservation_id,
+            "driver_reservation_expire",
             user_id,
         )
-
 
     # ---------- ORDER / ЗАКАЗЫ ----------
 
@@ -2703,12 +2677,45 @@ class DatabaseLayer:
             ]
 
     # ==================== Access Code ====================
-    def get_stage_order(self, session: Session, order_id: int, leg: str):
-        row = session.execute(
-            text("SELECT courier_user_id FROM stage_orders WHERE order_id = :oid AND leg = :leg"),
-            {"oid": order_id, "leg": leg}
-        ).fetchone()
-        return row if row else None
+    def get_stage_order(self, session: Session, order_id: int, leg: str) -> Optional[Dict[str, Any]]:
+        """
+        Получить запись stage_orders для заказа и плеча.
+        Возвращает dict или None.
+        """
+        logger.debug("get_stage_order вызван: order_id=%s, leg=%s", order_id, leg)
+        
+        try:
+            row = session.execute(
+                text("""
+                    SELECT trip_id, direction_id, order_id, leg, courier_user_id,
+                        reservation_id, reserved_by_driver_id
+                    FROM stage_orders
+                    WHERE order_id = :order_id AND leg = :leg
+                """), {
+                    "order_id": order_id,
+                    "leg": leg,
+                }
+            ).fetchone()
+            
+            if not row:
+                logger.debug("get_stage_order: не найдено для order_id=%s, leg=%s", order_id, leg)
+                return None
+            result = {
+                "trip_id": row[0],
+                "direction_id": row[1],
+                "order_id": row[2],
+                "leg": row[3],
+                "courier_user_id": row[4],
+                "reservation_id": row[5],
+                "reserved_by_driver_id": row[6],
+            }
+            
+            logger.debug("get_stage_order: найдено для order_id=%s, leg=%s", order_id, leg)
+            return result
+            
+        except Exception as e:
+            logger.error("get_stage_order завершился с ошибкой: %s", e)
+            return None
 
     def count_recent_access_code_requests(
         self,
@@ -3331,12 +3338,10 @@ class DatabaseLayer:
         query = text("""
             SELECT
                 d.id,
-                d.status,
                 d.from_city,
                 d.to_city,
                 d.pickup_locker_id,
                 d.delivery_locker_id,
-                d.orders_total,
                 d.orders_available,
                 d.orders_reserved
             FROM directions d
@@ -3352,15 +3357,12 @@ class DatabaseLayer:
             directions = [
                 {
                     "id": row[0],
-                    "status": row[1],
-                    "from_city": row[2],
-                    "to_city": row[3],
-                    "pickup_locker_id": row[4],
-                    "delivery_locker_id": row[5],
-                    "orders_total": row[6],
-                    "orders_available": row[7],
-                    "orders_reserved": row[8],
-                    # ❌ created_at удалён — нет такой колонки в directions
+                    "from_city": row[1],
+                    "to_city": row[2],
+                    "pickup_locker_id": row[3],
+                    "delivery_locker_id": row[4],
+                    "orders_available": row[5],
+                    "orders_reserved": row[6],
                 }
                 for row in result
             ]
@@ -3377,7 +3379,7 @@ class DatabaseLayer:
         self,
         session: Session,
         direction_id: int,
-        driver_user_id: int,
+        driver_user_id: int, 
         capacity: int,
     ) -> Tuple[bool, int, str]:
         """
@@ -3389,20 +3391,20 @@ class DatabaseLayer:
         )
         
         try:
-            # 1. Проверка лимита слотов
+            # 1. Проверка лимита слотов (максимум 3 активных резерва на направление)
             active_slots = session.execute(text("""
                 SELECT COUNT(*) 
                 FROM driver_reservations 
                 WHERE driver_user_id = :driver_user_id 
                 AND direction_id = :direction_id 
-                AND status IN ('active', 'loading')
+                AND status IN ('reservation_active', 'reservation_loading')
             """), {
                 "driver_user_id": driver_user_id,
                 "direction_id": direction_id,
             }).scalar()
             
             if active_slots >= 3:
-                return False, 0, "LIMIT_EXCEEDED"
+                return False, 0, "LIMIT_EXCEEDED: Максимум 3 слота на направление"
             
             # 2. Проверка доступных заказов
             available = session.execute(text("""
@@ -3426,7 +3428,7 @@ class DatabaseLayer:
                     requested_count, expires_at, status
                 ) VALUES (
                     :driver_user_id, :direction_id, 0,
-                    :requested_count, :expires_at, 'active'
+                    :requested_count, :expires_at, 'reservation_active'
                 )
             """), {
                 "driver_user_id": driver_user_id,
@@ -3481,7 +3483,7 @@ class DatabaseLayer:
                 "reservation_id": reservation_id,
             })
             
-            # 7. Обновить счётчики в directions
+            # 7. Обновить счётчики в directions (БЕЗ orders_total!)
             session.execute(text("""
                 UPDATE directions
                 SET orders_reserved = orders_reserved + :count,
@@ -3503,16 +3505,19 @@ class DatabaseLayer:
             logger.exception("reserve_orders_for_direction завершился с ошибкой")
             raise DbLayerError("reserve_orders_for_direction failed: %s" % e) from e
 
-    def get_orders_by_reservation(
+    def get_orders_by_driver_and_direction(
         self,
         session: Session,
-        reservation_id: int,
+        direction_id: int,
+        driver_user_id: int,
     ) -> List[Dict[str, Any]]:
         """
-        Получить список заказов для конкретного резерва (слота).
-        Вызывается при нажатии "Начать загрузку" для отображения в блоке "Активный рейс".
+        Получить все заказы водителя на направлении (из ВСЕХ его резервов).
         """
-        logger.debug("get_orders_by_reservation вызван: reservation_id=%s", reservation_id)
+        logger.debug(
+            "get_orders_by_driver_and_direction вызван: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
+        )
         
         try:
             rows = session.execute(text("""
@@ -3531,11 +3536,13 @@ class DatabaseLayer:
                 JOIN lockers l_src ON l_src.id = lc_src.locker_id
                 JOIN locker_cells lc_dst ON lc_dst.id = o.dest_cell_id
                 JOIN lockers l_dst ON l_dst.id = lc_dst.locker_id
-                WHERE so.reservation_id = :reservation_id
+                WHERE so.direction_id = :direction_id
+                AND so.reserved_by_driver_id = :driver_user_id
                 AND so.leg = 'pickup'
                 ORDER BY o.created_at ASC
             """), {
-                "reservation_id": reservation_id,
+                "direction_id": direction_id,
+                "driver_user_id": driver_user_id,
             }).fetchall()
             
             orders = [
@@ -3552,39 +3559,16 @@ class DatabaseLayer:
                 for row in rows
             ]
             
-            logger.info("get_orders_by_reservation: reservation_id=%s, orders=%d", reservation_id, len(orders))
+            logger.info(
+                "get_orders_by_driver_and_direction: direction_id=%s, driver_user_id=%s, orders=%d",
+                direction_id, driver_user_id, len(orders)
+            )
+            
             return orders
             
         except Exception as e:
-            logger.error("get_orders_by_reservation завершился с ошибкой: %s", e)
-            raise DbLayerError("get_orders_by_reservation failed: %s" % e) from e
-
-    def update_driver_reservation_status(
-        self,
-        session: Session,
-        reservation_id: int,
-        new_status: str,
-    ) -> None:
-        """
-        Обновить статус резерва водителя (active → loading → completed).
-        """
-        logger.debug("update_driver_reservation_status вызван: reservation_id=%s, status=%s", reservation_id, new_status)
-        
-        try:
-            session.execute(text("""
-                UPDATE driver_reservations
-                SET status = :status
-                WHERE id = :reservation_id
-            """), {
-                "status": new_status,
-                "reservation_id": reservation_id,
-            })
-            
-            logger.info("update_driver_reservation_status: reservation_id=%s → status=%s", reservation_id, new_status)
-            
-        except Exception as e:
-            logger.error("update_driver_reservation_status завершился с ошибкой: %s", e)
-            raise DbLayerError("update_driver_reservation_status failed: %s" % e) from e
+            logger.error("get_orders_by_driver_and_direction завершился с ошибкой: %s", e)
+            raise DbLayerError("get_orders_by_driver_and_direction failed: %s" % e) from e    
 
     def check_open_cells_for_driver_reservations(
         self,
@@ -3601,25 +3585,24 @@ class DatabaseLayer:
         )
         
         try:
-            # Находим все активные резервы водителя на направлении
-            reservation_ids = session.execute(text("""
-                SELECT id FROM driver_reservations
-                WHERE driver_user_id = :driver_user_id
-                AND direction_id = :direction_id
-                AND status IN ('active', 'loading')
-            """), {
-                "driver_user_id": driver_user_id,
-                "direction_id": direction_id,
-            }).fetchall()
-            
-            reservation_ids = [row[0] for row in reservation_ids]
+            # 1. Находим все активные резервы водителя на направлении
+            reservation_ids = self.get_driver_active_reservations(
+                session, direction_id, driver_user_id
+            )
             
             if not reservation_ids:
+                logger.info(
+                    "check_open_cells_for_driver_reservations: нет активных резервов у водителя %s на направлении %s",
+                    driver_user_id, direction_id
+                )
                 return False, []
             
-            # Проверяем ячейки через fsm_action_logs - ищем открытые без закрытия
-            # Ячейка открыта если есть locker_open_locker но нет locker_close_pickup/locker_close_locker
-            open_cells = session.execute(text("""
+            # 2. ✅ Динамические плейсхолдеры для IN
+            reservation_placeholders = ', '.join([f':res_{i}' for i in range(len(reservation_ids))])
+            reservation_params = {f'res_{i}': rid for i, rid in enumerate(reservation_ids)}
+            
+            # 3. Проверяем ячейки через fsm_action_logs
+            query = text(f"""
                 SELECT DISTINCT lc.id
                 FROM fsm_action_logs fal_open
                 JOIN locker_cells lc ON lc.id = fal_open.entity_id
@@ -3637,21 +3620,32 @@ class DatabaseLayer:
                 AND lc.current_order_id IN (
                     SELECT so.order_id
                     FROM stage_orders so
-                    WHERE so.reservation_id IN :reservation_ids
+                    WHERE so.reservation_id IN ({reservation_placeholders})
                     AND so.leg = 'pickup'
                 )
-            """), {
+            """)
+            
+            # 4. Объединяем параметры
+            params = {
                 "driver_user_id": driver_user_id,
-                "reservation_ids": tuple(reservation_ids) if reservation_ids else (0,),
-            }).fetchall()
+                **reservation_params,
+            }
+            
+            open_cells = session.execute(query, params).fetchall()
             
             open_cell_ids = [row[0] for row in open_cells]
             has_open = len(open_cell_ids) > 0
             
-            logger.info(
-                "check_open_cells_for_driver_reservations: direction_id=%s, driver_user_id=%s, open_cells=%d",
-                direction_id, driver_user_id, len(open_cell_ids)
-            )
+            if has_open:
+                logger.warning(
+                    "check_open_cells_for_driver_reservations: обнаружены открытые ячейки: %s",
+                    open_cell_ids
+                )
+            else:
+                logger.info(
+                    "check_open_cells_for_driver_reservations: direction_id=%s, driver_user_id=%s, open_cells=0",
+                    direction_id, driver_user_id
+                )
             
             return has_open, open_cell_ids
             
@@ -3667,7 +3661,6 @@ class DatabaseLayer:
     ) -> List[int]:
         """
         Получить все активные резервы (слоты) водителя на направлении.
-        Возвращает список reservation_id.
         """
         logger.debug(
             "get_driver_active_reservations вызван: direction_id=%s, driver_user_id=%s",
@@ -3680,7 +3673,7 @@ class DatabaseLayer:
                 FROM driver_reservations
                 WHERE driver_user_id = :driver_user_id
                 AND direction_id = :direction_id
-                AND status IN ('active', 'loading')
+                AND status IN ('reservation_active', 'reservation_loading')
                 ORDER BY reserved_at ASC
             """), {
                 "driver_user_id": driver_user_id,
@@ -3709,8 +3702,6 @@ class DatabaseLayer:
         """
         Получить order_id которые водитель фактически забрал (открыл + закрыл ячейки)
         из ВСЕХ его резервов на направлении.
-        Фильтр по fsm_action_logs: locker_close_pickup.
-        Исключает заказы с ошибкой.
         """
         logger.debug(
             "get_picked_orders_by_driver_and_direction вызван: direction_id=%s, driver_user_id=%s",
@@ -3718,7 +3709,7 @@ class DatabaseLayer:
         )
         
         try:
-            # Статусы заказов с ошибкой (исключить) — ← ← ← СПИСОК, НЕ КОРТЕЖ!
+            # Статусы заказов с ошибкой (исключить из результата)
             excluded_statuses = [
                 'order_cancelled',
                 'order_manual_intervention_required',
@@ -3728,11 +3719,11 @@ class DatabaseLayer:
                 'order_reservation_expired',
             ]
             
-            # Динамически создаём плейсхолдеры для IN
+            # Динамически создаём плейсхолдеры для IN (чтобы избежать SQL injection)
             excluded_placeholders = ', '.join([f':excl_{i}' for i in range(len(excluded_statuses))])
             excluded_params = {f'excl_{i}': status for i, status in enumerate(excluded_statuses)}
             
-            # Основной запрос
+            # Основной запрос: ищем заказы где водитель закрыл ячейку с забором (locker_close_pickup)
             query = text(f"""
                 SELECT DISTINCT lc.current_order_id
                 FROM fsm_action_logs fal
@@ -3758,7 +3749,7 @@ class DatabaseLayer:
             params = {
                 "driver_user_id": driver_user_id,
                 "direction_id": direction_id,
-                **excluded_params,  # ← ← ← Распаковываем excluded_params
+                **excluded_params, 
             }
             
             result = session.execute(query, params).fetchall()
@@ -3785,7 +3776,6 @@ class DatabaseLayer:
     ) -> int:
         """
         Освободить не забранные заказы из ВСЕХ резервов водителя (вернуть в пул направления).
-        Возвращает количество освобождённых заказов.
         """
         logger.debug(
             "release_unpicked_orders_by_driver_and_direction вызван: direction_id=%s, driver_user_id=%s",
@@ -3793,7 +3783,7 @@ class DatabaseLayer:
         )
         
         try:
-            # Находим все зарезервированные заказы водителя на направлении
+            # 1. Находим все зарезервированные заказы водителя на направлении
             reserved = session.execute(text("""
                 SELECT DISTINCT so.order_id
                 FROM stage_orders so
@@ -3807,18 +3797,18 @@ class DatabaseLayer:
             
             reserved_order_ids = [row[0] for row in reserved]
             
-            # Находим разницу (не забранные)
+            # 2. Находим разницу (не забранные)
             unpicked = [oid for oid in reserved_order_ids if oid not in picked_order_ids]
             
             if not unpicked:
                 logger.info("release_unpicked_orders_by_driver_and_direction: все заказы забраны")
                 return 0
             
-            # Динамически создаём плейсхолдеры для IN
+            # 3. Динамически создаём плейсхолдеры для IN (чтобы избежать SQL injection)
             unpicked_placeholders = ', '.join([f':unpicked_{i}' for i in range(len(unpicked))])
             unpicked_params = {f'unpicked_{i}': oid for i, oid in enumerate(unpicked)}
             
-            # Освобождаем не забранные
+            # 4. Освобождаем не забранные (сброс reservation_id и reserved_by_driver_id)
             query = text(f"""
                 UPDATE stage_orders
                 SET reserved_by_driver_id = NULL,
@@ -3831,12 +3821,12 @@ class DatabaseLayer:
             params = {
                 "direction_id": direction_id,
                 "driver_user_id": driver_user_id,
-                **unpicked_params,
+                **unpicked_params,  # ← ← ← Распаковываем unpicked_params
             }
             
             session.execute(query, params)
             
-            # Обновляем счётчики в directions
+            # 5. Обновляем счётчики в directions
             session.execute(text("""
                 UPDATE directions
                 SET orders_reserved = orders_reserved - :count,
@@ -3856,48 +3846,7 @@ class DatabaseLayer:
             
         except Exception as e:
             logger.error("release_unpicked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
-            raise DbLayerError("release_unpicked_orders_by_driver_and_direction failed: %s" % e) from e
-
-    def update_driver_reservations_to_completed(
-        self,
-        session: Session,
-        direction_id: int,
-        driver_user_id: int,
-    ) -> int:
-        """
-        Обновить статус ВСЕХ резервов водителя на направлении: active/loading → completed.
-        Возвращает количество обновлённых резервов.
-        """
-        logger.debug(
-            "update_driver_reservations_to_completed вызван: direction_id=%s, driver_user_id=%s",
-            direction_id, driver_user_id
-        )
-        
-        try:
-            result = session.execute(text("""
-                UPDATE driver_reservations
-                SET status = 'completed'
-                WHERE driver_user_id = :driver_user_id
-                AND direction_id = :direction_id
-                AND status IN ('active', 'loading')
-            """), {
-                "driver_user_id": driver_user_id,
-                "direction_id": direction_id,
-            })
-            
-            updated_count = result.rowcount
-            
-            logger.info(
-                "update_driver_reservations_to_completed: direction_id=%s, driver_user_id=%s, updated=%d",
-                direction_id, driver_user_id, updated_count
-            )
-            
-            return updated_count
-            
-        except Exception as e:
-            logger.error("update_driver_reservations_to_completed завершился с ошибкой: %s", e)
-            raise DbLayerError("update_driver_reservations_to_completed failed: %s" % e) from e
-
+            raise DbLayerError("release_unpicked_orders_by_driver_and_direction failed: %s" % e) from e    
 
     def create_trip_for_loading(
         self,
@@ -3908,7 +3857,6 @@ class DatabaseLayer:
     ) -> int:
         """
         Создать новый рейс (trip) для фактически забранных заказов.
-        Возвращает trip_id.
         """
         logger.debug(
             "create_trip_for_loading вызван: direction_id=%s, driver_user_id=%s, orders=%d",
@@ -3916,6 +3864,7 @@ class DatabaseLayer:
         )
         
         try:
+            # 1. Получаем данные направления
             direction = session.execute(text("""
                 SELECT from_city, to_city, pickup_locker_id, delivery_locker_id
                 FROM directions
@@ -3929,6 +3878,7 @@ class DatabaseLayer:
             
             from_city, to_city, pickup_locker_id, delivery_locker_id = direction
             
+            # 2. Создаём рейс
             session.execute(text("""
                 INSERT INTO trips (
                     driver_user_id, from_city, to_city,
@@ -3949,17 +3899,27 @@ class DatabaseLayer:
             
             trip_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
             
+            # 3. Привязываем заказы к рейсу
             if picked_order_ids:
-                session.execute(text("""
+                order_placeholders = ', '.join([f':order_{i}' for i in range(len(picked_order_ids))])
+                order_params = {f'order_{i}': oid for i, oid in enumerate(picked_order_ids)}
+                
+                # UPDATE pickup плеча + SET trip_id
+                query = text(f"""
                     UPDATE stage_orders
                     SET trip_id = :trip_id
-                    WHERE order_id IN :order_ids
+                    WHERE order_id IN ({order_placeholders})
                     AND leg = 'pickup'
-                """), {
-                    "trip_id": trip_id,
-                    "order_ids": tuple(picked_order_ids),
-                })
+                """)
                 
+                params = {
+                    "trip_id": trip_id,
+                    **order_params,
+                }
+                
+                session.execute(query, params)
+                
+                # INSERT delivery плеча
                 for order_id in picked_order_ids:
                     session.execute(text("""
                         INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id)
@@ -3969,6 +3929,21 @@ class DatabaseLayer:
                         "trip_id": trip_id,
                         "order_id": order_id,
                     })
+                
+                # УМЕНЬШАЕМ orders_reserved на количество забранных заказов
+                session.execute(text("""
+                    UPDATE directions
+                    SET orders_reserved = orders_reserved - :count
+                    WHERE id = :direction_id
+                """), {
+                    "count": len(picked_order_ids),
+                    "direction_id": direction_id,
+                })
+                
+                logger.info(
+                    "create_trip_for_loading: directions.orders_reserved уменьшен на %d",
+                    len(picked_order_ids)
+                )
             
             logger.info(
                 "create_trip_for_loading: direction_id=%s, trip_id=%s, orders=%d",
@@ -4257,10 +4232,6 @@ class DatabaseLayer:
         pickup_locker_id: int,
         delivery_locker_id: int,
     ) -> int:
-        """
-        Найти или создать направление по маршруту.
-        Возвращает direction_id.
-        """
         # 1. Ищем существующее
         existing = session.execute(text("""
             SELECT id FROM directions
@@ -4276,17 +4247,16 @@ class DatabaseLayer:
         }).fetchone()
         
         if existing:
-            logger.debug(f"Направление найдено: direction_id={existing[0]}")
             return existing[0]
         
         # 2. Создаём новое
         session.execute(text("""
             INSERT INTO directions (
                 from_city, to_city, pickup_locker_id, delivery_locker_id,
-                orders_total, orders_reserved, orders_available
+                orders_reserved, orders_available
             ) VALUES (
                 :from_city, :to_city, :pickup_locker_id, :delivery_locker_id,
-                0, 0, 0
+                0, 0
             )
         """), {
             "from_city": from_city,
@@ -4296,8 +4266,6 @@ class DatabaseLayer:
         })
         
         direction_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
-        logger.info(f"Создано направление: direction_id={direction_id}")
-        
         return direction_id
 
     def assign_order_to_direction(
@@ -4337,8 +4305,7 @@ class DatabaseLayer:
         # 3. Обновить счётчик в directions
         session.execute(text("""
             UPDATE directions
-            SET orders_total = orders_total + 1,
-                orders_available = orders_available + 1
+            SET orders_available = orders_available + 1
             WHERE id = :direction_id
         """), {
             "direction_id": direction_id,

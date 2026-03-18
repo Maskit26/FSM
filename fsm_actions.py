@@ -700,8 +700,7 @@ class DriverActions:
             if intent == "pickup":
                 logger.info("[DRIVER] Finishing PICKUP: cell %s will be EMPTY", cell_id)                
                 self.db.close_locker_pickup(session, cell_id, user_id)                
-                # ❌ НЕ меняем статус заказа здесь — он уже изменился при open_cell
-                # self.db.order_pickup_by_driver() вызывается в complete_loading()
+                self.db.order_pickup_by_driver(session, order_id, user_id)
 
             elif intent == "delivery":
                 logger.info("[DRIVER] Finishing DELIVERY: cell %s will be OCCUPIED", cell_id)                
@@ -1341,6 +1340,9 @@ class AccessCodeActions:
         user_id: int,
         leg: str
     ) -> Tuple[bool, str]:
+        """
+        Запрос кода доступа к ячейке.
+        """
         try:
             # 1. Загрузить заказ
             order = self.db.get_order(session, order_id)
@@ -1349,8 +1351,8 @@ class AccessCodeActions:
 
             # 2. Проверить статус
             allowed_statuses = {
-                "pickup": ["order_created", "order_courier1_assigned"],
-                "delivery": ["order_parcel_confirmed_post2", "order_courier2_assigned", "order_courier2_parcel_delivered"]
+                "pickup": ["order_created", "order_courier1_assigned", "order_parcel_confirmed", "order_parcel_submitted"],
+                "delivery": ["order_arrived_at_post2", "order_courier2_assigned", "order_courier2_parcel_delivered"]
             }
             if order["status"] not in allowed_statuses[leg]:
                 return False, f"CODE_NOT_ALLOWED_IN_{order['status']}"
@@ -1362,18 +1364,48 @@ class AccessCodeActions:
             user_role = self.db.get_user_role(session, user_id)
             
             if leg == "pickup":
+                # ✅ PICKUP (Постамат A)
                 if order["pickup_type"] == "self":
-                    authorized_user_id = order["client_user_id"]
+                    if user_role == "client":
+                        authorized_user_id = order["client_user_id"]
+                    elif user_role == "driver":
+                        stage = self.db.get_stage_order(session, order_id, "pickup")
+                        if stage and stage.get("reserved_by_driver_id") == user_id:
+                            authorized_user_id = user_id
+                    else:
+                        return False, "USER_NOT_AUTHORIZED"
                 else:
-                    stage = self.db.get_stage_order(session, order_id, "pickup")
-                    authorized_user_id = stage.courier_user_id if stage else None
-            else:  # delivery
-                if order["delivery_type"] == "self":
-                    # Самовывоз: только получатель
-                    authorized_user_id = order.get("recipient_user_id")
-                else:
-                    # Курьер и получатель могут запросить код
                     if user_role == "courier":
+                        stage = self.db.get_stage_order(session, order_id, "pickup")
+                        authorized_user_id = stage.courier_user_id if stage else None
+                    elif user_role == "driver":
+                        stage = self.db.get_stage_order(session, order_id, "pickup")
+                        if stage and stage.get("reserved_by_driver_id") == user_id:
+                            authorized_user_id = user_id
+                    else:
+                        return False, "USER_NOT_AUTHORIZED"
+                        
+            else:  
+                # ✅ DELIVERY (Постамат B):
+                if order["delivery_type"] == "self":
+                    if user_role == "driver":
+                        trip_id = self.db.get_trip_id_by_order_id(session, order_id)
+                        if trip_id:
+                            trip = self.db.get_trip(session, trip_id)
+                            if trip and trip["driver_user_id"] == user_id:
+                                authorized_user_id = user_id
+                    elif user_role == "recipient":
+                        authorized_user_id = order.get("recipient_user_id")
+                    else:
+                        return False, "USER_NOT_AUTHORIZED"
+                else: 
+                    if user_role == "driver":
+                        trip_id = self.db.get_trip_id_by_order_id(session, order_id)
+                        if trip_id:
+                            trip = self.db.get_trip(session, trip_id)
+                            if trip and trip["driver_user_id"] == user_id:
+                                authorized_user_id = user_id
+                    elif user_role == "courier":
                         stage = self.db.get_stage_order(session, order_id, "delivery")
                         authorized_user_id = stage.courier_user_id if stage else None
                     elif user_role == "recipient":
@@ -1458,7 +1490,7 @@ class TripActions:
         capacity: int,
     ) -> Tuple[bool, str]:
         """
-        Водитель резервирует слот в направлении.        
+        Водитель резервирует слот в направлении.
         """
         logger.info(
             "[TripActions] reserve_slot: direction_id=%s, driver_user_id=%s, capacity=%s",
@@ -1469,7 +1501,7 @@ class TripActions:
             logger.error("[TripActions] reserve_slot: invalid capacity=%s", capacity)
             return False, "INVALID_CAPACITY"
         
-        # 1. Резерв заказов
+        # Резерв заказов (атомарный UPDATE + INSERT в driver_reservations)
         success, reserved_count, msg = self.db.reserve_orders_for_direction(
             session, direction_id, driver_user_id, capacity
         )
@@ -1477,9 +1509,6 @@ class TripActions:
         if not success:
             logger.error("[TripActions] reserve_slot FAILED: direction_id=%s, error=%s", direction_id, msg)
             return False, msg
-        
-        # 2. FSM переход (direction_open → direction_open)
-        self.db.direction_reserve_slot(session, direction_id, driver_user_id)
         
         logger.info(
             "[TripActions] reserve_slot COMPLETED: direction_id=%s, driver_user_id=%s, reserved=%s",
@@ -1517,7 +1546,8 @@ class TripActions:
                 "[TripActions] start_loading: found %d reservations for driver %s",
                 len(reservation_ids), driver_user_id
             )
-            # 2. Получаем список заказов из ВСЕХ резервов (для отображения, НЕ для смены статуса)
+            
+            # 2. Получаем список заказов из ВСЕХ резервов
             orders = self.db.get_orders_by_driver_and_direction(
                 session, direction_id, driver_user_id
             )
@@ -1525,13 +1555,13 @@ class TripActions:
                 "[TripActions] start_loading: direction_id=%s, orders=%d",
                 direction_id, len(orders)
             )
-            # 3. FSM переход направления (direction_open → direction_loading)
-            self.db.direction_start_loading(session, direction_id, driver_user_id)
             
-            # 4. Обновляем ВСЕ резервы водителя: active → loading
-            self.db.update_driver_reservations_to_loading(
-                session, direction_id, driver_user_id
-            )
+            # 3. FSM переход для КАЖДОГО резерва: reservation_active → reservation_loading
+            for reservation_id in reservation_ids:
+                self.db.driver_reservation_start_loading(
+                    session, reservation_id, driver_user_id
+                )
+            
             logger.info(
                 "[TripActions] start_loading COMPLETED: direction_id=%s, driver_user_id=%s, orders=%d",
                 direction_id, driver_user_id, len(orders)
@@ -1550,30 +1580,25 @@ class TripActions:
     ) -> Tuple[bool, str]:
         """
         Водитель завершает погрузку по направлению.
-        
         1. Проверяет что нет открытых ячеек
         2. Находит ВСЕ активные резервы водителя на направлении
-        3. Определяет фактически забранные заказы (по fsm_action_logs)
+        3. Определяет фактически забранные заказы 
         4. Проверяет что есть хотя бы 1 забранный заказ
         5. Создаёт ОДИН рейс (trip) для ВСЕХ забранных заказов
         6. Освобождает не забранные заказы (возврат в пул направления)
-        7. Обновляет ВСЕ резервы: active/loading → completed
-        8. Делает FSM переход направления: direction_loading → direction_loading_finished
+        7. Обновляет FSM reservation_loading → reservation_completed
         """
         logger.info(
             "[TripActions] complete_loading: direction_id=%s, driver_user_id=%s",
             direction_id, driver_user_id
         )
+        
         try:
             # 1. ПРОВЕРКА ОТКРЫТЫХ ЯЧЕЕК
             has_open_cells, open_cell_ids = self.db.check_open_cells_for_driver_reservations(
                 session, direction_id, driver_user_id
             )
             if has_open_cells:
-                logger.error(
-                    "[TripActions] complete_loading: обнаружены открытые ячейки: %s",
-                    open_cell_ids
-                )
                 return False, f"OPEN_CELLS_DETECTED: Ячейки {open_cell_ids} не закрыты"
             
             # 2. Находим ВСЕ активные резервы водителя на направлении
@@ -1581,58 +1606,53 @@ class TripActions:
                 session, direction_id, driver_user_id
             )
             if not reservation_ids:
-                logger.error(
-                    "[TripActions] complete_loading: нет активных резервов у водителя %s на направлении %s",
-                    driver_user_id, direction_id
-                )
                 return False, "NO_ACTIVE_RESERVATIONS"
             
             logger.info(
                 "[TripActions] complete_loading: found %d reservations for driver %s",
                 len(reservation_ids), driver_user_id
             )
-            # 3. Определяем фактически забранные заказы (из ВСЕХ резервов)
+            
+            # 3. Определяем забранные заказы
             picked_order_ids = self.db.get_picked_orders_by_driver_and_direction(
                 session, direction_id, driver_user_id
             )
-            logger.info(
-                "[TripActions] complete_loading: picked_orders=%d",
-                len(picked_order_ids)
-            )
-            # 4. ПРОВЕРКА: РЕЙС НЕ МОЖЕТ БЫТЬ СОЗДАН С 0 ЗАКАЗОВ
-            if not picked_order_ids or len(picked_order_ids) == 0:
-                logger.error(
-                    "[TripActions] complete_loading: водитель не забрал ни одного заказа"
-                )
+            
+            # 4. ПРОВЕРКА: >= 1 заказа
+            if not picked_order_ids:
                 return False, "NO_ORDERS_PICKED: Невозможно создать рейс с 0 заказов"
             
             # 5. Создаём ОДИН рейс для ВСЕХ забранных заказов
             trip_id = self.db.create_trip_for_loading(
                 session, direction_id, driver_user_id, picked_order_ids
             )
+            
             logger.info(
                 "[TripActions] complete_loading: created trip_id=%s for %d orders",
                 trip_id, len(picked_order_ids)
             )
+            
             # 6. Освобождаем не забранные заказы (возврат в пул)
             released_count = self.db.release_unpicked_orders_by_driver_and_direction(
                 session, direction_id, driver_user_id, picked_order_ids
             )
+            
             logger.info(
                 "[TripActions] complete_loading: released %d unpicked orders",
                 released_count
             )
-            # 7. Обновляем ВСЕ резервы водителя: active/loading → completed
-            self.db.update_driver_reservations_to_completed(
-                session, direction_id, driver_user_id
-            )
-            # 8. FSM переход направления (direction_loading → direction_loading_finished)
-            self.db.direction_complete_loading(session, direction_id, driver_user_id)
+            
+            # 7. FSM переход для КАЖДОГО резерва: reservation_loading → reservation_completed
+            for reservation_id in reservation_ids:
+                self.db.driver_reservation_complete_loading(
+                    session, reservation_id, driver_user_id
+                )
             
             logger.info(
                 "[TripActions] complete_loading COMPLETED: direction_id=%s, driver_user_id=%s, trip_id=%s, picked=%d, released=%d",
                 direction_id, driver_user_id, trip_id, len(picked_order_ids), released_count
             )
+            
             return True, "Погрузка завершена: %d заказов в рейс %s" % (len(picked_order_ids), trip_id)
             
         except Exception as e:
