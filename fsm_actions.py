@@ -1647,3 +1647,53 @@ class TripActions:
         except Exception as e:
             logger.exception("[TripActions] complete_loading failed")
             return False, "COMPLETE_LOADING_FAILED: %s" % e
+
+    # ===================== отмена резерва =========================
+    def cancel_reservation(
+        self,
+        session: Session,
+        reservation_id: int,
+        driver_user_id: int,
+    ) -> Tuple[bool, str]:
+        """
+        Отмена резерва водителем.
+        
+        1. Проверяет что все заказы в статусе order_parcel_confirmed
+        2. Возвращает заказы в пул направления
+        3. Делает FSM переход reservation_loading → reservation_cancelled
+        """
+        logger.info(
+            "[TripActions] cancel_reservation: reservation_id=%s, driver_user_id=%s",
+            reservation_id, driver_user_id
+        )
+        
+        try:
+            # 1. Проверка что можно отменить
+            can_cancel, blocked_ids, error = self.db.validate_reservation_for_cancellation(
+                session, reservation_id
+            )
+            
+            if not can_cancel:
+                logger.warning("[TripActions] cancel_reservation blocked: %s", error)
+                return False, error
+            
+            # 2. Освобождаем заказы (возврат в пул)
+            released_count = self.db.release_orders_from_reservation(
+                session, reservation_id
+            )
+            
+            logger.info("[TripActions] cancel_reservation: released %d orders", released_count)
+            
+            # 3. FSM переход reservation_loading → reservation_cancelled
+            self.db.cancel_driver_reservation(session, reservation_id, driver_user_id)
+            
+            logger.info(
+                "[TripActions] cancel_reservation COMPLETED: reservation_id=%s, released=%d",
+                reservation_id, released_count
+            )
+            
+            return True, "Резерв отменён: %d заказов возвращено в пул" % released_count
+            
+        except Exception as e:
+            logger.exception("[TripActions] cancel_reservation failed")
+            return False, "CANCEL_RESERVATION_FAILED: %s" % e

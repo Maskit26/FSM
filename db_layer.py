@@ -3975,6 +3975,178 @@ class DatabaseLayer:
             logger.error("create_trip_for_loading завершился с ошибкой: %s", e)
             raise DbLayerError("create_trip_for_loading failed: %s" % e) from e
 
+    # ================ отмена резерва ===============
+    def get_orders_by_reservation(
+        self,
+        session: Session,
+        reservation_id: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить все заказы в резерве.
+        """
+        logger.debug("get_orders_by_reservation вызван: reservation_id=%s", reservation_id)
+        
+        try:
+            rows = session.execute(text("""
+                SELECT
+                    so.order_id,
+                    o.status,
+                    o.description,
+                    o.parcel_type,
+                    o.source_cell_id,
+                    o.dest_cell_id,
+                    o.client_user_id,
+                    o.recipient_user_id
+                FROM stage_orders so
+                JOIN orders o ON o.id = so.order_id
+                WHERE so.reservation_id = :reservation_id
+                AND so.leg = 'pickup'
+            """), {
+                "reservation_id": reservation_id,
+            }).fetchall()
+            
+            orders = [
+                {
+                    "order_id": row[0],
+                    "status": row[1],
+                    "description": row[2],
+                    "parcel_type": row[3],
+                    "source_cell_id": row[4],
+                    "dest_cell_id": row[5],
+                    "client_user_id": row[6],
+                    "recipient_user_id": row[7],
+                }
+                for row in rows
+            ]
+            
+            logger.info("get_orders_by_reservation: reservation_id=%s, orders=%d", reservation_id, len(orders))
+            return orders
+            
+        except Exception as e:
+            logger.error("get_orders_by_reservation завершился с ошибкой: %s", e)
+            raise DbLayerError("get_orders_by_reservation failed: %s" % e) from e
+
+    def validate_reservation_for_cancellation(
+        self,
+        session: Session,
+        reservation_id: int,
+    ) -> Tuple[bool, List[int], str]:
+        """
+        Проверить можно ли отменить резерв.
+        """
+        logger.debug("validate_reservation_for_cancellation вызван: reservation_id=%s", reservation_id)
+        
+        try:
+            # 1. Получаем резерв
+            reservation = session.execute(text("""
+                SELECT driver_user_id, direction_id, status
+                FROM driver_reservations
+                WHERE id = :reservation_id
+            """), {
+                "reservation_id": reservation_id,
+            }).fetchone()
+            
+            if not reservation:
+                return False, [], f"Резерв {reservation_id} не найден"
+            
+            driver_user_id, direction_id, reservation_status = reservation
+            
+            # 2. Получаем заказы резерва
+            orders = self.get_orders_by_reservation(session, reservation_id)
+            
+            if not orders:
+                return False, [], "В резерве нет заказов"
+            
+            # 3. Проверяем статусы заказов
+            allowed_status = "order_parcel_confirmed"
+            blocked_ids: List[int] = []
+            
+            for o in orders:
+                if o["status"] != allowed_status:
+                    blocked_ids.append(o["order_id"])
+            
+            if blocked_ids:
+                return False, blocked_ids, (
+                    f"Нельзя отменить резерв: заказы {blocked_ids} не в статусе '{allowed_status}'"
+                )
+            
+            logger.info("validate_reservation_for_cancellation: reservation_id=%s — OK", reservation_id)
+            return True, [], ""
+            
+        except Exception as e:
+            logger.error("validate_reservation_for_cancellation завершился с ошибкой: %s", e)
+            raise DbLayerError("validate_reservation_for_cancellation failed: %s" % e) from e
+
+    def release_orders_from_reservation(
+        self,
+        session: Session,
+        reservation_id: int,
+    ) -> int:
+        """
+        Освободить заказы из резерва (вернуть в пул направления).
+        """
+        logger.debug("release_orders_from_reservation вызван: reservation_id=%s", reservation_id)
+        
+        try:
+            # 1. Получаем направление из резерва
+            reservation = session.execute(text("""
+                SELECT direction_id
+                FROM driver_reservations
+                WHERE id = :reservation_id
+            """), {
+                "reservation_id": reservation_id,
+            }).fetchone()
+            
+            if not reservation:
+                raise DbLayerError(f"Резерв {reservation_id} не найден")
+            
+            direction_id = reservation[0]
+            
+            # 2. Считаем количество заказов
+            result = session.execute(text("""
+                SELECT COUNT(*)
+                FROM stage_orders
+                WHERE reservation_id = :reservation_id
+                AND leg = 'pickup'
+            """), {
+                "reservation_id": reservation_id,
+            }).scalar()
+            
+            released_count = int(result) if result else 0
+            
+            if released_count == 0:
+                logger.info("release_orders_from_reservation: нет заказов для освобождения")
+                return 0
+            
+            # 3. Освобождаем заказы (сброс reservation_id и reserved_by_driver_id)
+            session.execute(text("""
+                UPDATE stage_orders
+                SET reserved_by_driver_id = NULL,
+                    reservation_id = NULL
+                WHERE reservation_id = :reservation_id
+                AND leg = 'pickup'
+            """), {
+                "reservation_id": reservation_id,
+            })
+            
+            # 4. Обновляем счётчики в directions
+            session.execute(text("""
+                UPDATE directions
+                SET orders_reserved = orders_reserved - :count,
+                    orders_available = orders_available + :count
+                WHERE id = :direction_id
+            """), {
+                "count": released_count,
+                "direction_id": direction_id,
+            })
+            
+            logger.info("release_orders_from_reservation: reservation_id=%s, released=%d", reservation_id, released_count)
+            return released_count
+            
+        except Exception as e:
+            logger.error("release_orders_from_reservation завершился с ошибкой: %s", e)
+            raise DbLayerError("release_orders_from_reservation failed: %s" % e) from e
+
 
     # ==================== РЕЙСЫ ====================
 

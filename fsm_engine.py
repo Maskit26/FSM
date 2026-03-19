@@ -756,7 +756,7 @@ def _handle_direction_complete_loading(
     
     actions: TripActions = ctx["trip_actions"]
     
-    # 2. Вызываем экшен (БЕЗ reservation_id — найдёт все резервы сам)
+    # 2. Вызываем экшен
     success, msg = actions.complete_loading(
         session, direction_id, driver_user_id
     )
@@ -776,6 +776,59 @@ def _handle_direction_complete_loading(
         "[FSM] direction_complete_loading COMPLETED: direction_id=%s",
         direction_id
     )
+    
+    return FsmStepResult(
+        new_state="COMPLETED",
+        last_error=None,
+        attempts_increment=1
+    )
+
+def _handle_driver_reservation_cancel(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Обработчик отмены резерва водителем.
+    """
+    reservation_id = instance["entity_id"]
+    driver_user_id = instance["requested_by_user_id"]
+    user_role = instance.get("requested_user_role", "")
+    
+    logger.info(
+        "[FSM] driver_reservation_cancel: reservation_id=%s, driver_user_id=%s, role=%s",
+        reservation_id, driver_user_id, user_role
+    )
+    
+    # 1. Проверка роли (только водитель)
+    if user_role != "driver":
+        logger.error("[FSM] driver_reservation_cancel: доступ запрещён для роли %s", user_role)
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="ROLE_NOT_ALLOWED: только водитель может отменить резерв",
+            attempts_increment=1
+        )
+    
+    actions: TripActions = ctx["trip_actions"]
+    
+    # 2. Вызываем экшен
+    success, msg = actions.cancel_reservation(
+        session, reservation_id, driver_user_id
+    )
+    
+    if not success:
+        logger.error(
+            "[FSM] driver_reservation_cancel FAILED: reservation_id=%s, error=%s",
+            reservation_id, msg
+        )
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=msg,
+            attempts_increment=1
+        )
+    
+    logger.info("[FSM] driver_reservation_cancel COMPLETED: reservation_id=%s", reservation_id)
     
     return FsmStepResult(
         new_state="COMPLETED",
@@ -804,6 +857,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "direction_reserve_slot": {"PENDING": _handle_direction_reserve_slot},
     "direction_start_loading": {"PENDING": _handle_direction_start_loading},
     "direction_complete_loading": {"PENDING": _handle_direction_complete_loading},
+    "driver_reservation_cancel": {"PENDING": _handle_driver_reservation_cancel},
 }
 
 
