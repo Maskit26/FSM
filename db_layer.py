@@ -3821,7 +3821,7 @@ class DatabaseLayer:
             params = {
                 "direction_id": direction_id,
                 "driver_user_id": driver_user_id,
-                **unpicked_params,  # ← ← ← Распаковываем unpicked_params
+                **unpicked_params, 
             }
             
             session.execute(query, params)
@@ -4366,13 +4366,12 @@ class DatabaseLayer:
         trip_id: int
     ) -> Tuple[bool, List[int], List[int], str]:
         """
-        Проверка готовности рейса к старту (забор посылок из Пост1).    
-        
+        Проверка готовности рейса к старту (забор посылок из Пост1).
         """
         logger.debug("validate_and_get_orders_for_trip_start вызван: trip_id=%s", trip_id)
         
-        try:        
-            # 1. Проверка статуса рейса        
+        try:
+            # 1. Проверка статуса рейса (должен быть trip_assigned)
             trip = self.get_trip(session, trip_id)
             if not trip:
                 return False, [], [], f"Рейс {trip_id} не найден"
@@ -4380,31 +4379,23 @@ class DatabaseLayer:
             if trip["status"] != "trip_assigned":
                 return False, [], [], (
                     f"Рейс в статусе '{trip['status']}', ожидается 'trip_assigned'"
-                )       
+                )
             
-            # 2. Получаем все заказы рейса с их статусами        
+            # 2. Получаем все заказы рейса с их статусами
             orders = self.get_orders_with_status_in_trip(session, trip_id)
             if not orders:
-                return False, [], [], "В рейсе нет заказов"        
+                return False, [], [], "В рейсе нет заказов"
             
-            # 3. Статусы заказов        
-            expected_order_status = "order_picked_up_from_post1"       
+            # 3. Статусы заказов
+            expected_order_status = "order_picked_up_from_post1"
             
             excluded_order_statuses = [
                 "order_manual_intervention_required",
                 "order_parcel_missing",
                 "order_cancelled",
-            ]        
+            ]
             
-            # 4. Статусы ячеек        
-            expected_cell_status = "locker_occupied"       
-        
-            excluded_cell_statuses = [
-                "locker_error",
-                "locker_maintenance",
-            ]        
-            
-            # 5. Проверка заказов       
+            # 4. Проверка заказов (БЕЗ проверки ячеек!)
             blocked_ids: List[int] = []
             transit_ids: List[int] = []
             
@@ -4430,45 +4421,7 @@ class DatabaseLayer:
                 return False, blocked_ids, [], (
                     f"Нельзя начать путь: заказы {blocked_ids} не готовы "
                     f"(ожидался статус '{expected_order_status}')"
-                )        
-            
-            # 6. Проверка pickup ячеек (Пост1)        
-            pickup_cells = session.execute(
-                text("""
-                    SELECT 
-                        lc.id,
-                        lc.status,
-                        o.id as order_id
-                    FROM locker_cells lc
-                    JOIN orders o ON o.id = lc.current_order_id
-                    JOIN stage_orders so ON so.order_id = o.id
-                    WHERE so.trip_id = :trip_id
-                    AND lc.id = o.source_cell_id
-                    AND o.status NOT IN :excluded_order_statuses
-                """),
-                {
-                    "trip_id": trip_id,
-                    "excluded_order_statuses": tuple(excluded_order_statuses)
-                }
-            ).fetchall()
-            
-            for cell_row in pickup_cells:
-                cell_id, cell_status, order_id = cell_row
-                
-                # Пропускаем проблемные ячейки
-                if cell_status in excluded_cell_statuses:
-                    logger.debug(
-                        "validate_and_get_orders_for_trip_start: ячейка %s в статусе '%s' — исключена",
-                        cell_id, cell_status
-                    )
-                    continue
-                
-                # Проверяем успешные ячейки
-                if cell_status != expected_cell_status:
-                    return False, [], [], (
-                        f"Pickup ячейка {cell_id} (заказ {order_id}) в статусе '{cell_status}', "
-                        f"ожидается '{expected_cell_status}'"
-                    )
+                )
             
             logger.info(
                 "validate_and_get_orders_for_trip_start: trip_id=%s — OK, transit=%d заказов",

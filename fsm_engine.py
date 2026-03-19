@@ -700,9 +700,9 @@ def _handle_direction_start_loading(
         )
     actions: TripActions = ctx["trip_actions"]
     
-    # 2. Вызываем экшен (БЕЗ reservation_id — найдёт все резервы сам)
+    # 2. Вызываем экшен
     success, msg = actions.start_loading(
-        session, direction_id, driver_user_id  # ← ← ← Без reservation_id
+        session, direction_id, driver_user_id
     )
     if not success:
         logger.error(

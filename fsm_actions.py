@@ -1524,53 +1524,42 @@ class TripActions:
         driver_user_id: int,
     ) -> Tuple[bool, str]:
         """
-        Водитель начинает погрузку по направлению (нажал кнопку "Начать загрузку").
+        Водитель начинает погрузку по направлению (FSM переходы).
         """
         logger.info(
             "[TripActions] start_loading: direction_id=%s, driver_user_id=%s",
             direction_id, driver_user_id
         )
+        
         try:
             # 1. Находим ВСЕ активные резервы водителя на направлении
             reservation_ids = self.db.get_driver_active_reservations(
                 session, direction_id, driver_user_id
             )
+            
             if not reservation_ids:
-                logger.error(
+                logger.warning(
                     "[TripActions] start_loading: нет активных резервов у водителя %s на направлении %s",
                     driver_user_id, direction_id
                 )
                 return False, "NO_ACTIVE_RESERVATIONS"
             
-            logger.info(
-                "[TripActions] start_loading: found %d reservations for driver %s",
-                len(reservation_ids), driver_user_id
-            )
-            
-            # 2. Получаем список заказов из ВСЕХ резервов
-            orders = self.db.get_orders_by_driver_and_direction(
-                session, direction_id, driver_user_id
-            )
-            logger.info(
-                "[TripActions] start_loading: direction_id=%s, orders=%d",
-                direction_id, len(orders)
-            )
-            
-            # 3. FSM переход для КАЖДОГО резерва: reservation_active → reservation_loading
+            # 2. FSM переходы reservation_active → reservation_loading
             for reservation_id in reservation_ids:
                 self.db.driver_reservation_start_loading(
                     session, reservation_id, driver_user_id
                 )
             
             logger.info(
-                "[TripActions] start_loading COMPLETED: direction_id=%s, driver_user_id=%s, orders=%d",
-                direction_id, driver_user_id, len(orders)
+                "[TripActions] start_loading COMPLETED: direction_id=%s, driver_user_id=%s, reservations=%d",
+                direction_id, driver_user_id, len(reservation_ids)
             )
-            return True, "Погрузка начата: %d заказов" % len(orders)
+            
+            return True, "Погрузка начата"
             
         except Exception as e:
             logger.exception("[TripActions] start_loading failed")
-            return False, "START_LOADING_FAILED: %s" % e
+            return False, f"START_LOADING_FAILED: {e}"
 
     def complete_loading(
         self,
