@@ -568,12 +568,11 @@ class DriverActions:
         user_id: int
     ) -> Tuple[bool, str]:
         """
-        Водитель открывает ячейку для погрузки (до создания рейса).
+        Водитель открывает ячейку.
         
-        Проверка:
-        1. Ячейка привязана к заказу
-        2. Заказ зарезервирован за этим водителем (stage_orders.reserved_by_driver_id)
-        3. У водителя есть активный резерв на это направление (driver_reservations)
+        Проверка авторизации:
+        - ДО создания рейса: stage_orders.reserved_by_driver_id
+        - ПОСЛЕ создания рейса: trips.driver_user_id (через stage_orders.trip_id)
         """
         logger.info("[DRIVER] open_cell cell=%s user=%s", cell_id, user_id)
 
@@ -596,28 +595,42 @@ class DriverActions:
             else:
                 raise DbLayerError(f"Ячейка {cell_id} не совпадает ни с source, ни с dest для заказа {order_id}")
 
-            # 4. Получаем direction_id из stage_orders
+            # 4. Получаем stage_order
             stage = self.db.get_stage_order(session, order_id, intent)
-            if not stage or not stage.get("direction_id"):
-                raise DbLayerError(f"Заказ {order_id} не привязан к направлению (leg={intent})")
+            if not stage:
+                raise DbLayerError(f"Заказ {order_id} не имеет stage_order (leg={intent})")
             
-            direction_id = stage["direction_id"]
+            direction_id = stage.get("direction_id")
+            trip_id = stage.get("trip_id")
 
-            # 5. ПРОВЕРКА: заказ зарезервирован за этим водителем
-            if stage.get("reserved_by_driver_id") != user_id:
+            # 5. ПРОВЕРКА АВТОРИЗАЦИИ ВОДИТЕЛЯ
+            is_authorized = False
+            
+            if trip_id:
+                trip = self.db.get_trip(session, trip_id)
+                if trip and trip["driver_user_id"] == user_id:
+                    is_authorized = True
+            elif stage.get("reserved_by_driver_id") == user_id:
+                is_authorized = True
+            
+            if not is_authorized:
                 raise DbLayerError(
-                    f"Заказ {order_id} не зарезервирован за водителем {user_id} "
-                    f"(reserved_by_driver_id={stage.get('reserved_by_driver_id')})"
+                    f"Заказ {order_id} не принадлежит водителю {user_id}  "
+                    f"(trip_id={trip_id}, reserved_by_driver_id={stage.get('reserved_by_driver_id')})"
                 )
 
-            # 6. ПРОВЕРКА: у водителя есть активный резерв на это направление
-            reservations = self.db.get_driver_active_reservations(
-                session, direction_id, user_id
-            )
-            if not reservations:
-                raise DbLayerError(
-                    f"У водителя {user_id} нет активных резервов на направлении {direction_id}"
+            # 6. ПРОВЕРКА: у водителя есть активный резерв ИЛИ активный рейс
+            if trip_id:
+                if not trip or trip["driver_user_id"] != user_id:
+                    raise DbLayerError(f"Рейс {trip_id} не принадлежит водителю {user_id}")
+            elif direction_id:
+                reservations = self.db.get_driver_active_reservations(
+                    session, direction_id, user_id
                 )
+                if not reservations:
+                    raise DbLayerError(
+                        f"У водителя {user_id} нет активных резервов на направлении {direction_id}"
+                    )
 
             # 7. Открываем ячейку (Locker FSM)
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
@@ -637,6 +650,7 @@ class DriverActions:
         except Exception as e:
             logger.error("[DRIVER] failed to open cell %s: %s", cell_id, str(e))
             return False, str(e)
+            return False, str(e)
 
     def close_cell_for_driver(
         self,
@@ -644,14 +658,6 @@ class DriverActions:
         cell_id: int,
         user_id: int
     ) -> Tuple[bool, str]:
-        """
-        Водитель закрывает ячейку после погрузки (до создания рейса).
-        
-        Проверка:
-        1. Ячейка привязана к заказу
-        2. Заказ зарезервирован за этим водителем
-        3. У водителя есть активный резерв на это направление
-        """
         logger.info("[DRIVER] close_cell cell=%s user=%s", cell_id, user_id)
 
         try:
@@ -675,26 +681,25 @@ class DriverActions:
             else:
                 intent = "unknown"
 
-            # 4. Получаем direction_id и проверяем резерв
+            # 4. Получаем stage и проверяем авторизацию
             stage = self.db.get_stage_order(session, order_id, intent)
             if stage:
-                direction_id = stage.get("direction_id")
+                trip_id = stage.get("trip_id")
                 
-                # Проверка что заказ зарезервирован за водителем
-                if stage.get("reserved_by_driver_id") != user_id:
+                # ПРОВЕРКА АВТОРИЗАЦИИ
+                is_authorized = False
+                
+                if trip_id:
+                    trip = self.db.get_trip(session, trip_id)
+                    if trip and trip["driver_user_id"] == user_id:
+                        is_authorized = True
+                elif stage.get("reserved_by_driver_id") == user_id:
+                    is_authorized = True
+                
+                if not is_authorized:
                     raise DbLayerError(
-                        f"Заказ {order_id} не зарезервирован за водителем {user_id}"
+                        f"Заказ {order_id} не принадлежит водителю {user_id}"
                     )
-                
-                # Проверка что есть активный резерв
-                if direction_id:
-                    reservations = self.db.get_driver_active_reservations(
-                        session, direction_id, user_id
-                    )
-                    if not reservations:
-                        raise DbLayerError(
-                            f"У водителя {user_id} нет активных резервов на направлении {direction_id}"
-                        )
 
             # 5. Обрабатываем в зависимости от intent
             if intent == "pickup":
@@ -1340,9 +1345,6 @@ class AccessCodeActions:
         user_id: int,
         leg: str
     ) -> Tuple[bool, str]:
-        """
-        Запрос кода доступа к ячейке.
-        """
         try:
             # 1. Загрузить заказ
             order = self.db.get_order(session, order_id)
@@ -1351,20 +1353,18 @@ class AccessCodeActions:
 
             # 2. Проверить статус
             allowed_statuses = {
-                "pickup": ["order_created", "order_courier1_assigned", "order_parcel_confirmed", "order_parcel_submitted"],
-                "delivery": ["order_arrived_at_post2", "order_courier2_assigned", "order_courier2_parcel_delivered"]
+                "pickup": ["order_created", "order_courier1_assigned", "order_parcel_confirmed"],
+                "delivery": ["order_in_transit_to_post2", "order_courier2_assigned", "order_courier2_parcel_delivered", "order_parcel_confirmed_post2"]
             }
             if order["status"] not in allowed_statuses[leg]:
                 return False, f"CODE_NOT_ALLOWED_IN_{order['status']}"
 
             # 3. Определить, кто авторизован
             authorized_user_id = None
-            
-            # ПОЛУЧИТЬ РОЛЬ ИЗ БАЗЫ
             user_role = self.db.get_user_role(session, user_id)
             
             if leg == "pickup":
-                # ✅ PICKUP (Постамат A)
+                # ✅ PICKUP
                 if order["pickup_type"] == "self":
                     if user_role == "client":
                         authorized_user_id = order["client_user_id"]
@@ -1385,24 +1385,24 @@ class AccessCodeActions:
                     else:
                         return False, "USER_NOT_AUTHORIZED"
                         
-            else:  
-                # ✅ DELIVERY (Постамат B):
+            else:  # delivery
+                # ✅ DELIVERY
                 if order["delivery_type"] == "self":
                     if user_role == "driver":
-                        trip_id = self.db.get_trip_id_by_order_id(session, order_id)
-                        if trip_id:
-                            trip = self.db.get_trip(session, trip_id)
+                        stage = self.db.get_stage_order(session, order_id, "delivery")
+                        if stage and stage.get("trip_id"):
+                            trip = self.db.get_trip(session, stage["trip_id"])
                             if trip and trip["driver_user_id"] == user_id:
                                 authorized_user_id = user_id
                     elif user_role == "recipient":
                         authorized_user_id = order.get("recipient_user_id")
                     else:
                         return False, "USER_NOT_AUTHORIZED"
-                else: 
+                else:
                     if user_role == "driver":
-                        trip_id = self.db.get_trip_id_by_order_id(session, order_id)
-                        if trip_id:
-                            trip = self.db.get_trip(session, trip_id)
+                        stage = self.db.get_stage_order(session, order_id, "delivery")
+                        if stage and stage.get("trip_id"):
+                            trip = self.db.get_trip(session, stage["trip_id"])
                             if trip and trip["driver_user_id"] == user_id:
                                 authorized_user_id = user_id
                     elif user_role == "courier":
@@ -1416,7 +1416,7 @@ class AccessCodeActions:
             if authorized_user_id != user_id:
                 return False, "USER_NOT_AUTHORIZED"
 
-            # 4. Проверить лимит (≤3 за 15 мин)
+            # 4. Проверить лимит
             recent = self.db.count_recent_access_code_requests(session, order_id, leg, 15)
             if recent >= 3:
                 return False, "TOO_MANY_CODE_REQUESTS"
@@ -1426,7 +1426,7 @@ class AccessCodeActions:
             if not cell_id:
                 return False, "CELL_ID_MISSING"
 
-            # 6. Генерация PIN и запись в базу
+            # 6. Генерация PIN
             pin, token_id = self.db.generate_and_store_access_token(
                 session, order_id, leg, cell_id, user_id, expires_minutes=15
             )

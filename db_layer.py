@@ -265,6 +265,25 @@ class DatabaseLayer:
             user_id,
         )
 
+    def cancel_driver_reservation(
+        self,
+        session: Session,
+        reservation_id: int,
+        driver_user_id: int,
+    ) -> bool:
+        """
+        Отмена резерва (FSM: reservation_loading → reservation_cancelled).
+        """
+        logger.debug("cancel_driver_reservation вызван: reservation_id=%s, driver_user_id=%s", reservation_id, driver_user_id)
+        
+        return self.call_fsm_action(
+            session,
+            "driver_reservations",
+            reservation_id,
+            "driver_reservation_cancel",
+            driver_user_id,
+        )
+
     # ---------- ORDER / ЗАКАЗЫ ----------
 
     def get_orders_in_trip(self, session: Session, trip_id: int) -> List[int]:
@@ -4440,7 +4459,6 @@ class DatabaseLayer:
     ) -> Tuple[bool, List[int], List[int], str]:
         """
         Проверка готовности рейса к завершению (посылки размещены в Пост2).
-        
         """
         logger.debug("validate_trip_for_completion вызван: trip_id=%s", trip_id)
         
@@ -4468,15 +4486,8 @@ class DatabaseLayer:
                 "order_parcel_missing",
                 "order_cancelled",
             ]            
-            # 4. Статусы ячеек            
-            expected_cell_status = "locker_occupied"            
             
-            excluded_cell_statuses = [
-                "locker_error",
-                "locker_maintenance",
-            ]            
-            
-            # 5. Проверка заказов            
+            # 4. Проверка заказов            
             blocked_ids: List[int] = []
             completed_ids: List[int] = []
             
@@ -4502,45 +4513,7 @@ class DatabaseLayer:
                 return False, blocked_ids, [], (
                     f"Нельзя завершить рейс: заказы {blocked_ids} не размещены в Пост2 "
                     f"(ожидался статус '{expected_order_status}')"
-                )            
-            
-            # 6. Проверка delivery ячеек (Пост2)            
-            delivery_cells = session.execute(
-                text("""
-                    SELECT 
-                        lc.id,
-                        lc.status,
-                        o.id as order_id
-                    FROM locker_cells lc
-                    JOIN orders o ON o.id = lc.current_order_id
-                    JOIN stage_orders so ON so.order_id = o.id
-                    WHERE so.trip_id = :trip_id
-                    AND lc.id = o.dest_cell_id
-                    AND o.status NOT IN :excluded_order_statuses
-                """),
-                {
-                    "trip_id": trip_id,
-                    "excluded_order_statuses": tuple(excluded_order_statuses)
-                }
-            ).fetchall()
-            
-            for cell_row in delivery_cells:
-                cell_id, cell_status, order_id = cell_row
-                
-                # Пропускаем проблемные ячейки
-                if cell_status in excluded_cell_statuses:
-                    logger.debug(
-                        "validate_trip_for_completion: ячейка %s в статусе '%s' — исключена",
-                        cell_id, cell_status
-                    )
-                    continue
-                
-                # Проверяем успешные ячейки
-                if cell_status != expected_cell_status:
-                    return False, [], [], (
-                        f"Delivery ячейка {cell_id} (заказ {order_id}) в статусе '{cell_status}', "
-                        f"ожидается '{expected_cell_status}'"
-                    )
+                )
             
             logger.info(
                 "validate_trip_for_completion: trip_id=%s — OK, completed=%d заказов",
