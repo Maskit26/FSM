@@ -4180,13 +4180,8 @@ class DatabaseLayer:
     ) -> List[Dict[str, Any]]:
         """
         Получить резервы у которых истёк таймаут до начала погрузки.
-        
-        Условия:
-        - status IN ('reservation_active', 'reservation_loading')
-        - expires_at < NOW()
         """
         logger.debug("get_expired_reservations вызван: threshold_minutes=%s", threshold_minutes)
-        
         try:
             rows = session.execute(text("""
                 SELECT
@@ -4197,32 +4192,56 @@ class DatabaseLayer:
                     dr.reserved_count,
                     dr.expires_at
                 FROM driver_reservations dr
-                WHERE dr.status IN ('reservation_active', 'reservation_loading')
+                WHERE dr.status = 'reservation_active'
                 AND dr.expires_at < NOW()
                 ORDER BY dr.expires_at ASC
             """)).fetchall()
             
-            reservations = [
-                {
-                    "reservation_id": row[0],
-                    "driver_user_id": row[1],
-                    "direction_id": row[2],
-                    "status": row[3],
-                    "reserved_count": row[4],
-                    "expires_at": row[5],
-                }
-                for row in rows
-            ]
+            reservations = [{
+                "reservation_id": row[0],
+                "driver_user_id": row[1],
+                "direction_id": row[2],
+                "status": row[3],
+                "reserved_count": row[4],
+                "expires_at": row[5],
+            } for row in rows]
             
-            logger.info("get_expired_reservations: найдено %d просроченных резервов", len(reservations))
+            if reservations:
+                logger.info("get_expired_reservations: найдено %d просроченных резервов", len(reservations))
+            else:
+                logger.debug("get_expired_reservations: просроченных резервов нет")
             return reservations
             
         except Exception as e:
             logger.error("get_expired_reservations завершился с ошибкой: %s", e)
             raise DbLayerError("get_expired_reservations failed: %s" % e) from e
 
-     
-
+    def expire_reservation_direct(
+        self,
+        session: Session,
+        reservation_id: int,
+        user_id: int = 999999,  # системный пользователь
+    ) -> int:
+        """
+        Истечение резерва: освободить заказы + FSM переход.
+        """
+        logger.debug("expire_reservation_direct вызван: reservation_id=%s", reservation_id)
+        try:
+            # 1. Освобождаем заказы (возврат в пул)
+            released_count = self.release_orders_from_reservation(session, reservation_id)
+            
+            # 2. FSM переход: reservation_active → reservation_expired
+            self.driver_reservation_expire(session, reservation_id, user_id)
+            
+            logger.info(
+                "expire_reservation_direct: reservation_id=%s, released=%d заказов",
+                reservation_id, released_count
+            )
+            return released_count
+            
+        except Exception as e:
+            logger.error("expire_reservation_direct завершился с ошибкой: %s", e)
+            raise DbLayerError("expire_reservation_direct failed: %s" % e) from e
 
     # ==================== РЕЙСЫ ====================
 

@@ -167,22 +167,21 @@ def process_instance(
                 with SessionLocal() as log_session:
                     try:
                         db.log_error_to_db(
-                            session=log_session, # Важно: передаем новую сессию
+                            session=log_session,
                             error_message=result.last_error,
                             entity_type=instance["entity_type"],
                             entity_id=instance["entity_id"],
                             action_name=instance["process_name"],
                             user_id=instance["requested_by_user_id"]
                         )
-                        log_session.commit() # Фиксируем лог немедленно
+                        log_session.commit()
                         logger.info("[FSM] Error log saved independently")
                     except Exception as log_e:
                         log_session.rollback()
                         logger.error("[FSM] Failed to save log_error_to_db: %s", log_e)
-                session.rollback() # Это отменит И открытие ячейки, И смену статуса заказа
+                session.rollback() 
                 
-                # Теперь нам нужно записать ошибку в базу, но в НОВОЙ транзакции, 
-                # чтобы не потерять запись о провале.
+                # записать ошибку в НОВОЙ транзакции
                 db.update_fsm_instance(
                     session=session,
                     instance_id=instance["id"],
@@ -234,7 +233,7 @@ def process_instance(
 
         except Exception:
             logger.exception("[FSM] CRITICAL ERROR instance_id=%s", instance["id"])
-            raise  # чтобы rollback сработал
+            raise
 
 # ================== STUCK CHECK ==================
 
@@ -271,10 +270,47 @@ def main():
     db = DatabaseLayer()
 
     logger.info("[FSM] worker started")
-    logger.info("[FSM] processes: %s", list(PROCESS_DEFS.keys()))    
+    logger.info("[FSM] processes: %s", list(PROCESS_DEFS.keys()))
+    last_reservation_expire_check = 0    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while True:
-            try:        
+            try: 
+                # === ПРОВЕРКА ПРОСРОЧЕННЫХ РЕЗЕРВОВ (каждые 5 минут) ===
+                now = time.time()
+                if now - last_reservation_expire_check >= 300: 
+                    with get_db_session() as session_inner:
+                        expired = db.get_expired_reservations(session_inner)
+                        
+                        for res in expired:
+                            logger.info(
+                                "[AUTO_EXPIRE] Истёк резерв reservation_id=%s, driver=%s, direction=%s",
+                                res["reservation_id"], res["driver_user_id"], res["direction_id"]
+                            )
+                            try:                                
+                                released = db.expire_reservation_direct(
+                                    session_inner,
+                                    res["reservation_id"],
+                                    999999  # системный пользователь
+                                )
+                                logger.info(
+                                    "[AUTO_EXPIRE] reservation_id=%s: released=%d заказов, статус=reservation_expired",
+                                    res["reservation_id"], released
+                                )
+                                
+                            except Exception as e:
+                                session_inner.rollback()
+                                logger.exception(
+                                    "[AUTO_EXPIRE] failed reservation_id=%s: %s",
+                                    res["reservation_id"], e
+                                )
+                                continue
+                        session_inner.commit()
+                        
+                    if expired:
+                        logger.info("[AUTO_EXPIRE] Обработано %d просроченных резервов", len(expired))
+                    
+                    last_reservation_expire_check = now
+
                 # Получаем готовые инстансы
                 with get_db_session() as session:
                     rows = db.fetch_ready_fsm_instances(
