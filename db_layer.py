@@ -61,18 +61,13 @@ class DatabaseLayer:
         user_id: int,
         extra_id: Optional[str] = None,
     ) -> bool:
-        """Стабильный вызов процедуры через raw_cursor с очисткой протокола."""
-        
-        # Защита от NULL (SQLAlchemy None -> MySQL NULL может вешать драйвер)
         safe_extra_id = extra_id if extra_id is not None else ""
 
         try:
-            # Используем DBAPI курсор для прямого взаимодействия
             connection = session.connection().connection
             cursor = connection.cursor()
 
             try:
-                # Вызываем процедуру
                 cursor.callproc("fsm_perform_action", [
                     entity_type, 
                     entity_id, 
@@ -81,12 +76,10 @@ class DatabaseLayer:
                     safe_extra_id
                 ])
 
-                # Вычитываем первый набор данных (результат SELECT из процедуры)
                 results = []
                 for result in cursor.stored_results():
                     results.extend(result.fetchall())
 
-                # Важно: поглощаем все оставшиеся наборы данных, чтобы не было 'Commands out of sync'
                 while cursor.nextset():
                     pass
 
@@ -96,7 +89,6 @@ class DatabaseLayer:
                         logger.debug("[FSM] Success: %s", result_text)
                         return True
                     else:
-                        # Если процедура вернула текст ошибки через SELECT
                         raise DbLayerError(f"FSM Procedure returned: {result_text}")
                 
                 raise DbLayerError("FSM Procedure: No result returned")
@@ -104,9 +96,41 @@ class DatabaseLayer:
             finally:
                 cursor.close()
 
-        except Exception as e:            
-            logger.error("[FSM] Call failed: %s", e)
+        except Exception as e:
+            logger.error("[FSM] Call failed: %s", e)                       
             raise DbLayerError(f"FSM {action_name} failed: {e}") from e
+
+    def log_error_to_db(
+        self,
+        session: Session,
+        error_message: str,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[int] = None,
+        action_name: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Записать общую ошибку бэкенда в fsm_errors_log."""
+        logger.debug( "log_error_to_db вызван: error=%s ", error_message[:100] if error_message else None)
+        
+        try:
+            session.execute(text( """
+                INSERT INTO fsm_errors_log (
+                    error_time, error_message, entity_type, entity_id, action_name, user_id
+                ) VALUES (
+                    NOW(), :error_message, :entity_type, :entity_id, :action_name, :user_id
+                )
+            """ ), {
+                "error_message": error_message,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "action_name": action_name,
+                "user_id": user_id,
+            })
+            
+            logger.debug( "log_error_to_db: ошибка записана в fsm_errors_log ")
+            
+        except Exception as e:
+            logger.error( "log_error_to_db завершился с ошибкой: %s ", e)
 
     # ==================== FSM ОБЁРТКИ (TRIP / ORDER / LOCKER) ====================
 
@@ -4146,6 +4170,58 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("release_orders_from_reservation завершился с ошибкой: %s", e)
             raise DbLayerError("release_orders_from_reservation failed: %s" % e) from e
+
+    # ================ сброс резерва ================
+
+    def get_expired_reservations(
+        self,
+        session: Session,
+        threshold_minutes: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить резервы у которых истёк таймаут до начала погрузки.
+        
+        Условия:
+        - status IN ('reservation_active', 'reservation_loading')
+        - expires_at < NOW()
+        """
+        logger.debug("get_expired_reservations вызван: threshold_minutes=%s", threshold_minutes)
+        
+        try:
+            rows = session.execute(text("""
+                SELECT
+                    dr.id,
+                    dr.driver_user_id,
+                    dr.direction_id,
+                    dr.status,
+                    dr.reserved_count,
+                    dr.expires_at
+                FROM driver_reservations dr
+                WHERE dr.status IN ('reservation_active', 'reservation_loading')
+                AND dr.expires_at < NOW()
+                ORDER BY dr.expires_at ASC
+            """)).fetchall()
+            
+            reservations = [
+                {
+                    "reservation_id": row[0],
+                    "driver_user_id": row[1],
+                    "direction_id": row[2],
+                    "status": row[3],
+                    "reserved_count": row[4],
+                    "expires_at": row[5],
+                }
+                for row in rows
+            ]
+            
+            logger.info("get_expired_reservations: найдено %d просроченных резервов", len(reservations))
+            return reservations
+            
+        except Exception as e:
+            logger.error("get_expired_reservations завершился с ошибкой: %s", e)
+            raise DbLayerError("get_expired_reservations failed: %s" % e) from e
+
+     
 
 
     # ==================== РЕЙСЫ ====================

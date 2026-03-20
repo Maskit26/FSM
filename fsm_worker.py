@@ -151,7 +151,8 @@ def process_instance(
                     instance=instance,
                 )
             except Exception as step_error:
-                logger.exception("[FSM] step error instance_id=%s", instance["id"])
+                logger.exception("[FSM] step error instance_id=%s", instance["id"])               
+
                 result = FsmStepResult(
                     new_state="FAILED",
                     last_error=str(step_error),
@@ -162,6 +163,22 @@ def process_instance(
             # ================= UPDATE INSTANCE =================
             if result.new_state == "FAILED":
                 logger.warning("[FSM] Step failed. Rolling back everything for instance %s", instance["id"])
+                
+                with SessionLocal() as log_session:
+                    try:
+                        db.log_error_to_db(
+                            session=log_session, # Важно: передаем новую сессию
+                            error_message=result.last_error,
+                            entity_type=instance["entity_type"],
+                            entity_id=instance["entity_id"],
+                            action_name=instance["process_name"],
+                            user_id=instance["requested_by_user_id"]
+                        )
+                        log_session.commit() # Фиксируем лог немедленно
+                        logger.info("[FSM] Error log saved independently")
+                    except Exception as log_e:
+                        log_session.rollback()
+                        logger.error("[FSM] Failed to save log_error_to_db: %s", log_e)
                 session.rollback() # Это отменит И открытие ячейки, И смену статуса заказа
                 
                 # Теперь нам нужно записать ошибку в базу, но в НОВОЙ транзакции, 
@@ -257,7 +274,7 @@ def main():
     logger.info("[FSM] processes: %s", list(PROCESS_DEFS.keys()))    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while True:
-            try:                
+            try:        
                 # Получаем готовые инстансы
                 with get_db_session() as session:
                     rows = db.fetch_ready_fsm_instances(

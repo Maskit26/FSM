@@ -836,6 +836,52 @@ def _handle_driver_reservation_cancel(
         attempts_increment=1
     )
 
+def _handle_driver_reservation_expire(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Обработчик истечения таймаута резерва.
+    """
+    reservation_id = instance["entity_id"]
+    driver_user_id = instance["requested_by_user_id"]
+    
+    logger.info(
+        "[FSM] driver_reservation_expire: reservation_id=%s, driver_user_id=%s",
+        reservation_id, driver_user_id
+    )
+    
+    actions: TripActions = ctx["trip_actions"]
+    
+    # Вызываем экшен
+    success, msg = actions.expire_reservation(
+        session, reservation_id, driver_user_id
+    )
+    
+    if not success:
+        logger.error(
+            "[FSM] driver_reservation_expire FAILED: reservation_id=%s, error=%s",
+            reservation_id, msg
+        )
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=msg,
+            attempts_increment=1
+        )
+    
+    logger.info(
+        "[FSM] driver_reservation_expire COMPLETED: reservation_id=%s",
+        reservation_id
+    )
+    
+    return FsmStepResult(
+        new_state="COMPLETED",
+        last_error=None,
+        attempts_increment=1
+    )
+
 # ==================== PROCESS REGISTRY ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "order_creation": {"PENDING": _handle_order_creation_pending},
