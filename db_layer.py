@@ -4034,7 +4034,7 @@ class DatabaseLayer:
                 return False, [], f"Резерв {reservation_id} не принадлежит водителю {driver_user_id}"
             
             # 3. Проверка статуса (только reservation_active)
-            if reservation_status != 'reservation_active':
+            if reservation_status not in ('reservation_active', 'reservation_loading'):
                 return False, [], (
                     f"Нельзя начать погрузку: статус резерва '{reservation_status}' "
                     f"(требуется 'reservation_active')"
@@ -4094,9 +4094,6 @@ class DatabaseLayer:
         session: Session,
         reservation_id: int,
     ) -> Tuple[bool, List[int], str]:
-        """
-        Проверить можно ли отменить резерв.
-        """
         logger.debug("validate_reservation_for_cancellation вызван: reservation_id=%s", reservation_id)
         
         try:
@@ -4113,14 +4110,19 @@ class DatabaseLayer:
                 return False, [], f"Резерв {reservation_id} не найден"
             
             driver_user_id, direction_id, reservation_status = reservation
+            success, orders, error = self.get_orders_by_reservation(
+                session, 
+                reservation_id,
+                driver_user_id,
+            )
             
-            # 2. Получаем заказы резерва
-            orders = self.get_orders_by_reservation(session, reservation_id)
+            if not success:
+                return False, [], error
             
             if not orders:
                 return False, [], "В резерве нет заказов"
             
-            # 3. Проверяем статусы заказов
+            # 2. Проверяем статусы заказов
             allowed_status = "order_parcel_confirmed"
             blocked_ids: List[int] = []
             
@@ -5124,6 +5126,110 @@ class DatabaseLayer:
 
     # ==================== СЕРВИСНЫЕ ПРОЦЕДУРЫ ====================
 
+    # ==================== Сброс ячеек постааматов ================
+    def ensure_locker_cleanup_instance(
+        self,
+        session: Session,
+        threshold_minutes: int = 30,
+        user_id: int = 999999
+    ) -> bool:
+        """
+        Проверяет наличие активного инстанса locker_cleanup.
+        """
+        logger.debug(
+            f"ensure_locker_cleanup_instance: threshold={threshold_minutes} мин"
+        )
+        
+        try:
+            # 1. Проверяем, нет ли уже активного инстанса
+            existing = session.execute(text("""
+                SELECT id FROM server_fsm_instances
+                WHERE process_name = 'locker_cleanup'
+                AND fsm_state NOT IN ('COMPLETED', 'FAILED')
+                LIMIT 1
+            """)).fetchone()
+            
+            if existing:
+                logger.debug("ensure_locker_cleanup_instance: активный инстанс уже существует (пропущено)")
+                return False  # ← Не создан, уже существовал
+            
+            # 2. Создаём новый инстанс
+            self.enqueue_fsm_instance(
+                session=session,
+                entity_type="locker",
+                entity_id=0,  # 0 = все ячейки
+                process_name="locker_cleanup",
+                fsm_state="PENDING",
+                requested_by_user_id=user_id,
+                requested_user_role="system",
+                metadata={"threshold_minutes": threshold_minutes}
+            )
+            
+            logger.info("ensure_locker_cleanup_instance: создан новый инстанс locker_cleanup")  # ← Логируем только здесь
+            return True  # ← Создан
+            
+        except Exception as e:
+            logger.error(f"ensure_locker_cleanup_instance failed: {e}")
+            return False
+
+    def cleanup_closed_empty_lockers(
+        self,
+        session: Session,
+        threshold_minutes: int = 30,
+        user_id: int = 999999
+    ) -> Tuple[int, Optional[str]]:
+        """
+        Находит ячейки в статусе locker_closed_empty, висящие там дольше threshold_minutes,
+        и вызывает для них FSM locker_reset.
+        
+        Returns:
+            (количество_очищенных, ошибка)
+        """
+        logger.debug(f"cleanup_closed_empty_lockers: threshold={threshold_minutes} мин")
+        
+        try:
+            # 1. Находим ячейки, которые висят в статусе дольше порога
+            rows = session.execute(text("""
+                SELECT lc.id
+                FROM locker_cells lc
+                JOIN fsm_action_logs fal ON fal.entity_id = lc.id AND fal.entity_type = 'locker'
+                WHERE lc.status = 'locker_closed_empty'
+                AND fal.action_name = 'locker_close_pickup'
+                AND fal.created_at < NOW() - INTERVAL :threshold MINUTE
+                AND lc.id NOT IN (
+                    SELECT fal2.entity_id
+                    FROM fsm_action_logs fal2
+                    WHERE fal2.entity_type = 'locker'
+                    AND fal2.action_name IN ('locker_reset', 'locker_open_locker')
+                    AND fal2.created_at > fal.created_at
+                )
+            """), {"threshold": threshold_minutes}).fetchall()
+            
+            cell_ids = [row[0] for row in rows]
+            
+            if not cell_ids:
+                logger.info("cleanup_closed_empty_lockers: нет ячеек для очистки")
+                return 0, None
+            
+            # 2. Для каждой ячейки вызываем FSM locker_reset
+            cleaned_count = 0
+            for cell_id in cell_ids:
+                try:
+                    self.reset_locker(session, cell_id, user_id)
+                    cleaned_count += 1
+                except Exception as e:
+                    logger.error(f"cleanup_closed_empty_lockers: failed to reset cell {cell_id}: {e}")
+                    # Не прерываем цикл, продолжаем с другими ячейками
+            
+            logger.info(f"cleanup_closed_empty_lockers: очищено {cleaned_count} ячеек")
+            return cleaned_count, None
+            
+        except Exception as e:
+            logger.error(f"cleanup_closed_empty_lockers failed: {e}")
+            return 0, str(e)
+
+
+    # ====================== Очистка базы данных ===================  
     def clear_test_data(self) -> bool:
         """
         Вызвать хранимую процедуру clear_test_data().

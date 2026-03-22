@@ -18,6 +18,7 @@ from fsm_actions import (
     DriverActions,
     AccessCodeActions,
     TripActions,
+    LockerActions,
 )
 
 logger = logging.getLogger(__name__)
@@ -882,6 +883,38 @@ def _handle_driver_reservation_expire(
         attempts_increment=1
     )
 
+# ==================== Сброс ячеек постаматов ============
+def _handle_locker_cleanup(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Системный процесс очистки ячеек в статусе locker_closed_empty.
+    Ищет ячейки, висящие в этом статусе дольше threshold_minutes.
+    """
+    user_id = instance["requested_by_user_id"]
+    metadata = instance.get("metadata", {})
+    threshold_minutes = metadata.get("threshold_minutes", 30)
+    
+    logger.info(f"[FSM] locker_cleanup: threshold={threshold_minutes} мин, user_id={user_id}")
+    
+    # Вызываем экшен
+    actions: LockerActions = ctx["locker_actions"]
+    success, msg = actions.cleanup_closed_empty_lockers(
+        session=session,
+        threshold_minutes=threshold_minutes,
+        user_id=user_id
+    )
+    
+    if not success:
+        logger.error(f"[FSM] locker_cleanup FAILED: {msg}")
+        return FsmStepResult(new_state="FAILED", last_error=msg, attempts_increment=1)
+    
+    logger.info(f"[FSM] locker_cleanup COMPLETED: {msg}")
+    return FsmStepResult(new_state="COMPLETED", attempts_increment=1)
+
 # ==================== PROCESS REGISTRY ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "order_creation": {"PENDING": _handle_order_creation_pending},
@@ -904,6 +937,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "driver_reservation_start_loading": {"PENDING": _handle_driver_reservation_start_loading},
     "direction_complete_loading": {"PENDING": _handle_direction_complete_loading},
     "driver_reservation_cancel": {"PENDING": _handle_driver_reservation_cancel},
+    "locker_cleanup": {"PENDING": _handle_locker_cleanup},
 }
 
 
@@ -919,6 +953,7 @@ def build_actions_context(db: DatabaseLayer) -> Dict[str, Any]:
         "driver_actions": DriverActions(db),
         "access_code_actions": AccessCodeActions(db),
         "trip_actions": TripActions(db),
+        "locker_actions": LockerActions(db),
     }
 
 

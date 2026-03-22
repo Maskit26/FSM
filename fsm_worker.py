@@ -332,7 +332,23 @@ def main():
                     f.result()  # проброс исключений
 
                 # Проверяем зависшие инстансы
-                check_stuck_instances(db)                
+                check_stuck_instances(db)   
+
+                # ================= НОВОЕ: Создаём инстанс locker_cleanup периодически =================
+                current_time = time.time()
+                if current_time - _last_cleanup_check >= LOCKER_CLEANUP_INTERVAL_SECONDS:
+                    try:
+                        with get_db_session() as session:
+                            # Вызываем метод DB layer вместо прямого SQL
+                            db.ensure_locker_cleanup_instance(
+                                session=session,
+                                threshold_minutes=30
+                            )                           
+                        
+                        _last_cleanup_check = current_time
+                        
+                    except Exception as e:
+                        logger.error(f"[FSM] Ошибка создания locker_cleanup: {e}")             
 
             except DbLayerError:
                 logger.exception("[FSM] DbLayerError")

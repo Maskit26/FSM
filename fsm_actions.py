@@ -1684,4 +1684,35 @@ class TripActions:
             logger.exception("[TripActions] cancel_reservation failed")
             return False, "CANCEL_RESERVATION_FAILED: %s" % e
 
+# ================== Очистка ячеек постаматов ===========================
+class LockerActions:
+    """Действия для управления ячейками (системные операции)."""
     
+    def cleanup_closed_empty_lockers(
+        self,
+        session: Session,
+        threshold_minutes: int = 30,
+        user_id: int = 999999
+    ) -> Tuple[bool, str]:
+        """
+        Системная очистка ячеек в статусе locker_closed_empty.
+        Ищет ячейки, висящие в этом статусе дольше threshold_minutes.
+        """
+        logger.info(
+            f"[LockerActions] cleanup_closed_empty_lockers: threshold={threshold_minutes} мин"
+        )
+        
+        cleaned_count, error = self.db.cleanup_closed_empty_lockers(
+            session=session,
+            threshold_minutes=threshold_minutes,
+            user_id=user_id
+        )
+        
+        if error:
+            logger.error(f"[LockerActions] cleanup_closed_empty_lockers FAILED: {error}")
+            return False, error
+        
+        logger.info(
+            f"[LockerActions] cleanup_closed_empty_lockers COMPLETED: очищено {cleaned_count} ячеек"
+        )
+        return True, f"Очищено {cleaned_count} ячеек"
