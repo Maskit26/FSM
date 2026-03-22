@@ -1520,39 +1520,25 @@ class TripActions:
     def start_loading(
         self,
         session: Session,
-        direction_id: int,
+        reservation_id: int,
         driver_user_id: int,
     ) -> Tuple[bool, str]:
         """
-        Водитель начинает погрузку по направлению (FSM переходы).
+        Водитель начинает погрузку для КОНКРЕТНОГО резерва.
         """
         logger.info(
-            "[TripActions] start_loading: direction_id=%s, driver_user_id=%s",
-            direction_id, driver_user_id
+            "[TripActions] start_loading: reservation_id=%s, driver_user_id=%s",
+            reservation_id, driver_user_id
         )
         
         try:
-            # 1. Находим ВСЕ активные резервы водителя на направлении
-            reservation_ids = self.db.get_driver_active_reservations(
-                session, direction_id, driver_user_id
+            self.db.driver_reservation_start_loading(
+                session, reservation_id, driver_user_id
             )
             
-            if not reservation_ids:
-                logger.warning(
-                    "[TripActions] start_loading: нет активных резервов у водителя %s на направлении %s",
-                    driver_user_id, direction_id
-                )
-                return False, "NO_ACTIVE_RESERVATIONS"
-            
-            # 2. FSM переходы reservation_active → reservation_loading
-            for reservation_id in reservation_ids:
-                self.db.driver_reservation_start_loading(
-                    session, reservation_id, driver_user_id
-                )
-            
             logger.info(
-                "[TripActions] start_loading COMPLETED: direction_id=%s, driver_user_id=%s, reservations=%d",
-                direction_id, driver_user_id, len(reservation_ids)
+                "[TripActions] start_loading COMPLETED: reservation_id=%s",
+                reservation_id
             )
             
             return True, "Погрузка начата"

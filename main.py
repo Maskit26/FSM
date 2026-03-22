@@ -705,42 +705,31 @@ async def get_trip_orders(trip_id: int, db: DatabaseLayer = Depends(get_db)):
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/api/driver/direction/{direction_id}/start-loading", response_model=dict)
-async def start_direction_loading(
-    direction_id: int,
+@app.post("/api/driver/reservation/{reservation_id}/start-loading", response_model=dict)
+async def start_reservation_loading(
+    reservation_id: int,
     driver_user_id: int,
     db: DatabaseLayer = Depends(get_db)
 ):
     """
-    Начать погрузку по направлению.
+    Начать погрузку для КОНКРЕТНОГО резерва.
     """
     with get_db_session(read_only=False) as session:
         try:
-            # 1. Проверка роли (только водитель)
-            user_role = db.get_user_role(session, driver_user_id)
-            if user_role != 'driver':
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"USER_NOT_AUTHORIZED: роль '{user_role}' не может начать погрузку"
-                )
-            
-            # 2. Получить список заказов водителя на направлении (для фронта)
-            orders = db.get_orders_by_driver_and_direction(
-                session, direction_id, driver_user_id
+            # 2. Проверка резерва (существует + принадлежит водителю + статус)
+            success, orders, error = db.get_orders_by_reservation(
+                session, reservation_id, driver_user_id
             )
             
-            if not orders:
-                raise HTTPException(
-                    status_code=400,
-                    detail="NO_ORDERS_FOUND: У водителя нет заказов на этом направлении"
-                )
+            if not success:
+                raise HTTPException(status_code=400, detail=error)
             
-            # 3. Запустить FSM процесс direction_start_loading
+            # 3. Запустить FSM процесс driver_reservation_start_loading
             fsm_instance_id = db.enqueue_fsm_instance(
                 session,
-                entity_type='direction',
-                entity_id=direction_id,
-                process_name='direction_start_loading',
+                entity_type='driver_reservations',
+                entity_id=reservation_id,
+                process_name='driver_reservation_start_loading',
                 fsm_state='PENDING',
                 requested_by_user_id=driver_user_id,
                 requested_user_role='driver',
@@ -751,12 +740,10 @@ async def start_direction_loading(
             
             return {
                 "success": True,
-                "direction_id": direction_id,
-                "driver_user_id": driver_user_id,
+                "reservation_id": reservation_id,
                 "orders": orders,
                 "orders_count": len(orders),
-                "fsm_instance_id": fsm_instance_id,
-                "message": f"Погрузка начата: {len(orders)} заказов"
+                "message": f"Погрузка начата: {len(orders)} заказов в резерве {reservation_id}"
             }
             
         except HTTPException:
@@ -765,7 +752,7 @@ async def start_direction_loading(
             raise HTTPException(
                 status_code=500,
                 detail=f"START_LOADING_FAILED: {str(e)}"
-            )            
+            )   
 
 @app.post("/api/driver/trip/{trip_id}/start-trip", response_model=dict)
 async def start_trip_endpoint(

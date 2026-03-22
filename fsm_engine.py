@@ -670,7 +670,7 @@ def _handle_direction_reserve_slot(
         attempts_increment=1
     )
 
-def _handle_direction_start_loading(
+def _handle_driver_reservation_start_loading(
     db: DatabaseLayer,
     session: Session,
     ctx: Dict[str, Any],
@@ -679,18 +679,18 @@ def _handle_direction_start_loading(
     """
     Обработчик начала погрузки водителем.
     """
-    direction_id = instance["entity_id"]
+    reservation_id = instance["entity_id"]
     driver_user_id = instance["requested_by_user_id"]
     user_role = instance.get("requested_user_role", "")
     
     logger.info(
-        "[FSM] direction_start_loading: direction_id=%s, driver_user_id=%s, role=%s",
-        direction_id, driver_user_id, user_role
+        "[FSM] driver_reservation_start_loading: direction_id=%s, driver_user_id=%s, role=%s",
+        reservation_id, driver_user_id, user_role
     )
     # 1. Проверка роли (только водитель)
     if user_role != "driver":
         logger.error(
-            "[FSM] direction_start_loading: доступ запрещён для роли %s",
+            "[FSM] driver_reservation_start_loading: доступ запрещён для роли %s",
             user_role
         )
         return FsmStepResult(
@@ -702,12 +702,12 @@ def _handle_direction_start_loading(
     
     # 2. Вызываем экшен
     success, msg = actions.start_loading(
-        session, direction_id, driver_user_id
+        session, reservation_id, driver_user_id
     )
     if not success:
         logger.error(
-            "[FSM] direction_start_loading FAILED: direction_id=%s, error=%s",
-            direction_id, msg
+            "[FSM] driver_reservation_start_loading FAILED: direction_id=%s, error=%s",
+            reservation_id, msg
         )
         return FsmStepResult(
             new_state="FAILED",
@@ -716,7 +716,7 @@ def _handle_direction_start_loading(
         )
     logger.info(
         "[FSM] direction_start_loading COMPLETED: direction_id=%s",
-        direction_id
+        reservation_id
     )
     return FsmStepResult(
         new_state="COMPLETED",
@@ -901,7 +901,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "bind_order_to_trip": {"PENDING": _handle_bind_order_to_trip},
     "report_error": {"PENDING": _handle_report_error},
     "direction_reserve_slot": {"PENDING": _handle_direction_reserve_slot},
-    "direction_start_loading": {"PENDING": _handle_direction_start_loading},
+    "driver_reservation_start_loading": {"PENDING": _handle_driver_reservation_start_loading},
     "direction_complete_loading": {"PENDING": _handle_direction_complete_loading},
     "driver_reservation_cancel": {"PENDING": _handle_driver_reservation_cancel},
 }

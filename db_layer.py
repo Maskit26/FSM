@@ -844,7 +844,7 @@ class DatabaseLayer:
                     FROM driver_reservations dr
                     JOIN directions d ON d.id = dr.direction_id
                     WHERE dr.driver_user_id = :driver_user_id
-                    AND dr.status IN ('active', 'loading')
+                    AND dr.status IN ('reservation_active', 'reservation_loading')
                     ORDER BY dr.reserved_at DESC
                 """),
                 {"driver_user_id": driver_user_id},
@@ -4004,13 +4004,43 @@ class DatabaseLayer:
         self,
         session: Session,
         reservation_id: int,
-    ) -> List[Dict[str, Any]]:
+        driver_user_id: int,
+    ) -> Tuple[bool, List[Dict[str, Any]], str]:
         """
-        Получить все заказы в резерве.
+        Получить заказы для начала погрузки.
         """
-        logger.debug("get_orders_by_reservation вызван: reservation_id=%s", reservation_id)
+        logger.debug(
+            "get_orders_by_reservation вызван: reservation_id=%s, driver_user_id=%s",
+            reservation_id, driver_user_id
+        )
         
         try:
+            # 1. Проверка резерва (существует + статус + водитель)
+            reservation = session.execute(text("""
+                SELECT dr.driver_user_id, dr.direction_id, dr.status
+                FROM driver_reservations dr
+                WHERE dr.id = :reservation_id
+            """), {
+                "reservation_id": reservation_id,
+            }).fetchone()
+            
+            if not reservation:
+                return False, [], f"Резерв {reservation_id} не найден"
+            
+            res_driver_id, direction_id, reservation_status = reservation
+            
+            # 2. Проверка что резерв принадлежит водителю
+            if res_driver_id != driver_user_id:
+                return False, [], f"Резерв {reservation_id} не принадлежит водителю {driver_user_id}"
+            
+            # 3. Проверка статуса (только reservation_active)
+            if reservation_status != 'reservation_active':
+                return False, [], (
+                    f"Нельзя начать погрузку: статус резерва '{reservation_status}' "
+                    f"(требуется 'reservation_active')"
+                )
+            
+            # 4. Получаем заказы резерва
             rows = session.execute(text("""
                 SELECT
                     so.order_id,
@@ -4025,9 +4055,14 @@ class DatabaseLayer:
                 JOIN orders o ON o.id = so.order_id
                 WHERE so.reservation_id = :reservation_id
                 AND so.leg = 'pickup'
+                AND so.reserved_by_driver_id = :driver_user_id
             """), {
                 "reservation_id": reservation_id,
+                "driver_user_id": driver_user_id,
             }).fetchall()
+            
+            if not rows:
+                return False, [], "В резерве нет заказов"
             
             orders = [
                 {
@@ -4043,12 +4078,16 @@ class DatabaseLayer:
                 for row in rows
             ]
             
-            logger.info("get_orders_by_reservation: reservation_id=%s, orders=%d", reservation_id, len(orders))
-            return orders
+            logger.info(
+                "get_orders_by_reservation: reservation_id=%s, orders=%d",
+                reservation_id, len(orders)
+            )
+            
+            return True, orders, ""
             
         except Exception as e:
             logger.error("get_orders_by_reservation завершился с ошибкой: %s", e)
-            raise DbLayerError("get_orders_by_reservation failed: %s" % e) from e
+            raise DbLayerError(f"get_orders_by_reservation failed: {e}") from e
 
     def validate_reservation_for_cancellation(
         self,
