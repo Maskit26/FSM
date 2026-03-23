@@ -806,29 +806,58 @@ class DriverActions:
             logger.error("[DRIVER] report_error failed: %s", e)
             return False, str(e)
 
-    def start_trip(self, session: Session, trip_id: int, user_id: int) -> Tuple[bool, str]:
-        logger.info("[DRIVER] start_trip trip=%s user=%s", trip_id, user_id)
-
-        try:            
-            can_start, blocked, transit_ids, error = (
+    def start_trip(
+        self,
+        session: Session,
+        trip_id: int,
+        user_id: int
+    ) -> Tuple[bool, str]:
+        """        
+        1 Делает FSM переход рейса: trip_assigned → trip_in_progress
+        2. Делает FSM переход для каждого заказа: order_picked_up_from_post1 → order_in_transit_to_post2
+        """
+        logger.info(
+            "[DriverActions] start_trip: trip_id=%s, user_id=%s ",
+            trip_id, user_id
+        )
+        
+        try:
+            # 1. Проверка готовности рейса
+            can_start, blocked_order_ids, transit_order_ids, error = (
                 self.db.validate_and_get_orders_for_trip_start(session, trip_id)
-            ) 
+            )
             
             if not can_start:
-                logger.warning("[DRIVER] start_trip blocked: %s", error)
+                logger.warning(
+                    "[DriverActions] start_trip blocked: trip_id=%s, error=%s ",
+                    trip_id, error
+                )
                 return False, error
-
+            
+            # 2. FSM переход для рейса: trip_assigned → trip_in_progress
             self.db.start_trip(session, trip_id, user_id)
-
-            for order_id in transit_ids:
+            logger.info(
+                "[DriverActions] start_trip: trip %s transitioned to trip_in_progress ",
+                trip_id
+            )
+            
+            # 3. FSM переход для КАЖДОГО заказа в рейсе
+            for order_id in transit_order_ids:
                 self.db.order_start_transit(session, order_id, user_id)
-
-            logger.info("[DRIVER] trip %s started: %d orders to transit", trip_id, len(transit_ids))
-            return True, ""
+                logger.debug(
+                    "[DriverActions] start_trip: order %s transitioned to order_in_transit_to_post2 ",
+                    order_id
+                )
+            
+            logger.info(
+                "[DriverActions] start_trip COMPLETED: trip_id=%s, orders=%d ",
+                trip_id, len(transit_order_ids)
+            )
+            return True, f"Рейс {trip_id} начат: {len(transit_order_ids)} заказов в транзите"
             
         except Exception as e:
-            logger.error("[DRIVER] failed to start trip %s: %s", trip_id, str(e))
-            return False, str(e)
+            logger.exception("[DriverActions] start_trip failed ")
+            return False, f"START_TRIP_FAILED: {e}"
 
     def arrive_at_destination(
         self,
@@ -1557,11 +1586,10 @@ class TripActions:
         Водитель завершает погрузку по направлению.
         1. Проверяет что нет открытых ячеек
         2. Находит ВСЕ активные резервы водителя на направлении
-        3. Определяет фактически забранные заказы 
+        3. Определяет фактически забранные заказы
         4. Проверяет что есть хотя бы 1 забранный заказ
-        5. Создаёт ОДИН рейс (trip) для ВСЕХ забранных заказов
-        6. Освобождает не забранные заказы (возврат в пул направления)
-        7. Обновляет FSM reservation_loading → reservation_completed
+        5. Освобождает не забранные заказы (возврат в пул направления)
+        6. Обновляет FSM reservation_loading → reservation_completed
         """
         logger.info(
             "[TripActions] complete_loading: direction_id=%s, driver_user_id=%s",
@@ -1596,17 +1624,7 @@ class TripActions:
             # 4. ПРОВЕРКА: >= 1 заказа
             if not picked_order_ids:
                 return False, "NO_ORDERS_PICKED: Невозможно создать рейс с 0 заказов"
-            
-            # 5. Создаём ОДИН рейс для ВСЕХ забранных заказов
-            trip_id = self.db.create_trip_for_loading(
-                session, direction_id, driver_user_id, picked_order_ids
-            )
-            
-            logger.info(
-                "[TripActions] complete_loading: created trip_id=%s for %d orders",
-                trip_id, len(picked_order_ids)
-            )
-            
+
             # 6. Освобождаем не забранные заказы (возврат в пул)
             released_count = self.db.release_unpicked_orders_by_driver_and_direction(
                 session, direction_id, driver_user_id, picked_order_ids
@@ -1624,11 +1642,11 @@ class TripActions:
                 )
             
             logger.info(
-                "[TripActions] complete_loading COMPLETED: direction_id=%s, driver_user_id=%s, trip_id=%s, picked=%d, released=%d",
-                direction_id, driver_user_id, trip_id, len(picked_order_ids), released_count
+                "[TripActions] complete_loading COMPLETED: direction_id=%s, driver_user_id=%s, picked=%d, released=%d",
+                direction_id, driver_user_id, len(picked_order_ids), released_count
             )
             
-            return True, "Погрузка завершена: %d заказов в рейс %s" % (len(picked_order_ids), trip_id)
+            return True, "Погрузка завершена: %d заказов готово к рейсу" % len(picked_order_ids)
             
         except Exception as e:
             logger.exception("[TripActions] complete_loading failed")
@@ -1687,6 +1705,8 @@ class TripActions:
 # ================== Очистка ячеек постаматов ===========================
 class LockerActions:
     """Действия для управления ячейками (системные операции)."""
+    def __init__(self, db: DatabaseLayer):
+        self.db = db     
     
     def cleanup_closed_empty_lockers(
         self,
@@ -1694,11 +1714,7 @@ class LockerActions:
         threshold_minutes: int = 30,
         user_id: int = 999999
     ) -> Tuple[bool, str]:
-        """
-        Системная очистка ячеек в статусе locker_closed_empty.
-        Ищет ячейки, висящие в этом статусе дольше threshold_minutes.
-        """
-        logger.info(
+        logger.debug(
             f"[LockerActions] cleanup_closed_empty_lockers: threshold={threshold_minutes} мин"
         )
         
@@ -1707,12 +1723,12 @@ class LockerActions:
             threshold_minutes=threshold_minutes,
             user_id=user_id
         )
-        
+         
         if error:
             logger.error(f"[LockerActions] cleanup_closed_empty_lockers FAILED: {error}")
             return False, error
         
-        logger.info(
+        logger.debug(
             f"[LockerActions] cleanup_closed_empty_lockers COMPLETED: очищено {cleaned_count} ячеек"
         )
         return True, f"Очищено {cleaned_count} ячеек"

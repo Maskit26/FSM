@@ -496,18 +496,52 @@ async def view_access_code(
             if not order:
                 raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND")
             
+            # Получаем роль пользователя
+            user_role = db.get_user_role(session, user_id)
+            
+            # Получаем stage_order
+            stage = db.get_stage_order(session, order_id, leg)
+            
+            authorized_id = None
+            
             if leg == "pickup":
                 if order["pickup_type"] == "self":
-                    authorized_id = order["client_user_id"]
+                    # Клиент сам несёт
+                    if user_role == "client":
+                        authorized_id = order["client_user_id"]
+                    # ✅ ПРОВЕРКА ВОДИТЕЛЯ
+                    elif user_role == "driver":
+                        if stage and stage.get("reserved_by_driver_id") == user_id:
+                            authorized_id = user_id
                 else:
-                    stage = db.get_stage_order(session, order_id, "pickup")
-                    authorized_id = stage.courier_user_id if stage else None
-            else:
+                    # Курьер забирает
+                    if user_role == "courier":
+                        authorized_id = stage.courier_user_id if stage else None
+                    # ✅ ПРОВЕРКА ВОДИТЕЛЯ
+                    elif user_role == "driver":
+                        if stage and stage.get("reserved_by_driver_id") == user_id:
+                            authorized_id = user_id
+            else:  # delivery
                 if order["delivery_type"] == "self":
-                    authorized_id = order.get("recipient_user_id")
+                    # Получатель сам забирает
+                    if user_role == "recipient":
+                        authorized_id = order.get("recipient_user_id")
+                    # ✅ ПРОВЕРКА ВОДИТЕЛЯ
+                    elif user_role == "driver":
+                        if stage and stage.get("trip_id"):
+                            trip = db.get_trip(session, stage["trip_id"])
+                            if trip and trip["driver_user_id"] == user_id:
+                                authorized_id = user_id
                 else:
-                    stage = db.get_stage_order(session, order_id, "delivery")
-                    authorized_id = stage.courier_user_id if stage else None
+                    # Курьер доставляет
+                    if user_role == "courier":
+                        authorized_id = stage.courier_user_id if stage else None
+                    # ✅ ПРОВЕРКА ВОДИТЕЛЯ
+                    elif user_role == "driver":
+                        if stage and stage.get("trip_id"):
+                            trip = db.get_trip(session, stage["trip_id"])
+                            if trip and trip["driver_user_id"] == user_id:
+                                authorized_id = user_id
             
             if authorized_id != user_id:
                 raise HTTPException(status_code=403, detail="USER_NOT_AUTHORIZED")
@@ -754,14 +788,17 @@ async def start_reservation_loading(
                 detail=f"START_LOADING_FAILED: {str(e)}"
             )   
 
-@app.post("/api/driver/trip/{trip_id}/start-trip", response_model=dict)
+@app.post("/api/driver/direction/{direction_id}/start-trip", response_model=dict)
 async def start_trip_endpoint(
-    trip_id: int,
+    direction_id: int,
     driver_user_id: int,
     db: DatabaseLayer = Depends(get_db)
 ):
     """
-    Начать рейс (после завершения погрузки).
+    Начать рейс после завершения погрузки.
+    1. Создаёт рейс
+    2. Создаёт FSM заявки для заказов и рейса
+    3. Возвращает trip_id и заказы на фронт
     """
     with get_db_session(read_only=False) as session:
         try:
@@ -773,31 +810,29 @@ async def start_trip_endpoint(
                     detail=f"USER_NOT_AUTHORIZED: роль '{user_role}' не может начать рейс"
                 )
             
-            # 2. Проверка рейса
-            trip = db.get_trip(session, trip_id)
-            if not trip:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Рейс {trip_id} не найден"
+            # 2. Создаём рейс через db_layer (внутри получает picked_order_ids)
+            trip_id, trip_orders = db.create_trip_for_loading(
+                session, direction_id, driver_user_id
+            )
+            
+            # 3. Создаём FSM заявки для ВСЕХ заказов в рейсе
+            for order in trip_orders:
+                order_id = order['order_id']
+                db.enqueue_fsm_instance(
+                    session,
+                    entity_type='order',
+                    entity_id=order_id,
+                    process_name='order_start_transit',
+                    fsm_state='PENDING',
+                    requested_by_user_id=driver_user_id,
+                    requested_user_role='driver',
+                    target_user_id=driver_user_id,
+                    target_role='driver',
+                    metadata={"trip_id": trip_id}
                 )
             
-            if trip["driver_user_id"] != driver_user_id:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Водитель {driver_user_id} не назначен на рейс {trip_id}"
-                )
-            
-            # 3. Получить список заказов в рейсе (для фронта)
-            orders = db.get_trip_orders(session, trip_id)
-            
-            if not orders:
-                raise HTTPException(
-                    status_code=400,
-                    detail="NO_ORDERS_IN_TRIP: В рейсе нет заказов"
-                )
-            
-            # 4. Запустить FSM процесс start_trip
-            fsm_instance_id = db.enqueue_fsm_instance(
+            # 4. Создаём FSM заявку для рейса
+            db.enqueue_fsm_instance(
                 session,
                 entity_type='trip',
                 entity_id=trip_id,
@@ -810,19 +845,22 @@ async def start_trip_endpoint(
                 metadata={}
             )
             
+            session.commit()
+            
+            # 5. Возвращаем trip_id и все заказы на фронт
             return {
                 "success": True,
                 "trip_id": trip_id,
-                "driver_user_id": driver_user_id,
-                "orders": orders,
-                "orders_count": len(orders),
-                "fsm_instance_id": fsm_instance_id,
-                "message": f"Рейс начат: {len(orders)} заказов"
+                "orders": trip_orders,
+                "orders_count": len(trip_orders),
+                "message": f"Рейс {trip_id} создан, {len(trip_orders)} заказов"
             }
             
         except HTTPException:
+            session.rollback()
             raise
         except Exception as e:
+            session.rollback()
             raise HTTPException(
                 status_code=500,
                 detail=f"START_TRIP_FAILED: {str(e)}"

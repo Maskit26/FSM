@@ -29,6 +29,8 @@ BATCH_SIZE = 20
 MAX_ATTEMPTS = 5
 STUCK_THRESHOLD_MINUTES = 60
 MAX_WORKERS = 1
+LOCKER_CLEANUP_INTERVAL_SECONDS = 300
+_last_cleanup_check = 0
 
 # ================== DB SETUP ==================
 
@@ -268,7 +270,7 @@ def check_stuck_instances(db: DatabaseLayer) -> int:
 
 def main():
     db = DatabaseLayer()
-
+    global _last_cleanup_check
     logger.info("[FSM] worker started")
     logger.info("[FSM] processes: %s", list(PROCESS_DEFS.keys()))
     last_reservation_expire_check = 0    
@@ -332,7 +334,7 @@ def main():
                     f.result()  # проброс исключений
 
                 # Проверяем зависшие инстансы
-                check_stuck_instances(db)   
+                check_stuck_instances(db)                  
 
                 # ================= НОВОЕ: Создаём инстанс locker_cleanup периодически =================
                 current_time = time.time()

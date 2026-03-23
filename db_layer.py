@@ -3744,15 +3744,14 @@ class DatabaseLayer:
     ) -> List[int]:
         """
         Получить order_id которые водитель фактически забрал (открыл + закрыл ячейки)
-        из ВСЕХ его резервов на направлении.
         """
         logger.debug(
-            "get_picked_orders_by_driver_and_direction вызван: direction_id=%s, driver_user_id=%s",
+            "[DatabaseLayer] get_picked_orders_by_driver_and_direction: direction_id=%s, driver_user_id=%s",
             direction_id, driver_user_id
         )
         
         try:
-            # Статусы заказов с ошибкой (исключить из результата)
+            # Статусы заказов с ошибкой
             excluded_statuses = [
                 'order_cancelled',
                 'order_manual_intervention_required',
@@ -3762,11 +3761,10 @@ class DatabaseLayer:
                 'order_reservation_expired',
             ]
             
-            # Динамически создаём плейсхолдеры для IN (чтобы избежать SQL injection)
+            # Динамически создаём плейсхолдеры для IN
             excluded_placeholders = ', '.join([f':excl_{i}' for i in range(len(excluded_statuses))])
             excluded_params = {f'excl_{i}': status for i, status in enumerate(excluded_statuses)}
-            
-            # Основной запрос: ищем заказы где водитель закрыл ячейку с забором (locker_close_pickup)
+                        
             query = text(f"""
                 SELECT DISTINCT lc.current_order_id
                 FROM fsm_action_logs fal
@@ -3780,6 +3778,7 @@ class DatabaseLayer:
                     WHERE so.direction_id = :direction_id
                     AND so.leg = 'pickup'
                     AND so.reserved_by_driver_id = :driver_user_id
+                    AND so.trip_id IS NULL
                 )
                 AND lc.current_order_id NOT IN (
                     SELECT o.id
@@ -3800,14 +3799,14 @@ class DatabaseLayer:
             picked_order_ids = [row[0] for row in result if row[0] is not None]
             
             logger.info(
-                "get_picked_orders_by_driver_and_direction: direction_id=%s, driver_user_id=%s, picked=%d",
+                "[DatabaseLayer] get_picked_orders_by_driver_and_direction: direction_id=%s, driver_user_id=%s, picked=%d",
                 direction_id, driver_user_id, len(picked_order_ids)
             )
             
             return picked_order_ids
             
         except Exception as e:
-            logger.error("get_picked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
+            logger.error("[DatabaseLayer] get_picked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
             raise DbLayerError("get_picked_orders_by_driver_and_direction failed: %s" % e) from e
 
     def release_unpicked_orders_by_driver_and_direction(
@@ -3889,39 +3888,54 @@ class DatabaseLayer:
             
         except Exception as e:
             logger.error("release_unpicked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
-            raise DbLayerError("release_unpicked_orders_by_driver_and_direction failed: %s" % e) from e    
-
+            raise DbLayerError("release_unpicked_orders_by_driver_and_direction failed: %s" % e) from e 
+    
     def create_trip_for_loading(
         self,
         session: Session,
         direction_id: int,
         driver_user_id: int,
-        picked_order_ids: List[int],
-    ) -> int:
+    ) -> Tuple[int, List[Dict[str, Any]]]:
         """
         Создать новый рейс (trip) для фактически забранных заказов.
         """
         logger.debug(
-            "create_trip_for_loading вызван: direction_id=%s, driver_user_id=%s, orders=%d",
-            direction_id, driver_user_id, len(picked_order_ids)
+            "[DatabaseLayer] create_trip_for_loading: direction_id=%s, driver_user_id=%s",
+            direction_id, driver_user_id
         )
         
         try:
-            # 1. Получаем данные направления
+            # 1. Получаем фактически забранные заказы
+            picked_order_ids = self.get_picked_orders_by_driver_and_direction(
+                session, direction_id, driver_user_id
+            )
+            
+            if not picked_order_ids:
+                raise DbLayerError("NO_PICKED_ORDERS: Нет забранных заказов для создания рейса")
+            
+            # 2. Проверяем что заказы ещё не привязаны к рейсу
+            existing_trip = session.execute(text("""
+                SELECT DISTINCT trip_id FROM stage_orders
+                WHERE order_id IN :order_ids
+                AND leg = 'pickup'
+                AND trip_id IS NOT NULL
+            """), {"order_ids": tuple(picked_order_ids)}).fetchone()
+            
+            if existing_trip:
+                raise DbLayerError(f"ORDERS_ALREADY_IN_TRIP: Заказы уже в рейсе {existing_trip[0]}")
+            
+            # 3. Получаем данные направления
             direction = session.execute(text("""
                 SELECT from_city, to_city, pickup_locker_id, delivery_locker_id
-                FROM directions
-                WHERE id = :direction_id
-            """), {
-                "direction_id": direction_id,
-            }).fetchone()
+                FROM directions WHERE id = :direction_id
+            """), {"direction_id": direction_id}).fetchone()
             
             if not direction:
                 raise DbLayerError(f"Направление {direction_id} не найдено")
             
             from_city, to_city, pickup_locker_id, delivery_locker_id = direction
             
-            # 2. Создаём рейс
+            # 4. Создаём рейс
             session.execute(text("""
                 INSERT INTO trips (
                     driver_user_id, from_city, to_city,
@@ -3942,27 +3956,21 @@ class DatabaseLayer:
             
             trip_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
             
-            # 3. Привязываем заказы к рейсу
             if picked_order_ids:
                 order_placeholders = ', '.join([f':order_{i}' for i in range(len(picked_order_ids))])
                 order_params = {f'order_{i}': oid for i, oid in enumerate(picked_order_ids)}
                 
-                # UPDATE pickup плеча + SET trip_id
-                query = text(f"""
+                session.execute(text(f"""
                     UPDATE stage_orders
                     SET trip_id = :trip_id
                     WHERE order_id IN ({order_placeholders})
                     AND leg = 'pickup'
-                """)
-                
-                params = {
+                    AND trip_id IS NULL
+                """), {
                     "trip_id": trip_id,
                     **order_params,
-                }
+                })
                 
-                session.execute(query, params)
-                
-                # INSERT delivery плеча
                 for order_id in picked_order_ids:
                     session.execute(text("""
                         INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id)
@@ -3973,30 +3981,18 @@ class DatabaseLayer:
                         "order_id": order_id,
                     })
                 
-                # УМЕНЬШАЕМ orders_reserved на количество забранных заказов
-                session.execute(text("""
-                    UPDATE directions
-                    SET orders_reserved = orders_reserved - :count
-                    WHERE id = :direction_id
-                """), {
-                    "count": len(picked_order_ids),
-                    "direction_id": direction_id,
-                })
-                
-                logger.info(
-                    "create_trip_for_loading: directions.orders_reserved уменьшен на %d",
-                    len(picked_order_ids)
-                )
+            # 5. Получаем все заказы в рейсе для возврата
+            trip_orders = self.get_trip_orders(session, trip_id)
             
             logger.info(
-                "create_trip_for_loading: direction_id=%s, trip_id=%s, orders=%d",
+                "[DatabaseLayer] create_trip_for_loading: direction_id=%s, trip_id=%s, orders=%d",
                 direction_id, trip_id, len(picked_order_ids)
             )
             
-            return trip_id
+            return trip_id, trip_orders
             
         except Exception as e:
-            logger.error("create_trip_for_loading завершился с ошибкой: %s", e)
+            logger.error("[DatabaseLayer] create_trip_for_loading завершился с ошибкой: %s", e)
             raise DbLayerError("create_trip_for_loading failed: %s" % e) from e
 
     # ================ отмена резерва ===============
@@ -4033,11 +4029,10 @@ class DatabaseLayer:
             if res_driver_id != driver_user_id:
                 return False, [], f"Резерв {reservation_id} не принадлежит водителю {driver_user_id}"
             
-            # 3. Проверка статуса (только reservation_active)
+            # 3. Проверка статуса
             if reservation_status not in ('reservation_active', 'reservation_loading'):
                 return False, [], (
-                    f"Нельзя начать погрузку: статус резерва '{reservation_status}' "
-                    f"(требуется 'reservation_active')"
+                    f"Статус резерва не соответсвует '{reservation_status}' "                    
                 )
             
             # 4. Получаем заказы резерва
@@ -4110,6 +4105,15 @@ class DatabaseLayer:
                 return False, [], f"Резерв {reservation_id} не найден"
             
             driver_user_id, direction_id, reservation_status = reservation
+            
+            # 2. ✅ ПРОВЕРКА СТАТУСА
+            if reservation_status not in ('reservation_active', 'reservation_loading'):
+                return False, [], (
+                    f"Нельзя отменить резерв: статус '{reservation_status}'  "
+                    f"(требуется 'reservation_active' или 'reservation_loading')"
+                )
+            
+            # 3. Получаем заказы резерва
             success, orders, error = self.get_orders_by_reservation(
                 session, 
                 reservation_id,
@@ -4122,7 +4126,7 @@ class DatabaseLayer:
             if not orders:
                 return False, [], "В резерве нет заказов"
             
-            # 2. Проверяем статусы заказов
+            # 4. Проверяем статусы заказов
             allowed_status = "order_parcel_confirmed"
             blocked_ids: List[int] = []
             
@@ -5127,21 +5131,18 @@ class DatabaseLayer:
     # ==================== СЕРВИСНЫЕ ПРОЦЕДУРЫ ====================
 
     # ==================== Сброс ячеек постааматов ================
+    
     def ensure_locker_cleanup_instance(
         self,
         session: Session,
         threshold_minutes: int = 30,
         user_id: int = 999999
     ) -> bool:
-        """
-        Проверяет наличие активного инстанса locker_cleanup.
-        """
         logger.debug(
             f"ensure_locker_cleanup_instance: threshold={threshold_minutes} мин"
         )
         
         try:
-            # 1. Проверяем, нет ли уже активного инстанса
             existing = session.execute(text("""
                 SELECT id FROM server_fsm_instances
                 WHERE process_name = 'locker_cleanup'
@@ -5151,13 +5152,12 @@ class DatabaseLayer:
             
             if existing:
                 logger.debug("ensure_locker_cleanup_instance: активный инстанс уже существует (пропущено)")
-                return False  # ← Не создан, уже существовал
+                return False
             
-            # 2. Создаём новый инстанс
             self.enqueue_fsm_instance(
                 session=session,
                 entity_type="locker",
-                entity_id=0,  # 0 = все ячейки
+                entity_id=0,
                 process_name="locker_cleanup",
                 fsm_state="PENDING",
                 requested_by_user_id=user_id,
@@ -5165,8 +5165,8 @@ class DatabaseLayer:
                 metadata={"threshold_minutes": threshold_minutes}
             )
             
-            logger.info("ensure_locker_cleanup_instance: создан новый инстанс locker_cleanup")  # ← Логируем только здесь
-            return True  # ← Создан
+            logger.debug("ensure_locker_cleanup_instance: создан новый инстанс locker_cleanup")
+            return True
             
         except Exception as e:
             logger.error(f"ensure_locker_cleanup_instance failed: {e}")
@@ -5178,17 +5178,9 @@ class DatabaseLayer:
         threshold_minutes: int = 30,
         user_id: int = 999999
     ) -> Tuple[int, Optional[str]]:
-        """
-        Находит ячейки в статусе locker_closed_empty, висящие там дольше threshold_minutes,
-        и вызывает для них FSM locker_reset.
-        
-        Returns:
-            (количество_очищенных, ошибка)
-        """
         logger.debug(f"cleanup_closed_empty_lockers: threshold={threshold_minutes} мин")
         
         try:
-            # 1. Находим ячейки, которые висят в статусе дольше порога
             rows = session.execute(text("""
                 SELECT lc.id
                 FROM locker_cells lc
@@ -5208,10 +5200,9 @@ class DatabaseLayer:
             cell_ids = [row[0] for row in rows]
             
             if not cell_ids:
-                logger.info("cleanup_closed_empty_lockers: нет ячеек для очистки")
+                logger.debug("cleanup_closed_empty_lockers: нет ячеек для очистки")
                 return 0, None
             
-            # 2. Для каждой ячейки вызываем FSM locker_reset
             cleaned_count = 0
             for cell_id in cell_ids:
                 try:
@@ -5219,16 +5210,14 @@ class DatabaseLayer:
                     cleaned_count += 1
                 except Exception as e:
                     logger.error(f"cleanup_closed_empty_lockers: failed to reset cell {cell_id}: {e}")
-                    # Не прерываем цикл, продолжаем с другими ячейками
             
-            logger.info(f"cleanup_closed_empty_lockers: очищено {cleaned_count} ячеек")
+            logger.debug(f"cleanup_closed_empty_lockers: очищено {cleaned_count} ячеек")
             return cleaned_count, None
             
         except Exception as e:
             logger.error(f"cleanup_closed_empty_lockers failed: {e}")
             return 0, str(e)
-
-
+    
     # ====================== Очистка базы данных ===================  
     def clear_test_data(self) -> bool:
         """

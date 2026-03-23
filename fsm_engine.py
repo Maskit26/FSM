@@ -884,6 +884,7 @@ def _handle_driver_reservation_expire(
     )
 
 # ==================== Сброс ячеек постаматов ============
+
 def _handle_locker_cleanup(
     db: DatabaseLayer,
     session: Session,
@@ -892,27 +893,25 @@ def _handle_locker_cleanup(
 ) -> FsmStepResult:
     """
     Системный процесс очистки ячеек в статусе locker_closed_empty.
-    Ищет ячейки, висящие в этом статусе дольше threshold_minutes.
     """
     user_id = instance["requested_by_user_id"]
     metadata = instance.get("metadata", {})
     threshold_minutes = metadata.get("threshold_minutes", 30)
     
-    logger.info(f"[FSM] locker_cleanup: threshold={threshold_minutes} мин, user_id={user_id}")
-    
-    # Вызываем экшен
+    logger.debug(f"[FSM] locker_cleanup: threshold={threshold_minutes} мин, user_id={user_id}")
+
     actions: LockerActions = ctx["locker_actions"]
     success, msg = actions.cleanup_closed_empty_lockers(
         session=session,
         threshold_minutes=threshold_minutes,
         user_id=user_id
     )
-    
+
     if not success:
         logger.error(f"[FSM] locker_cleanup FAILED: {msg}")
         return FsmStepResult(new_state="FAILED", last_error=msg, attempts_increment=1)
-    
-    logger.info(f"[FSM] locker_cleanup COMPLETED: {msg}")
+
+    logger.debug(f"[FSM] locker_cleanup COMPLETED: {msg}")
     return FsmStepResult(new_state="COMPLETED", attempts_increment=1)
 
 # ==================== PROCESS REGISTRY ====================
