@@ -516,7 +516,7 @@ async def view_access_code(
                 else:
                     # Курьер забирает
                     if user_role == "courier":
-                        authorized_id = stage.courier_user_id if stage else None
+                        authorized_id = stage["courier_user_id"] if stage else None
                     # ✅ ПРОВЕРКА ВОДИТЕЛЯ
                     elif user_role == "driver":
                         if stage and stage.get("reserved_by_driver_id") == user_id:
@@ -535,7 +535,7 @@ async def view_access_code(
                 else:
                     # Курьер доставляет
                     if user_role == "courier":
-                        authorized_id = stage.courier_user_id if stage else None
+                        authorized_id = stage["courier_user_id"] if stage else None
                     # ✅ ПРОВЕРКА ВОДИТЕЛЯ
                     elif user_role == "driver":
                         if stage and stage.get("trip_id"):

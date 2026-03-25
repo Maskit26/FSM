@@ -1410,7 +1410,7 @@ class AccessCodeActions:
                 else:
                     if user_role == "courier":
                         stage = self.db.get_stage_order(session, order_id, "pickup")
-                        authorized_user_id = stage.courier_user_id if stage else None
+                        authorized_user_id = stage["courier_user_id"] if stage else None
                     elif user_role == "driver":
                         stage = self.db.get_stage_order(session, order_id, "pickup")
                         if stage and stage.get("reserved_by_driver_id") == user_id:
@@ -1418,7 +1418,7 @@ class AccessCodeActions:
                     else:
                         return False, "USER_NOT_AUTHORIZED"
                         
-            else:  # delivery
+            else: 
                 # ✅ DELIVERY
                 if order["delivery_type"] == "self":
                     if user_role == "driver":
@@ -1440,7 +1440,7 @@ class AccessCodeActions:
                                 authorized_user_id = user_id
                     elif user_role == "courier":
                         stage = self.db.get_stage_order(session, order_id, "delivery")
-                        authorized_user_id = stage.courier_user_id if stage else None
+                        authorized_user_id = stage["courier_user_id"] if stage else None
                     elif user_role == "recipient":
                         authorized_user_id = order.get("recipient_user_id")
                     else:
