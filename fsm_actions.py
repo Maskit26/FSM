@@ -176,9 +176,8 @@ class AssignmentActions:
         """
         Назначает водителя на рейс.
         """
-
         logger.info(
-            "[ASSIGNMENT] assign_to_trip trip_id=%s executor=%s role=%s",
+            "[ASSIGNMENT] assign_to_trip trip_id=%s executor=%s role=%s ",
             trip_id,
             executor_id,
             role,
@@ -187,21 +186,22 @@ class AssignmentActions:
         try:
             if role == "driver":
                 self.db.set_driver_in_trip(session, trip_id, executor_id)
-                self.db.driver_take_trip(session, trip_id, executor_id)
+                self.db.trip_reassign_driver(session, trip_id, executor_id)
+                
+                logger.info(
+                    "[ASSIGNMENT] trip %s reassigned to driver %s (trip_failed → trip_assigned)",
+                    trip_id,
+                    executor_id,
+                )
             else:
-                logger.error("[ASSIGNMENT] unknown role for trip: %s", role)
+                logger.error("[ASSIGNMENT] unknown role for trip: %s ", role)
                 return False
 
-            logger.info(
-                "[ASSIGNMENT] assigned trip_id=%s driver=%s",
-                trip_id,
-                executor_id,
-            )
             return True
 
         except Exception:
             logger.exception(
-                "[ASSIGNMENT] assign_to_trip failed trip_id=%s", trip_id
+                "[ASSIGNMENT] assign_to_trip failed trip_id=%s ", trip_id
             )
             return False
 
@@ -885,30 +885,34 @@ class DriverActions:
             logger.error("[DRIVER] failed to process arrival for trip %s: %s", trip_id, str(e))
             return False, str(e)
 
-    def cancel_trip(
-        self,
-        session: Session,
-        trip_id: int,
-        user_id: int
-    ) -> Tuple[bool, str]:
-        logger.info("[DRIVER] cancel_trip trip=%s user=%s", trip_id, user_id)
+    def cancel_trip(self, session: Session, trip_id: int, user_id: int) -> Tuple[bool, str]:
+        """Отмена рейса водителем (из trip_assigned или trip_in_progress)."""
+        logger.info("[DRIVER] cancel_trip trip_id=%s user_id=%s", trip_id, user_id)
 
         try:
+            # Получаем текущий статус рейса
             trip = self.db.get_trip(session, trip_id)
-            if not trip or trip.get("driver_user_id") != user_id:
-                logger.warning("[DRIVER] trip %s not assigned to driver %s", trip_id, user_id)
-                return False, "TRIP_NOT_ASSIGNED_TO_DRIVER"
+            if not trip:
+                return False, "TRIP_NOT_FOUND"
 
-            if trip["status"] != "trip_assigned":
-                logger.warning("[DRIVER] cannot cancel trip %s from status %s", trip_id, trip["status"])
-                return False, f"CANNOT_CANCEL_FROM_{trip['status']}"
+            current_status = trip.get("status")
+            logger.info("[DRIVER] current trip status: %s", current_status)
 
-            self.db.trip_report_failure(session, trip_id, user_id)
-            logger.info("[DRIVER] trip %s cancelled successfully", trip_id)
-            return True, ""
-            
+            # Разрешаем отмену только из разрешённых статусов
+            if current_status not in ("trip_assigned", "trip_in_progress"):
+                return False, f"CANNOT_CANCEL_FROM_{current_status}"
+
+            # Выполняем FSM переход
+            success = self.db.trip_cancel(session, trip_id, user_id)
+
+            if success:
+                logger.info("[DRIVER] cancel_trip COMPLETED: trip_id=%s (was %s)", trip_id, current_status)
+                return True, ""
+            else:
+                return False, "FSM_CANCEL_FAILED"
+
         except Exception as e:
-            logger.error("[DRIVER] failed to cancel trip %s: %s", trip_id, str(e))
+            logger.error("[DRIVER] cancel_trip failed: %s", e)
             return False, str(e)
 
     def complete_trip(self, session: Session, trip_id: int, user_id: int) -> Tuple[bool, str]:

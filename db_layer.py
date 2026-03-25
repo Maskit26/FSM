@@ -147,7 +147,11 @@ class DatabaseLayer:
             )
 
         return self.call_fsm_action(session, "trip", trip_id, "trip_vzyat_reis", driver_id)
-
+    
+    def trip_reassign_driver(self, session: Session, trip_id: int, driver_id: int) -> bool:
+        """Переназначение водителя на рейс после поломки (FSM: trip_reassign_driver)."""
+        
+        return self.call_fsm_action(session, "trip", trip_id, "trip_reassign_driver", driver_id)
 
     def start_trip(self, session: Session, trip_id: int, driver_id: int) -> bool:
         """Старт рейса (FSM: trip_start_trip)."""
@@ -158,26 +162,21 @@ class DatabaseLayer:
 
         return self.call_fsm_action(session, "trip", trip_id, "trip_start_trip", driver_id)
 
-
     def trip_assign_driver(self, session: Session, trip_id: int, operator_id: int) -> bool:
         """Назначение водителя на рейс (FSM: trip_assign_voditel)."""
         return self.call_fsm_action(session, "trip", trip_id, "trip_assign_voditel", operator_id)
-
 
     def trip_start_pickup(self, session: Session, trip_id: int, driver_id: int) -> bool:
         """Начало этапа забора посылок (FSM: trip_start_pickup)."""
         return self.call_fsm_action(session, "trip", trip_id, "trip_start_pickup", driver_id)
 
-
     def trip_confirm_pickup(self, session: Session, trip_id: int, driver_id: int) -> bool:
         """Подтверждение, что посылки забраны (FSM: trip_confirm_pickup)."""
         return self.call_fsm_action(session, "trip", trip_id, "trip_confirm_pickup", driver_id)
 
-
     def trip_confirm_delivery(self, session: Session, trip_id: int, driver_id: int) -> bool:
         """Подтверждение доставки по рейсу (FSM: trip_confirm_delivery)."""
         return self.call_fsm_action(session, "trip", trip_id, "trip_confirm_delivery", driver_id)
-
 
     def complete_trip(self, session: Session, trip_id: int, driver_id: int) -> bool:
         """
@@ -196,20 +195,17 @@ class DatabaseLayer:
         
         return self.call_fsm_action(session, "trip", trip_id, "trip_complete_trip", driver_id)    
 
-    def trip_end_delivery(self, session: Session, trip_id: int, driver_id: int) -> bool:
-        """Завершение этапа доставки (FSM: trip_end_delivery)."""
-        return self.call_fsm_action(session, "trip", trip_id, "trip_end_delivery", driver_id)
-
+    def trip_cancel(self, session: Session, trip_id: int, driver_id: int) -> bool:
+        """Отмена рейса водителем (FSM: trip_cancel)."""
+        return self.call_fsm_action(session, "trip", trip_id, "trip_cancel", driver_id)
 
     def trip_report_driver_not_found(self, session: Session, trip_id: int, user_id: int) -> bool:
         """Сообщение, что водитель не найден (FSM: trip_report_driver_not_found)."""
         return self.call_fsm_action(session, "trip", trip_id, "trip_report_driver_not_found", user_id)
 
-
     def trip_report_failure(self, session: Session, trip_id: int, user_id: int) -> bool:
         """Сообщение о сбое рейса (FSM: trip_report_failure)."""
         return self.call_fsm_action(session, "trip", trip_id, "trip_report_failure", user_id)
-
 
     def trip_request_manual_intervention(
         self,
@@ -453,7 +449,7 @@ class DatabaseLayer:
     def create_order_issue(
         self,
         session: Session,
-        order_id: Optional[int],  # ← Сделать Optional
+        order_id: Optional[int],
         trip_id: Optional[int],
         user_id: int,
         issue_type: str,
@@ -511,14 +507,14 @@ class DatabaseLayer:
         # Выполняем FSM-переход
         self.call_fsm_action(session, "order", order_id, "order_confirm_parcel_in", user_id)
 
-        # Ставим задачу на привязку к рейсу
+        # Ставим задачу на привязку к Направлению
         self.enqueue_fsm_instance(
             session,
             entity_type="order",
             entity_id=order_id,
             process_name="bind_order_to_trip",
             fsm_state="PENDING",
-            requested_by_user_id=999999,  # системный
+            requested_by_user_id=999999,
             requested_user_role="system"
         )
 
@@ -3640,11 +3636,10 @@ class DatabaseLayer:
                 )
                 return False, []
             
-            # 2. ✅ Динамические плейсхолдеры для IN
             reservation_placeholders = ', '.join([f':res_{i}' for i in range(len(reservation_ids))])
             reservation_params = {f'res_{i}': rid for i, rid in enumerate(reservation_ids)}
             
-            # 3. Проверяем ячейки через fsm_action_logs
+            # 2. Проверяем ячейки через fsm_action_logs
             query = text(f"""
                 SELECT DISTINCT lc.id
                 FROM fsm_action_logs fal_open
@@ -3668,7 +3663,7 @@ class DatabaseLayer:
                 )
             """)
             
-            # 4. Объединяем параметры
+            # 3. Объединяем параметры
             params = {
                 "driver_user_id": driver_user_id,
                 **reservation_params,
@@ -4106,7 +4101,7 @@ class DatabaseLayer:
             
             driver_user_id, direction_id, reservation_status = reservation
             
-            # 2. ✅ ПРОВЕРКА СТАТУСА
+            # 2. ПРОВЕРКА СТАТУСА
             if reservation_status not in ('reservation_active', 'reservation_loading'):
                 return False, [], (
                     f"Нельзя отменить резерв: статус '{reservation_status}'  "
@@ -4215,6 +4210,111 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("release_orders_from_reservation завершился с ошибкой: %s", e)
             raise DbLayerError("release_orders_from_reservation failed: %s" % e) from e
+
+    # ================ Оператор =====================
+    # ================ Вывод ленты рейсов ===========
+    def get_all_trips_for_operator(
+        self,
+        session: Session,
+        status_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить все рейсы для оператора.
+        Опционально: фильтр по статусу (например, 'trip_failed').
+        """
+        logger.debug(
+            "[DB] get_all_trips_for_operator: status_filter=%s",
+            status_filter
+        )
+        
+        try:
+            query = text("""
+                SELECT 
+                    t.id,
+                    t.driver_user_id,
+                    t.from_city,
+                    t.to_city,
+                    t.pickup_locker_id,
+                    t.delivery_locker_id,
+                    t.status,
+                    t.active,
+                    t.created_at,
+                    l_pickup.location_address as pickup_address,
+                    l_delivery.location_address as delivery_address,
+                    ri.id as issue_id,
+                    ri.issue_type,
+                    ri.description as issue_description,
+                    ri.created_at as issue_created_at
+                FROM trips t
+                LEFT JOIN lockers l_pickup ON l_pickup.id = t.pickup_locker_id
+                LEFT JOIN lockers l_delivery ON l_delivery.id = t.delivery_locker_id
+                LEFT JOIN report_issues ri ON ri.trip_id = t.id
+                    AND ri.issue_type IN ('trip_breakdown', 'trip_manual_intervention', 'trip_delayed', 'trip_route_issue')
+                WHERE 1=1
+            """)
+            
+            params = {}
+            
+            if status_filter:
+                query = text("""
+                    SELECT 
+                        t.id,
+                        t.driver_user_id,
+                        t.from_city,
+                        t.to_city,
+                        t.pickup_locker_id,
+                        t.delivery_locker_id,
+                        t.status,
+                        t.active,
+                        t.created_at,
+                        l_pickup.location_address as pickup_address,
+                        l_delivery.location_address as delivery_address,
+                        ri.id as issue_id,
+                        ri.issue_type,
+                        ri.description as issue_description,
+                        ri.created_at as issue_created_at
+                    FROM trips t
+                    LEFT JOIN lockers l_pickup ON l_pickup.id = t.pickup_locker_id
+                    LEFT JOIN lockers l_delivery ON l_delivery.id = t.delivery_locker_id
+                    LEFT JOIN report_issues ri ON ri.trip_id = t.id
+                        AND ri.issue_type IN ('trip_breakdown', 'trip_manual_intervention', 'trip_delayed', 'trip_route_issue')
+                    WHERE t.status = :status
+                    ORDER BY t.created_at DESC
+                """)
+                params = {"status": status_filter}
+            
+            rows = session.execute(query, params).fetchall()
+            
+            trips = []
+            for row in rows:
+                trips.append({
+                    "trip_id": row[0],
+                    "driver_user_id": row[1],
+                    "from_city": row[2],
+                    "to_city": row[3],
+                    "pickup_locker_id": row[4],
+                    "delivery_locker_id": row[5],
+                    "status": row[6],
+                    "active": bool(row[7]),
+                    "created_at": row[8].isoformat() if row[8] else None,
+                    "pickup_address": row[9],
+                    "delivery_address": row[10],
+                    "issue_id": row[11],
+                    "issue_type": row[12],
+                    "issue_description": row[13],
+                    "issue_created_at": row[14].isoformat() if row[14] else None,
+                })
+            
+            logger.info(
+                "[DB] get_all_trips_for_operator: found %d trips",
+                len(trips)
+            )
+            
+            return trips
+            
+        except Exception as e:
+            logger.error("[DB] get_all_trips_for_operator failed: %s", e)
+            raise DbLayerError(f"get_all_trips_for_operator failed: {e}") from e
 
     # ================ сброс резерва ================
 

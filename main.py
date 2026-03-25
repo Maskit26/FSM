@@ -649,6 +649,23 @@ async def get_driver_exchange_trips(
         directions = db.get_available_directions_for_driver_exchange(session, city)
     return directions
 
+@app.get("/api/operator/trips", response_model=List[dict])
+async def get_operator_trips(
+    status: Optional[str] = Query(None, description="Фильтр по статусу (например, trip_failed)"),
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить все рейсы для оператора.
+    Опционально: фильтр по статусу для показа только рейсов с проблемами.
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            trips = db.get_all_trips_for_operator(session, status_filter=status)
+            return trips
+            
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
 # ==================== Универсальное действие ====================
 
 @app.post("/api/fsm/enqueue", response_model=ApiResponse)
