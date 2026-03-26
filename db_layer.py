@@ -4316,7 +4316,118 @@ class DatabaseLayer:
             logger.error("[DB] get_all_trips_for_operator failed: %s", e)
             raise DbLayerError(f"get_all_trips_for_operator failed: {e}") from e
 
-
+    def get_all_lockers_with_orders_for_operator(
+        self,
+        session: Session,
+    ) -> List[Dict[str, Any]]:
+        """
+        Получить все постаматы с заказами для оператора.
+        Показывает ВСЕ постаматы и ВСЕ заказы в ячейках этих постаматов.
+        Без рейсов, направлений, резервов.
+        """
+        logger.debug("[DB] get_all_lockers_with_orders_for_operator")
+        
+        try:
+            # 1. Получаем ВСЕ постаматы
+            lockers_rows = session.execute(text("""
+                SELECT 
+                    l.id,
+                    l.locker_code,
+                    l.location_address,
+                    l.city,
+                    l.status
+                FROM lockers l
+                ORDER BY l.id ASC
+            """)).fetchall()
+            
+            lockers = []
+            for locker_row in lockers_rows:
+                locker_id = locker_row[0]
+                
+                # 2. Для каждого постамата получаем ВСЕ заказы в его ячейках
+                #    (и source_cell_id, и dest_cell_id)
+                orders_rows = session.execute(text("""
+                    SELECT 
+                        o.id as order_id,
+                        o.status,
+                        o.pickup_type,
+                        o.delivery_type,
+                        o.source_cell_id,
+                        o.dest_cell_id,
+                        o.client_user_id,
+                        o.recipient_user_id,
+                        o.created_at,
+                        o.updated_at,
+                        -- pickup leg
+                        so_pickup.courier_user_id as pickup_courier_id,
+                        so_pickup.trip_id as pickup_trip_id,
+                        -- delivery leg
+                        so_delivery.courier_user_id as delivery_courier_id,
+                        so_delivery.trip_id as delivery_trip_id,
+                        -- ячейки
+                        lc_src.cell_code as source_cell_code,
+                        lc_dst.cell_code as dest_cell_code
+                    FROM orders o
+                    JOIN locker_cells lc_src ON lc_src.id = o.source_cell_id
+                    JOIN locker_cells lc_dst ON lc_dst.id = o.dest_cell_id
+                    LEFT JOIN stage_orders so_pickup 
+                        ON so_pickup.order_id = o.id AND so_pickup.leg = 'pickup'
+                    LEFT JOIN stage_orders so_delivery 
+                        ON so_delivery.order_id = o.id AND so_delivery.leg = 'delivery'
+                    WHERE lc_src.locker_id = :locker_id
+                    OR lc_dst.locker_id = :locker_id
+                    ORDER BY o.created_at DESC
+                """), {"locker_id": locker_id}).fetchall()
+                
+                orders = [{
+                    "order_id": row[0],
+                    "status": row[1],
+                    "pickup_type": row[2],
+                    "delivery_type": row[3],
+                    "source_cell_id": row[4],
+                    "dest_cell_id": row[5],
+                    "client_user_id": row[6],
+                    "recipient_user_id": row[7],
+                    "created_at": row[8].isoformat() if row[8] else None,
+                    "updated_at": row[9].isoformat() if row[9] else None,
+                    "pickup_courier_id": row[10],
+                    "pickup_trip_id": row[11],
+                    "delivery_courier_id": row[12],
+                    "delivery_trip_id": row[13],
+                    "source_cell_code": row[14],
+                    "dest_cell_code": row[15],
+                } for row in orders_rows]
+                
+                # 3. Считаем статистику
+                orders_waiting_courier = len([
+                    o for o in orders 
+                    if o["pickup_courier_id"] is None and o["pickup_type"] == "courier"
+                ])
+                orders_assigned = len([
+                    o for o in orders 
+                    if o["pickup_courier_id"] is not None
+                ])
+                
+                lockers.append({
+                    "locker_id": locker_id,
+                    "locker_code": locker_row[1],
+                    "location_address": locker_row[2],
+                    "city": locker_row[3],
+                    "status": locker_row[4],
+                    "orders": orders,
+                    "orders_waiting_courier": orders_waiting_courier,
+                    "orders_assigned": orders_assigned,
+                })
+            
+            logger.info(
+                "[DB] get_all_lockers_with_orders_for_operator: found %d lockers",
+                len(lockers)
+            )
+            return lockers
+            
+        except Exception as e:
+            logger.error("[DB] get_all_lockers_with_orders_for_operator failed: %s", e)
+            raise DbLayerError(f"get_all_lockers_with_orders_for_operator failed: {e}") from e
 
     # ================ Снять курьера с заказа и водителя с рейса =====
     def remove_courier_from_order(

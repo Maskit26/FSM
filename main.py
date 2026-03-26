@@ -666,6 +666,25 @@ async def get_operator_trips(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/api/operator/lockers", response_model=List[dict])
+async def get_operator_lockers(
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить все постаматы с заказами для оператора.
+    Показывает:
+    - Все постаматы
+    - Все заказы в каждом постамате
+    - Статус курьера для каждого заказа (NULL = не назначен)
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            lockers = db.get_all_lockers_with_orders_for_operator(session)
+            return lockers
+            
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
 # ==================== Универсальное действие ====================
 
 @app.post("/api/fsm/enqueue", response_model=ApiResponse)
