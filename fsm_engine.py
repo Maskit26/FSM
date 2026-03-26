@@ -122,6 +122,88 @@ def _handle_assign_executor_pending(
     logger.info(f"[FSM] assign_executor COMPLETED: entity={entity_type}:{entity_id}, executor={executor_id}, role={role}")
     return FsmStepResult(new_state="COMPLETED", last_error=None, attempts_increment=1)
 
+# =========== снять курьера с заказа и водителя с рейса ======
+def _handle_remove_executor_pending(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Универсальный обработчик снятия исполнителя.
+    Работает для процессов:
+    - order_remove_courier1 (leg=pickup)
+    - order_remove_courier2 (leg=delivery)
+    - trip_remove_driver
+    """
+    actions: AssignmentActions = ctx["assignment_actions"]
+    entity_type = instance["entity_type"]
+    entity_id = instance["entity_id"]
+    target_user_id = instance.get("target_user_id", 0)
+    operator_id = instance["requested_by_user_id"]
+    process_name = instance["process_name"]
+    
+    if not target_user_id or target_user_id <= 0:
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="TARGET_USER_ID_NOT_SET",
+            attempts_increment=1
+        )
+    
+    if "courier1" in process_name:
+        leg = "pickup"
+    elif "courier2" in process_name:
+        leg = "delivery"
+    elif "driver" in process_name:
+        leg = None 
+    else:
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="UNKNOWN_PROCESS_TYPE",
+            attempts_increment=1
+        )
+    
+    logger.info(
+        f"[FSM] remove_executor: entity={entity_type}:{entity_id}, "
+        f"executor={target_user_id}, leg={leg}"
+    )
+    
+    if entity_type == "order":
+        if not leg:
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="LEG_REQUIRED_FOR_ORDER",
+                attempts_increment=1
+            )
+        success = actions.remove_courier_from_order(
+            session, entity_id, target_user_id, leg, operator_id
+        )
+    elif entity_type == "trip":
+        success = actions.remove_driver_from_trip(
+            session, entity_id, target_user_id, operator_id
+        )
+    else:
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error=f"UNKNOWN_ENTITY_TYPE_{entity_type}",
+            attempts_increment=1
+        )
+    
+    if not success:
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="REMOVE_EXECUTOR_FAILED",
+            attempts_increment=1
+        )
+    
+    logger.info(
+        f"[FSM] remove_executor COMPLETED: entity={entity_type}:{entity_id}"
+    )
+    return FsmStepResult(
+        new_state="COMPLETED",
+        last_error=None,
+        attempts_increment=1
+    )
 
 # ==================== OPEN/CLOSE CELL ====================
 def _handle_open_cell(
@@ -920,6 +1002,9 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "order_assign_courier1": {"PENDING": _handle_assign_executor_pending},
     "order_assign_courier2": {"PENDING": _handle_assign_executor_pending},
     "trip_assign_driver": {"PENDING": _handle_assign_executor_pending},
+    "order_remove_courier1": { "PENDING": _handle_remove_executor_pending},
+    "order_remove_courier2": { "PENDING": _handle_remove_executor_pending},
+    "trip_remove_driver":    { "PENDING": _handle_remove_executor_pending},
     "start_trip": {"PENDING": _handle_start_trip},
     "arrive_at_destination": {"PENDING": _handle_arrive_at_destination},
     "cancel_trip": {"PENDING": _handle_cancel_trip},

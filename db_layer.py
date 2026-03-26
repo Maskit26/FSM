@@ -4316,6 +4316,133 @@ class DatabaseLayer:
             logger.error("[DB] get_all_trips_for_operator failed: %s", e)
             raise DbLayerError(f"get_all_trips_for_operator failed: {e}") from e
 
+
+
+    # ================ Снять курьера с заказа и водителя с рейса =====
+    def remove_courier_from_order(
+        self,
+        session: Session,
+        order_id: int,
+        leg: str,  # 'pickup' или 'delivery'
+        operator_id: int,
+    ) -> bool:
+        """
+        Снять курьера с заказа (без FSM перехода).
+        Просто обнуляет stage_orders.courier_user_id + логирует в report_issues.
+        """
+        logger.debug(
+            "[DB] remove_courier_from_order: order_id=%s, leg=%s, operator_id=%s",
+            order_id, leg, operator_id
+        )
+        
+        try:
+            # 1. Получаем текущего курьера
+            old_courier = session.execute(
+                text("""
+                    SELECT courier_user_id
+                    FROM stage_orders
+                    WHERE order_id = :order_id AND leg = :leg
+                """),
+                {"order_id": order_id, "leg": leg}
+            ).scalar_one_or_none()
+            
+            if not old_courier:
+                logger.warning(
+                    "remove_courier_from_order: курьер не назначен order_id=%s, leg=%s",
+                    order_id, leg
+                )
+                return False
+            
+            # 2. Снимаем курьера (UPDATE)
+            result = session.execute(
+                text("""
+                    UPDATE stage_orders
+                    SET courier_user_id = NULL
+                    WHERE order_id = :order_id AND leg = :leg
+                """),
+                {"order_id": order_id, "leg": leg}
+            )
+            
+            if result.rowcount == 0:
+                logger.warning(
+                    "remove_courier_from_order: не удалось снять курьера order_id=%s, leg=%s",
+                    order_id, leg
+                )
+                return False
+            
+            # 3. Логируем в report_issues
+            self.create_order_issue(
+                session,
+                order_id=order_id,
+                trip_id=None,
+                user_id=operator_id,
+                issue_type="manual_override",
+                description=f"Курьер {old_courier} снят с заказа {leg} оператором"
+            )
+            
+            logger.info(
+                "Курьер %s снят с заказа %s (leg=%s) оператором %s",
+                old_courier, order_id, leg, operator_id
+            )
+            return True
+            
+        except Exception as e:
+            logger.error("remove_courier_from_order завершился с ошибкой: %s", e)
+            raise DbLayerError(f"remove_courier_from_order failed: {e}") from e
+
+    def remove_driver_from_trip(
+        self,
+        session: Session,
+        trip_id: int,
+        operator_id: int,
+    ) -> bool:
+        """
+        Снять водителя с рейса (без FSM перехода).
+        Просто обнуляет trips.driver_user_id + логирует в report_issues.
+        """
+        logger.debug(
+            "[DB] remove_driver_from_trip: trip_id=%s, operator_id=%s",
+            trip_id, operator_id
+        )
+        
+        try:
+            # 1. Получаем текущего водителя
+            old_driver = session.execute(
+                text("SELECT driver_user_id FROM trips WHERE id = :trip_id"),
+                {"trip_id": trip_id}
+            ).scalar_one_or_none()
+            
+            if not old_driver:
+                logger.warning("remove_driver_from_trip: рейс %s не найден", trip_id)
+                return False
+            
+            # 2. Снимаем водителя (UPDATE)
+            result = session.execute(
+                text("UPDATE trips SET driver_user_id = NULL WHERE id = :trip_id"),
+                {"trip_id": trip_id}
+            )
+            
+            if result.rowcount == 0:
+                logger.warning("remove_driver_from_trip: не удалось снять водителя с рейса %s", trip_id)
+                return False
+            
+            # 3. Логируем в report_issues
+            self.create_order_issue(
+                session,
+                order_id=None,
+                trip_id=trip_id,
+                user_id=operator_id,
+                issue_type="manual_override",
+                description=f"Водитель {old_driver} снят с рейса оператором"
+            )
+            
+            logger.info("Водитель %s снят с рейса %s оператором %s", old_driver, trip_id, operator_id)
+            return True
+            
+        except Exception as e:
+            logger.error("remove_driver_from_trip завершился с ошибкой: %s", e)
+            raise DbLayerError(f"remove_driver_from_trip failed: {e}") from e
+
     # ================ сброс резерва ================
 
     def get_expired_reservations(
@@ -4365,7 +4492,7 @@ class DatabaseLayer:
         self,
         session: Session,
         reservation_id: int,
-        user_id: int = 999999,  # системный пользователь
+        user_id: int = 999999,
     ) -> int:
         """
         Истечение резерва: освободить заказы + FSM переход.
@@ -4399,15 +4526,31 @@ class DatabaseLayer:
         """Назначить водителя на рейс (в trips.driver_user_id)."""
         logger.debug("set_driver_in_trip вызван: trip_id=%s, driver_id=%s", trip_id, driver_id)
         try:
+            # 1. Получаем старого водителя
+            old_driver = session.execute(
+                text("SELECT driver_user_id FROM trips WHERE id = :trip_id"),
+                {"trip_id": trip_id}
+            ).scalar_one_or_none()
+            
+            # 2. Обновляем водителя
             result = session.execute(
                 text("UPDATE trips SET driver_user_id = :driver_id WHERE id = :trip_id"),
                 {"driver_id": driver_id, "trip_id": trip_id}
             )
+            
             updated = result.rowcount > 0
             if updated:
-                logger.info("Водитель %s назначен на рейс %s", driver_id, trip_id)
+                # 3. Логируем смену водителя
+                if old_driver and old_driver != driver_id:
+                    logger.info(
+                        "Водитель рейса %s изменён: %s → %s",
+                        trip_id, old_driver, driver_id
+                    )
+                else:
+                    logger.info("Водитель %s назначен на рейс %s", driver_id, trip_id)
             else:
                 logger.warning("set_driver_in_trip: рейс %s не найден", trip_id)
+                
         except Exception as e:
             logger.error("set_driver_in_trip завершился с ошибкой: trip_id=%s, error=%s", trip_id, e)
             raise DbLayerError(f"Failed to assign driver {driver_id} to trip {trip_id}: {e}") from e

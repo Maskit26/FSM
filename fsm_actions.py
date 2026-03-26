@@ -205,6 +205,86 @@ class AssignmentActions:
             )
             return False
 
+# =========== снять курьера с заказа и водителя с рейса ======
+    def remove_courier_from_order(
+        self,
+        session: Session,
+        order_id: int,
+        executor_id: int,
+        leg: str, 
+        operator_id: int, 
+    ) -> bool:
+        """
+        Снимает курьера с заказа.
+        """
+        logger.info(
+            "[ASSIGNMENT] remove_courier_from_order order_id=%s executor=%s leg=%s operator=%s",
+            order_id, executor_id, leg, operator_id,
+        )
+
+        try:
+            success = self.db.remove_courier_from_order(
+                session, order_id, leg, operator_id
+            )
+            
+            if success:
+                logger.info(
+                    "[ASSIGNMENT] courier %s removed from order %s (leg=%s)",
+                    executor_id, order_id, leg,
+                )
+            else:
+                logger.error(
+                    "[ASSIGNMENT] failed to remove courier %s from order %s",
+                    executor_id, order_id,
+                )
+            
+            return success
+
+        except Exception:
+            logger.exception(
+                "[ASSIGNMENT] remove_courier_from_order failed order_id=%s", order_id
+            )
+            return False
+
+
+    def remove_driver_from_trip(
+        self,
+        session: Session,
+        trip_id: int,
+        executor_id: int,
+        operator_id: int, 
+    ) -> bool:
+        """
+        Снимает водителя с рейса.
+        """
+        logger.info(
+            "[ASSIGNMENT] remove_driver_from_trip trip_id=%s executor=%s operator=%s",
+            trip_id, executor_id, operator_id,
+        )
+
+        try:
+            success = self.db.remove_driver_from_trip(
+                session, trip_id, operator_id
+            )
+            
+            if success:
+                logger.info(
+                    "[ASSIGNMENT] driver %s removed from trip %s",
+                    executor_id, trip_id,
+                )
+            else:
+                logger.error(
+                    "[ASSIGNMENT] failed to remove driver %s from trip %s",
+                    executor_id, trip_id,
+                )
+            
+            return success
+
+        except Exception:
+            logger.exception(
+                "[ASSIGNMENT] remove_driver_from_trip failed trip_id=%s", trip_id
+            )
+            return False
 
 # =========== РАБОТА С ПОСТАМАТОМ ===========================
 
