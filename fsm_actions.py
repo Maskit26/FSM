@@ -1485,16 +1485,19 @@ class AccessCodeActions:
                         stage = self.db.get_stage_order(session, order_id, "pickup")
                         if stage and stage.get("reserved_by_driver_id") == user_id:
                             authorized_user_id = user_id
+                    elif user_role == "operator": 
+                        authorized_user_id = user_id
                     else:
                         return False, "USER_NOT_AUTHORIZED"
                 else:
+                    stage = self.db.get_stage_order(session, order_id, "pickup")
                     if user_role == "courier":
-                        stage = self.db.get_stage_order(session, order_id, "pickup")
                         authorized_user_id = stage["courier_user_id"] if stage else None
                     elif user_role == "driver":
-                        stage = self.db.get_stage_order(session, order_id, "pickup")
                         if stage and stage.get("reserved_by_driver_id") == user_id:
                             authorized_user_id = user_id
+                    elif user_role == "operator": 
+                        authorized_user_id = user_id
                     else:
                         return False, "USER_NOT_AUTHORIZED"
                         
@@ -1509,6 +1512,8 @@ class AccessCodeActions:
                                 authorized_user_id = user_id
                     elif user_role == "recipient":
                         authorized_user_id = order.get("recipient_user_id")
+                    elif user_role == "operator": 
+                        authorized_user_id = user_id
                     else:
                         return False, "USER_NOT_AUTHORIZED"
                 else:
@@ -1523,6 +1528,8 @@ class AccessCodeActions:
                         authorized_user_id = stage["courier_user_id"] if stage else None
                     elif user_role == "recipient":
                         authorized_user_id = order.get("recipient_user_id")
+                    elif user_role == "operator":
+                        authorized_user_id = user_id
                     else:
                         return False, "USER_NOT_AUTHORIZED"
 

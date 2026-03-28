@@ -513,6 +513,8 @@ async def view_access_code(
                     elif user_role == "driver":
                         if stage and stage.get("reserved_by_driver_id") == user_id:
                             authorized_id = user_id
+                    elif user_role == "operator":
+                        authorized_id = user_id
                 else:
                     # Курьер забирает
                     if user_role == "courier":
@@ -521,6 +523,8 @@ async def view_access_code(
                     elif user_role == "driver":
                         if stage and stage.get("reserved_by_driver_id") == user_id:
                             authorized_id = user_id
+                    elif user_role == "operator":
+                        authorized_id = user_id
             else:  # delivery
                 if order["delivery_type"] == "self":
                     # Получатель сам забирает
@@ -532,6 +536,8 @@ async def view_access_code(
                             trip = db.get_trip(session, stage["trip_id"])
                             if trip and trip["driver_user_id"] == user_id:
                                 authorized_id = user_id
+                    elif user_role == "operator":
+                        authorized_id = user_id
                 else:
                     # Курьер доставляет
                     if user_role == "courier":
@@ -541,7 +547,9 @@ async def view_access_code(
                         if stage and stage.get("trip_id"):
                             trip = db.get_trip(session, stage["trip_id"])
                             if trip and trip["driver_user_id"] == user_id:
-                                authorized_id = user_id
+                                authorized_id = user_id    
+                    elif user_role == "operator":
+                        authorized_id = user_id                
             
             if authorized_id != user_id:
                 raise HTTPException(status_code=403, detail="USER_NOT_AUTHORIZED")

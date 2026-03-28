@@ -4358,13 +4358,10 @@ class DatabaseLayer:
                         o.recipient_user_id,
                         o.created_at,
                         o.updated_at,
-                        -- pickup leg
                         so_pickup.courier_user_id as pickup_courier_id,
                         so_pickup.trip_id as pickup_trip_id,
-                        -- delivery leg
                         so_delivery.courier_user_id as delivery_courier_id,
                         so_delivery.trip_id as delivery_trip_id,
-                        -- ячейки
                         lc_src.cell_code as source_cell_code,
                         lc_dst.cell_code as dest_cell_code
                     FROM orders o
@@ -4401,11 +4398,23 @@ class DatabaseLayer:
                 # 3. Считаем статистику
                 orders_waiting_courier = len([
                     o for o in orders 
-                    if o["pickup_courier_id"] is None and o["pickup_type"] == "courier"
+                    if o["pickup_courier_id"] is None 
+                    and o["pickup_type"] == "courier"
+                    and o["status"] not in ("order_completed", "order_cancelled")
                 ])
+
                 orders_assigned = len([
                     o for o in orders 
                     if o["pickup_courier_id"] is not None
+                    and o["status"] not in ("order_completed", "order_cancelled")
+                ])
+
+                # заказы на доставку для курьера2
+                orders_waiting_delivery = len([
+                    o for o in orders 
+                    if o["delivery_courier_id"] is None 
+                    and o["delivery_type"] == "courier"
+                    and o["status"] == "order_parcel_confirmed_post2"
                 ])
                 
                 lockers.append({
