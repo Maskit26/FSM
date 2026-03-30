@@ -3484,7 +3484,7 @@ class DatabaseLayer:
                 SET so.reserved_by_driver_id = :driver_user_id,
                     so.reservation_id = :reservation_id
                 WHERE so.direction_id = :direction_id
-                AND so.leg = 'pickup'
+                AND so.leg IN ('pickup', 'delivery')
                 AND so.reserved_by_driver_id IS NULL
                 AND so.trip_id IS NULL
                 ORDER BY so.order_id ASC
@@ -3523,15 +3523,7 @@ class DatabaseLayer:
             })
             
             # 7. Обновить счётчики в directions (БЕЗ orders_total!)
-            session.execute(text("""
-                UPDATE directions
-                SET orders_reserved = orders_reserved + :count,
-                    orders_available = orders_available - :count
-                WHERE id = :direction_id
-            """), {
-                "count": reserved_count,
-                "direction_id": direction_id,
-            })
+            self.recalculate_direction_counters(session, direction_id)
             
             logger.info(
                 "reserve_orders_for_direction: direction_id=%s, driver_user_id=%s, reserved=%s, reservation_id=%s",
@@ -3741,10 +3733,9 @@ class DatabaseLayer:
         Получить order_id которые водитель фактически забрал (открыл + закрыл ячейки)
         """
         logger.debug(
-            "[DatabaseLayer] get_picked_orders_by_driver_and_direction: direction_id=%s, driver_user_id=%s",
+            "[DatabaseLayer] get_picked_orders_by_driver_and_direction: direction_id=%s, driver_user_id=%s ",
             direction_id, driver_user_id
         )
-        
         try:
             # Статусы заказов с ошибкой
             excluded_statuses = [
@@ -3755,11 +3746,9 @@ class DatabaseLayer:
                 'order_courier_failed',
                 'order_reservation_expired',
             ]
-            
-            # Динамически создаём плейсхолдеры для IN
-            excluded_placeholders = ', '.join([f':excl_{i}' for i in range(len(excluded_statuses))])
-            excluded_params = {f'excl_{i}': status for i, status in enumerate(excluded_statuses)}
-                        
+            excluded_status_placeholders = ', '.join([f':status_{i}' for i in range(len(excluded_statuses))])
+            excluded_status_params = {f'status_{i}': status for i, status in enumerate(excluded_statuses)}
+
             query = text(f"""
                 SELECT DISTINCT lc.current_order_id
                 FROM fsm_action_logs fal
@@ -3767,41 +3756,35 @@ class DatabaseLayer:
                 WHERE fal.entity_type = 'locker'
                 AND fal.action_name = 'locker_close_pickup'
                 AND fal.user_id = :driver_user_id
+                AND lc.current_order_id IS NOT NULL
                 AND lc.current_order_id IN (
                     SELECT so.order_id
                     FROM stage_orders so
+                    JOIN orders o ON o.id = so.order_id 
                     WHERE so.direction_id = :direction_id
                     AND so.leg = 'pickup'
                     AND so.reserved_by_driver_id = :driver_user_id
                     AND so.trip_id IS NULL
-                )
-                AND lc.current_order_id NOT IN (
-                    SELECT o.id
-                    FROM orders o
-                    WHERE o.status IN ({excluded_placeholders})
+                    AND o.status NOT IN ({excluded_status_placeholders})
                 )
             """)
-            
-            # Объединяем параметры
             params = {
                 "driver_user_id": driver_user_id,
                 "direction_id": direction_id,
-                **excluded_params, 
+                **excluded_status_params,
             }
-            
+
             result = session.execute(query, params).fetchall()
-            
-            picked_order_ids = [row[0] for row in result if row[0] is not None]
-            
+            picked_order_ids = [int(row[0]) for row in result if row[0] is not None]
+
             logger.info(
                 "[DatabaseLayer] get_picked_orders_by_driver_and_direction: direction_id=%s, driver_user_id=%s, picked=%d",
                 direction_id, driver_user_id, len(picked_order_ids)
             )
-            
             return picked_order_ids
-            
+
         except Exception as e:
-            logger.error("[DatabaseLayer] get_picked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
+            logger.error("get_picked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
             raise DbLayerError("get_picked_orders_by_driver_and_direction failed: %s" % e) from e
 
     def release_unpicked_orders_by_driver_and_direction(
@@ -3864,15 +3847,7 @@ class DatabaseLayer:
             session.execute(query, params)
             
             # 5. Обновляем счётчики в directions
-            session.execute(text("""
-                UPDATE directions
-                SET orders_reserved = orders_reserved - :count,
-                    orders_available = orders_available + :count
-                WHERE id = :direction_id
-            """), {
-                "count": len(unpicked),
-                "direction_id": direction_id,
-            })
+            self.recalculate_direction_counters(session, direction_id)
             
             logger.info(
                 "release_unpicked_orders_by_driver_and_direction: direction_id=%s, released=%d заказов",
@@ -3891,46 +3866,53 @@ class DatabaseLayer:
         direction_id: int,
         driver_user_id: int,
     ) -> Tuple[int, List[Dict[str, Any]]]:
-        """
-        Создать новый рейс (trip) для фактически забранных заказов.
-        """
         logger.debug(
             "[DatabaseLayer] create_trip_for_loading: direction_id=%s, driver_user_id=%s",
             direction_id, driver_user_id
         )
-        
         try:
             # 1. Получаем фактически забранные заказы
             picked_order_ids = self.get_picked_orders_by_driver_and_direction(
                 session, direction_id, driver_user_id
             )
-            
             if not picked_order_ids:
                 raise DbLayerError("NO_PICKED_ORDERS: Нет забранных заказов для создания рейса")
-            
-            # 2. Проверяем что заказы ещё не привязаны к рейсу
-            existing_trip = session.execute(text("""
-                SELECT DISTINCT trip_id FROM stage_orders
-                WHERE order_id IN :order_ids
-                AND leg = 'pickup'
-                AND trip_id IS NOT NULL
-            """), {"order_ids": tuple(picked_order_ids)}).fetchone()
-            
-            if existing_trip:
-                raise DbLayerError(f"ORDERS_ALREADY_IN_TRIP: Заказы уже в рейсе {existing_trip[0]}")
-            
-            # 3. Получаем данные направления
+
+            logger.info(
+                "[DatabaseLayer] create_trip_for_loading: found %d picked orders",
+                len(picked_order_ids)
+            )
+
+            # 2. ✅ ЯВНОЕ ПРЕОБРАЗОВАНИЕ К INT
+            picked_order_ids = [int(oid) for oid in picked_order_ids]
+
+            # 3. Проверка: не в рейсе ли уже эти заказы
+            if picked_order_ids:
+                order_placeholders = ', '.join([f':order_{i}' for i in range(len(picked_order_ids))])
+                order_params = {f'order_{i}': oid for i, oid in enumerate(picked_order_ids)}
+                
+                existing_trip_check = session.execute(text(f"""
+                    SELECT trip_id
+                    FROM stage_orders
+                    WHERE order_id IN ({order_placeholders})
+                    AND leg = 'pickup'
+                    AND trip_id IS NOT NULL
+                    LIMIT 1
+                """), order_params).fetchone()
+
+                if existing_trip_check:
+                    raise DbLayerError(f"ORDERS_ALREADY_IN_TRIP: Заказы уже в рейсе {existing_trip_check[0]}")
+
+            # 4. Получаем данные направления
             direction = session.execute(text("""
                 SELECT from_city, to_city, pickup_locker_id, delivery_locker_id
                 FROM directions WHERE id = :direction_id
             """), {"direction_id": direction_id}).fetchone()
-            
             if not direction:
                 raise DbLayerError(f"Направление {direction_id} не найдено")
-            
             from_city, to_city, pickup_locker_id, delivery_locker_id = direction
-            
-            # 4. Создаём рейс
+
+            # 5. Создаём рейс
             session.execute(text("""
                 INSERT INTO trips (
                     driver_user_id, from_city, to_city,
@@ -3948,44 +3930,49 @@ class DatabaseLayer:
                 "pickup_locker_id": pickup_locker_id,
                 "delivery_locker_id": delivery_locker_id,
             })
-            
-            trip_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
-            
+
+            # 6. ✅ ПОЛУЧАЕМ trip_id ЧЕРЕЗ fetchone()[0]
+            trip_id_row = session.execute(text("SELECT LAST_INSERT_ID()")).fetchone()
+            if not trip_id_row or trip_id_row[0] is None:
+                raise DbLayerError("Не удалось получить trip_id после INSERT")
+            trip_id = int(trip_id_row[0])
+
+            logger.info("[DatabaseLayer] create_trip_for_loading: created trip_id=%s", trip_id)
+
+            # 7. Привязываем заказы к рейсу
             if picked_order_ids:
                 order_placeholders = ', '.join([f':order_{i}' for i in range(len(picked_order_ids))])
                 order_params = {f'order_{i}': oid for i, oid in enumerate(picked_order_ids)}
-                
-                session.execute(text(f"""
+
+                query = text(f"""
                     UPDATE stage_orders
                     SET trip_id = :trip_id
                     WHERE order_id IN ({order_placeholders})
-                    AND leg = 'pickup'
+                    AND leg IN ('pickup', 'delivery')
                     AND trip_id IS NULL
-                """), {
-                    "trip_id": trip_id,
+                """)
+                params = {
+                    "trip_id": trip_id, 
                     **order_params,
-                })
-                
-                for order_id in picked_order_ids:
-                    session.execute(text("""
-                        INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id)
-                        VALUES (:trip_id, :order_id, 'delivery', NULL)
-                        ON DUPLICATE KEY UPDATE trip_id = :trip_id
-                    """), {
-                        "trip_id": trip_id,
-                        "order_id": order_id,
-                    })
-                
-            # 5. Получаем все заказы в рейсе для возврата
+                }
+                session.execute(query, params)
+                logger.info(
+                    "[DatabaseLayer] create_trip_for_loading: attached %d orders to trip_id=%s",
+                    len(picked_order_ids), trip_id
+                )
+
+            # 8. Пересчитываем счётчики направления после привязки к рейсу
+            self.recalculate_direction_counters(session, direction_id)
+
+            # 9. Получаем заказы для возврата
             trip_orders = self.get_trip_orders(session, trip_id)
-            
+
             logger.info(
                 "[DatabaseLayer] create_trip_for_loading: direction_id=%s, trip_id=%s, orders=%d",
                 direction_id, trip_id, len(picked_order_ids)
             )
-            
             return trip_id, trip_orders
-            
+
         except Exception as e:
             logger.error("[DatabaseLayer] create_trip_for_loading завершился с ошибкой: %s", e)
             raise DbLayerError("create_trip_for_loading failed: %s" % e) from e
@@ -4194,15 +4181,7 @@ class DatabaseLayer:
             })
             
             # 4. Обновляем счётчики в directions
-            session.execute(text("""
-                UPDATE directions
-                SET orders_reserved = orders_reserved - :count,
-                    orders_available = orders_available + :count
-                WHERE id = :direction_id
-            """), {
-                "count": released_count,
-                "direction_id": direction_id,
-            })
+            self.recalculate_direction_counters(session, direction_id)
             
             logger.info("release_orders_from_reservation: reservation_id=%s, released=%d", reservation_id, released_count)
             return released_count
@@ -4210,6 +4189,58 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("release_orders_from_reservation завершился с ошибкой: %s", e)
             raise DbLayerError("release_orders_from_reservation failed: %s" % e) from e
+
+    def recalculate_direction_counters(self, session: Session, direction_id: int) -> None:
+        """
+        Пересчитать orders_available и orders_reserved из stage_orders.
+        Вызывать после любых изменений в stage_orders.
+        """
+        logger.debug(f"recalculate_direction_counters: direction_id={direction_id}")
+        
+        # orders_available: заказы без reservation_id и trip_id
+        available = session.execute(text("""
+            SELECT COUNT(DISTINCT order_id)
+            FROM stage_orders
+            WHERE direction_id = :direction_id
+            AND leg = 'pickup'
+            AND reservation_id IS NULL
+            AND trip_id IS NULL
+        """), {"direction_id": direction_id}).scalar()
+        
+        # orders_reserved: заказы с reservation_id (но без trip_id)
+        reserved = session.execute(text("""
+            SELECT COUNT(DISTINCT order_id)
+            FROM stage_orders
+            WHERE direction_id = :direction_id
+            AND leg = 'pickup'
+            AND reservation_id IS NOT NULL
+            AND trip_id IS NULL
+        """), {"direction_id": direction_id}).scalar()
+        
+        # Обновить счётчики
+        old_values = session.execute(text("""
+            SELECT orders_available, orders_reserved
+            FROM directions
+            WHERE id = :direction_id
+        """), {"direction_id": direction_id}).fetchone()
+        
+        session.execute(text("""
+            UPDATE directions
+            SET orders_available = :available,
+                orders_reserved = :reserved
+            WHERE id = :direction_id
+        """), {
+            "available": available or 0,
+            "reserved": reserved or 0,
+            "direction_id": direction_id,
+        })
+        
+        logger.info(
+            f"recalculate_direction_counters: direction_id={direction_id}, "
+            f"was_available={old_values[0] if old_values else 'N/A'}, "
+            f"was_reserved={old_values[1] if old_values else 'N/A'}, "
+            f"new_available={available or 0}, new_reserved={reserved or 0}"
+        )
 
     # ================ Оператор =====================
     # ================ Вывод ленты рейсов ===========
@@ -4997,13 +5028,7 @@ class DatabaseLayer:
             )
         
         # 3. Обновить счётчик в directions
-        session.execute(text("""
-            UPDATE directions
-            SET orders_available = orders_available + 1
-            WHERE id = :direction_id
-        """), {
-            "direction_id": direction_id,
-        })
+        self.recalculate_direction_counters(session, direction_id)
         
         logger.info(f"Заказ {order_id} привязан к направлению {direction_id}")
         
