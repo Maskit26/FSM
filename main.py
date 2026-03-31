@@ -417,6 +417,20 @@ async def get_user_orders(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/api/orders/recipient/{recipient_id}", response_model=List[dict])
+async def get_recipient_orders(
+    recipient_id: int,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить все заказы получателя по его ID.
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            return db.get_recipient_orders(session, recipient_id)
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
 @app.get("/api/orders/courier/{courier_id}", response_model=List[dict])
 async def get_courier_orders_endpoint(
     courier_id: int,

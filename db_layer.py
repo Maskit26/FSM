@@ -744,6 +744,65 @@ class DatabaseLayer:
             logger.error("get_user_orders завершился с ошибкой для user_id=%s: %s", user_id, e)
             raise DbLayerError(f"get_user_orders failed: {e}") from e
 
+    def get_recipient_orders(self, session: Session, recipient_id: int) -> List[Dict[str, Any]]:
+        """
+        Получить все заказы получателя.
+        
+        Источник истины:
+        - orders (recipient_user_id)
+        """
+        logger.debug("get_recipient_orders вызван для recipient_id=%s", recipient_id)
+        
+        if recipient_id <= 0:
+            raise DbLayerError("Invalid recipient_id")
+        
+        try:
+            rows = session.execute(
+                text("""
+                    SELECT
+                        o.id,
+                        o.status,
+                        o.description,
+                        o.parcel_type,
+                        o.pickup_type,
+                        o.delivery_type,
+                        o.source_cell_id,
+                        o.dest_cell_id,
+                        o.client_user_id,
+                        o.recipient_user_id,
+                        o.created_at,
+                        o.updated_at
+                    FROM orders o
+                    WHERE o.recipient_user_id = :recipient_id
+                    ORDER BY o.created_at DESC
+                """),
+                {"recipient_id": recipient_id},
+            ).fetchall()
+            
+            orders: List[Dict[str, Any]] = []
+            for row in rows:
+                orders.append({
+                    "id": row[0],
+                    "status": row[1],
+                    "description": row[2],
+                    "parcel_type": row[3],
+                    "pickup_type": row[4],
+                    "delivery_type": row[5],
+                    "source_cell_id": row[6],
+                    "dest_cell_id": row[7],
+                    "client_user_id": row[8],
+                    "recipient_user_id": row[9],
+                    "created_at": row[10].isoformat() if row[10] else None,
+                    "updated_at": row[11].isoformat() if row[11] else None,
+                })
+            
+            logger.debug("get_recipient_orders: найдено %d заказов для recipient_id=%s", len(orders), recipient_id)
+            return orders
+            
+        except Exception as e:
+            logger.error("get_recipient_orders завершился с ошибкой для recipient_id=%s: %s", recipient_id, e)
+            raise DbLayerError(f"get_recipient_orders failed: {e}") from e
+
     def get_courier_orders(
         self, 
         session: Session, 
