@@ -5715,3 +5715,110 @@ class DatabaseLayer:
             logger.error("get_log_counters завершился с ошибкой: %s", e)
             return 0, 0, 0
     
+# ==================== CORE USER MAPPING ====================
+    def get_core_user_id(self, session: Session, user_id: int) -> Optional[int]:
+        """
+        Получить core_u_id по local_user_id.
+        """
+        logger.debug("get_core_user_id вызван: user_id=%s", user_id)
+        try:
+            row = session.execute(
+                text("""
+                    SELECT core_u_id FROM core_user_mapping 
+                    WHERE local_user_id = :user_id
+                """),
+                {"user_id": user_id}
+            ).fetchone()
+            result = row[0] if row else None
+            logger.debug("get_core_user_id: user_id=%s → %s", user_id, result)
+            return result
+        except Exception as e:
+            logger.error("get_core_user_id завершился с ошибкой: %s", e)
+            raise DbLayerError(f"get_core_user_id failed: {e}") from e
+
+    def create_user_core_mapping(
+        self,
+        session: Session,
+        user_id: int,
+        core_u_id: int,
+        core_role: int,
+        performer_type: str,
+        transport_type: Optional[str] = None,
+        capabilities: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        Создать соответствие user_id ↔ core_u_id (идемпотентно с UPSERT).
+        """
+        logger.debug(
+            "create_user_core_mapping вызван: user_id=%s, core_u_id=%s",
+            user_id, core_u_id
+        )
+        try:
+            import json
+            session.execute(
+                text("""
+                    INSERT INTO core_user_mapping 
+                        (local_user_id, core_u_id, core_role, performer_type, transport_type, 
+                        capabilities, sync_status, registered_at, last_sync_at)
+                    VALUES 
+                        (:local_id, :core_id, :core_role, :performer_type, :transport_type, 
+                        :capabilities, 'success', NOW(), NOW())
+                    ON DUPLICATE KEY UPDATE 
+                        core_u_id = VALUES(core_u_id),
+                        core_role = VALUES(core_role),
+                        performer_type = VALUES(performer_type),
+                        transport_type = VALUES(transport_type),
+                        capabilities = VALUES(capabilities),
+                        last_sync_at = NOW(),
+                        sync_status = 'success'
+                """),
+                {
+                    "local_id": user_id,
+                    "core_id": core_u_id,
+                    "core_role": core_role,
+                    "performer_type": performer_type,
+                    "transport_type": transport_type,
+                    "capabilities": json.dumps(capabilities) if capabilities else None,
+                }
+            )
+            logger.info(
+                "create_user_core_mapping: user_id=%s ↔ core_u_id=%s",
+                user_id, core_u_id
+            )
+            return True
+        except Exception as e:
+            logger.error("create_user_core_mapping завершился с ошибкой: %s", e)
+            raise DbLayerError(f"create_user_core_mapping failed: {e}") from e
+
+    def create_user_record(
+        self,
+        session: Session,
+        phone: str,
+        name: str,
+        role: str,
+        city: Optional[str] = None,
+    ) -> int:
+        """
+        Создать пользователя в локальной БД.
+        Returns: user_id
+        """
+        logger.debug("create_user_record вызван: phone=%s, role=%s", phone, role)
+        try:
+            result = session.execute(
+                text("""
+                    INSERT INTO users (phone, name, role, city, created_at)
+                    VALUES (:phone, :name, :role, :city, NOW())
+                """),
+                {
+                    "phone": phone,
+                    "name": name,
+                    "role": role,
+                    "city": city,
+                }
+            )
+            user_id = result.lastrowid
+            logger.info("create_user_record: создан user_id=%s", user_id)
+            return user_id
+        except Exception as e:
+            logger.error("create_user_record завершился с ошибкой: %s", e)
+            raise DbLayerError(f"create_user_record failed: {e}") from e

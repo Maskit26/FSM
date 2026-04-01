@@ -9,6 +9,7 @@ from fsm_engine import PROCESS_DEFS
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
+from adapter import CoreAdapter, CoreUnavailableError, CoreValidationError
 
 from db_layer import DatabaseLayer, DbLayerError, FsmCallError
 from models import (
@@ -18,6 +19,7 @@ from models import (
     UserCreateRequest, LockerCreateRequest,
     CellCreateRequest, CellResponse, ButtonResponse,
     ClientCreateOrderRequest, FsmEnqueueRequest,
+    UserRegisterRequest,
 )
 
 # ======================
@@ -55,7 +57,7 @@ def get_db_session(read_only: bool = True) -> Generator[Session, None, None]:
         if not read_only:
             session.commit()
         else:
-            session.rollback()  # read-only rollback для очистки транзакции
+            session.rollback() 
     except Exception:
         session.rollback()
         raise
@@ -68,6 +70,15 @@ def get_db_session(read_only: bool = True) -> Generator[Session, None, None]:
 def get_db() -> Generator[DatabaseLayer, None, None]:
     """Возвращает stateless экземпляр DatabaseLayer (без сессии!)."""
     yield DatabaseLayer()
+
+# =====================
+# CORE ADAPTER
+# =====================
+core_adapter = CoreAdapter(
+    core_url=os.getenv("CORE_URL", "https://ibronevik.ru/taxi/c/0/"),
+    core_api_key=os.getenv("CORE_API_KEY", ""),
+    core_timeout=5
+)
 
 # ======================
 # FASTAPI APP
@@ -1350,3 +1361,69 @@ async def get_log_counters(db: DatabaseLayer = Depends(get_db)):
             }
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
+
+# ==================== CORE USER MAPPING ====================
+@app.post("/api/users/register", response_model=dict)
+async def register_user(
+    data: UserRegisterRequest,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Регистрация пользователя.
+    1. Создаёт в Delivery (через db_layer)
+    2. Синхронизирует с Core (через adapter)
+    3. ⚠️ Откатывает транзакцию если Core недоступен
+    """
+    with get_db_session(read_only=False) as session:
+        try:
+            # 1. Создаём пользователя в Delivery
+            user_id = db.create_user_record(
+                session=session,
+                phone=data.get("phone"),
+                name=data.get("name"),
+                role=data.get("role_name", "client"),
+                city=data.get("city"),
+            )
+            
+            # 2. Синхронизируем с Core
+            core_u_id, performer_type = core_adapter.sync_user_to_core(
+                session, user_id, {
+                    "name": data.get("name"),
+                    "phone": data.get("phone"),
+                    "email": data.get("email"),
+                    "role_name": data.get("role_name", "client"),
+                    "performer_type": data.get("performer_type"),
+                    "transport_type": data.get("transport_type"),
+                    "capabilities": ["delivery"] if data.get("role_name") in ["driver", "courier"] else None,
+                }
+            )
+            
+            # 3. Коммит (если Core успешно ответил)
+            session.commit()
+            
+            return {
+                "user_id": user_id,
+                "core_user_id": core_u_id,
+                "performer_type": performer_type,
+                "core_sync_status": "success",
+                "message": "Пользователь зарегистрирован"
+            }
+            
+        except CoreUnavailableError as e:
+            # ⚠️ Core недоступен — откат!
+            session.rollback()
+            return {
+                "user_id": user_id if 'user_id' in locals() else None,
+                "core_user_id": None,
+                "performer_type": None,
+                "core_sync_status": "unavailable",
+                "message": "CORE_UNAVAILABLE: попробуйте позже"
+            }
+        
+        except DbLayerError as e:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+        
+        except Exception as e:
+            session.rollback()
+            raise HTTPException(status_code=500, detail=f"REGISTRATION_FAILED: {str(e)}")

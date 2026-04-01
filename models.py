@@ -135,3 +135,22 @@ class DirectionSlotActionRequest(BaseModel):
     direction_id: int
     driver_user_id: int
     reservation_id: Optional[int] = None
+
+# ==================== CORE USER MAPPING ====================
+class UserRegisterRequest(BaseModel):
+    """Запрос на регистрацию пользователя"""
+    name: str
+    phone: str
+    email: Optional[str] = None
+    role_name: str = "client"  # client, courier, driver, admin
+    performer_type: Optional[str] = None  # courier, driver (для исполнителей)
+    transport_type: Optional[str] = None  # car, bike, foot
+    city: Optional[str] = None
+
+class UserRegisterResponse(BaseModel):
+    """Ответ после регистрации"""
+    user_id: int
+    core_user_id: Optional[int] = None
+    performer_type: Optional[str] = None
+    core_sync_status: str  # success, failed, unavailable
+    message: str
