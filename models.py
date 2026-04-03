@@ -146,6 +146,7 @@ class UserRegisterRequest(BaseModel):
     performer_type: Optional[str] = None  # courier, driver (для исполнителей)
     transport_type: Optional[str] = None  # car, bike, foot
     city: Optional[str] = None
+    password: str
 
 class UserRegisterResponse(BaseModel):
     """Ответ после регистрации"""
@@ -153,4 +154,17 @@ class UserRegisterResponse(BaseModel):
     core_user_id: Optional[int] = None
     performer_type: Optional[str] = None
     core_sync_status: str  # success, failed, unavailable
+    message: str
+
+class UserLoginRequest(BaseModel):
+    login: str
+    password: str
+    type: str = "phone"
+
+class UserLoginResponse(BaseModel):
+    success: bool
+    token: Optional[str] = None
+    user_id: Optional[int] = None
+    core_user_id: Optional[int] = None
+    role: Optional[str] = None
     message: str

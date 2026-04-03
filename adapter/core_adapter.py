@@ -5,7 +5,7 @@
 import logging
 from typing import Dict, Any, Tuple
 from .core_client import CoreClient
-from .mappers.user import to_core_register, from_core_register
+from .mappers.user import to_core_register, from_core_register, to_core_login, from_core_login
 from .exceptions import CoreUnavailableError, CoreValidationError, CoreAdapterError
 
 logger = logging.getLogger(__name__)
@@ -22,8 +22,10 @@ class CoreAdapter:
         try:
             payload = to_core_register(user_data)
             
+            logger.info("Core register payload (without password): %s", 
+                    {k: v for k, v in payload.items() if k != "password"})
             logger.debug("Core API request: POST /api/v1/register/ with payload: %s", 
-                        {k: v for k, v in payload.items() if k != "password"})  # не логируем пароль
+                        {k: v for k, v in payload.items() if k != "password"}) 
             
             response = self.client.post_form("/api/v1/register/", payload)
             
@@ -47,3 +49,27 @@ class CoreAdapter:
         except Exception as e:
             logger.error("get_user_info failed: %s", e)
             raise CoreAdapterError(f"Core fetch error: {e}") from e
+
+# ========================== Авторизация ===================
+    def authenticate_user(
+        self, 
+        login: str, 
+        password: str, 
+        type: str = "phone"
+    ) -> Dict[str, Any]:
+        """
+        Авторизация пользователя через Core.
+        Возвращает: {"core_u_id": int, "auth_hash": str, ...}
+        """
+        logger.info("authenticate_user: login=%s, type=%s", login, type)
+        try:
+            payload = to_core_login(login, password, type)
+            masked_payload = {k: ('***' if k == 'password' else v) for k, v in payload.items()}
+            logger.info("Core login payload: %s", masked_payload)
+            response = self.client.post_form("/api/v1/auth/", payload)
+            return from_core_login(response)
+        except (CoreUnavailableError, CoreValidationError):
+            raise
+        except Exception as e:
+            logger.exception("authenticate_user failed")
+            raise CoreAdapterError(f"Auth failed: {e}") from e

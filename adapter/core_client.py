@@ -61,3 +61,28 @@ class CoreClient:
         except Exception as e:
             logger.error("Core FORM POST error: %s", e)
             raise CoreUnavailableError(str(e)) from e
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=2, max=10),
+        retry=retry_if_exception_type(CoreUnavailableError)
+    )
+    def get(self, endpoint: str) -> Dict[str, Any]:
+        """GET запрос."""
+        url = f"{self.base_url}{endpoint.lstrip('/')}"
+        headers = {**self.headers}
+        try:
+            resp = requests.get(url, headers=headers, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise CoreAuthError("Unauthorized")
+            if e.response.status_code == 400:
+                raise CoreValidationError("Bad request")
+            if e.response.status_code >= 500:
+                raise CoreUnavailableError("Core server error")
+            raise
+        except Exception as e:
+            logger.error("Core GET error: %s", e)
+            raise CoreUnavailableError(str(e)) from e

@@ -5842,19 +5842,4 @@ class DatabaseLayer:
             logger.error("get_local_user_id_by_core_u_id завершился с ошибкой: %s", e)
             raise DbLayerError(f"get_local_user_id_by_core_u_id failed: {e}") from e
 
-    def get_local_user_id_by_core_u_id(
-        self,
-        session: Session,
-        core_u_id: int
-    ) -> Optional[int]:
-        """Поиск local_user_id по core_u_id. Только чтение."""
-        logger.debug("get_local_user_id_by_core_u_id: core_u_id=%s", core_u_id)
-        try:
-            row = session.execute(
-                text("SELECT local_user_id FROM core_user_mapping WHERE core_u_id = :core_u_id"),
-                {"core_u_id": core_u_id}
-            ).fetchone()
-            return row[0] if row else None
-        except Exception as e:
-            logger.error("get_local_user_id_by_core_u_id failed: %s", e)
-            raise DbLayerError(f"Mapping lookup failed: {e}") from e
+    

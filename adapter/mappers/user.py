@@ -25,25 +25,29 @@ def to_core_register(user_data: Dict[str, Any]) -> Dict[str, Any]:
     payload = {
         "u_name": user_data.get("name", "User"),
         "u_role": core_role,
-        "st": 1,  
+        "st": 1,
     }
 
     if user_data.get("phone"):
         payload["u_phone"] = user_data["phone"]
     if user_data.get("email"):
         payload["u_email"] = user_data["email"]
-
+    
     u_details = {"source": "fsm_backend"}
+
     if core_role == 2:
         u_details["performer"] = {
             "type": user_data.get("performer_type", "driver"),
             "transport": {"type": user_data.get("transport_type", "car")},
             "capabilities": user_data.get("capabilities", ["delivery"]),
         }
-    
-    # Core принимает `data` как JSON-строку внутри form-data
-    payload["data"] = json.dumps({"u_details": u_details})
-    
+
+    data_obj = {"u_details": u_details}
+    if user_data.get("password"):
+        data_obj["password"] = user_data["password"]
+
+    payload["data"] = json.dumps(data_obj)
+
     logger.debug("to_core_register: role=%s → core_role=%s", role_name, core_role)
     return payload
 
@@ -78,4 +82,31 @@ def from_core_register(core_response: Any) -> Dict[str, Any]:
         "capabilities": performer.get("capabilities", []),
         "token": data.get("token"),
         "u_hash": data.get("u_hash"),
+    }
+
+# ========================= Авторизация ===============================
+
+def to_core_login(login: str, password: str, type: str = "phone") -> Dict[str, Any]:
+    """Подготовка данных для авторизации в Core."""
+    return {"login": login, "password": password, "type": type}
+
+def from_core_login(core_response: Any) -> Dict[str, Any]:
+    """Парсинг ответа Core после авторизации."""
+    if isinstance(core_response, list):
+        core_response = core_response[0] if core_response else {}
+    if not isinstance(core_response, dict):
+        raise CoreMappingError(f"Core вернул неожиданный тип: {type(core_response)}")
+
+    if core_response.get("status") == "error":
+        raise CoreValidationError(f"Core auth error: {core_response.get('message')}")
+    if core_response.get("code") and str(core_response.get("code")).startswith("4"):
+        raise CoreValidationError(f"Core auth error {core_response.get('code')}: {core_response.get('message')}")
+
+    # Данные пользователя лежат в auth_user, а не в data
+    auth_user = core_response.get("auth_user", {})
+    return {
+        "core_u_id": auth_user.get("u_id"),
+        "auth_hash": core_response.get("auth_hash"),
+        "core_role": auth_user.get("u_role"),
+        "user_name": auth_user.get("u_name"),
     }

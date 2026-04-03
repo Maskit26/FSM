@@ -49,32 +49,75 @@ class UserMapping:
         logger.info("register_user: успешно local=%s, core=%s", local_user_id, core_u_id)
         return local_user_id, core_u_id, performer_type
 
-    def get_or_create_by_core_id(self, session: Session, core_u_id: int) -> int:
-        """Ленивое создание локальной проекции при первом обращении."""
+    def get_or_create_by_core_id(
+        self, 
+        session: Session, 
+        core_u_id: int, 
+        auth_data: Optional[Dict[str, Any]] = None
+    ) -> int:
+        """
+        Ленивое создание локальной проекции при первом обращении.
+        """
         logger.debug("get_or_create_by_core_id: core_u_id=%s", core_u_id)
 
-        # Проверка через db_layer (без прямого SQL)
         existing_id = self.db.get_local_user_id_by_core_u_id(session, core_u_id)
+        logger.info("existing_id for core_u_id %s: %s", core_u_id, existing_id)
         if existing_id:
             return existing_id
 
-        # Получаем данные из Core
-        info = self.core_adapter.get_user_info_from_core(core_u_id)
-        
-        # Маппинг роли Core -> FSM
+        # Если есть auth_data, создаём локального пользователя из этих данных (без запроса к Core)
+        if auth_data:
+            user_name = auth_data.get("user_name", f"User_{core_u_id}")
+            phone = auth_data.get("login", "")
+            core_role = auth_data.get("core_role", 1)
+
+            # Маппинг роли Core -> локальная роль
+            if core_role == 1:
+                local_role = "client"
+            elif core_role == 2:
+                local_role = "driver"
+            elif core_role == 3:
+                local_role = "operator"
+            else:
+                local_role = "client"
+
+            local_user_id = self.db.create_user_record(
+                session=session,
+                phone=phone,
+                name=user_name,
+                role_name=local_role,
+                city=None,
+            )
+
+            self.db.create_user_core_mapping(
+                session=session,
+                user_id=local_user_id,
+                core_u_id=core_u_id,
+                core_role=core_role,
+                performer_type="client",
+                transport_type=None,
+                capabilities=None,
+            )
+
+            logger.info("get_or_create_by_core_id: создан local=%s из auth_data", local_user_id)
+            return local_user_id
+
+        # Если auth_data нет, пробуем получить данные из Core (для совместимости)
+        info = self.core_adapter.get_user_info(core_u_id)
+
         core_role = info.get("core_role", 1)
-        local_role = "client"
         if core_role == 2:
             local_role = info.get("performer_type", "driver")
         elif core_role == 3:
             local_role = "operator"
+        else:
+            local_role = "client"
 
-        # Создание в БД
         local_user_id = self.db.create_user_record(
             session=session,
             phone=info.get("phone", ""),
             name=info.get("name", f"User_{core_u_id}"),
-            role=local_role,
+            role_name=local_role,
             city=info.get("city"),
         )
 
@@ -94,3 +137,34 @@ class UserMapping:
     def _map_role_to_core(self, role_name: str) -> int:
         from .mappers.user import ROLE_TO_CORE
         return ROLE_TO_CORE.get(role_name, 1)
+
+# ==================== Авторизация ===============================
+    def authenticate_user(
+        self,
+        session: Session,
+        login: str,
+        password: str,
+        type: str = "phone"
+    ) -> Dict[str, Any]:
+        """
+        Авторизация: Core → Lazy Create Local → Return.
+        """
+        logger.info("authenticate_user: login=%s", login)
+
+        # 1. Проверка в Core        
+        auth_data = self.core_adapter.authenticate_user(login, password, type)
+        logger.info("auth_data received: %s", auth_data)
+        core_u_id = auth_data["core_u_id"]
+
+        # 2. Ленивое создание локальной проекции (если ещё нет) с передачей auth_data
+        local_user_id = self.get_or_create_by_core_id(session, core_u_id, auth_data)
+
+        logger.info("authenticate_user: success local=%s, core=%s", local_user_id, core_u_id)
+
+        return {
+            "local_user_id": local_user_id,
+            "core_user_id": core_u_id,
+            "auth_hash": auth_data.get("auth_hash"),
+            "role": auth_data.get("core_role"),
+            "message": "Успешно"
+        }

@@ -9,8 +9,7 @@ from fsm_engine import PROCESS_DEFS
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
-from adapter import CoreAdapter
-from adapter import UserMapping
+from adapter import CoreAdapter, UserMapping
 import logging
 from adapter.exceptions import (
     CoreUnavailableError,
@@ -28,7 +27,7 @@ from models import (
     UserCreateRequest, LockerCreateRequest,
     CellCreateRequest, CellResponse, ButtonResponse,
     ClientCreateOrderRequest, FsmEnqueueRequest,
-    UserRegisterRequest,
+    UserRegisterRequest, UserLoginRequest,
 )
 
 # ======================
@@ -1405,6 +1404,7 @@ async def register_user(
                     "transport_type": data.transport_type,
                     "capabilities": ["delivery"] if data.role_name in ["driver", "courier"] else None,
                     "city": data.city,
+                    "password": data.password,
                 }
             )
             session.commit()
@@ -1465,3 +1465,36 @@ async def register_user(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"INTERNAL_ERROR: {str(e)}"
             )
+
+@app.post("/api/users/login", response_model=dict)
+async def login_user(
+    data: UserLoginRequest,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Авторизация пользователя.
+    1. Проверяет логин/пароль в Core
+    2. Создаёт локальную проекцию, если её нет
+    3. Возвращает auth_hash/core_u_id для дальнейших запросов
+    """
+    with get_db_session(read_only=False) as session:
+        try:
+            user_mapping = UserMapping(core_adapter=core_adapter, db=db)
+            result = user_mapping.authenticate_user(
+                session=session,
+                login=data.login,
+                password=data.password,
+                type=data.type
+            )
+            session.commit()
+            return {"success": True, **result}
+            
+        except CoreValidationError as e:
+            session.rollback()
+            logger.warning("AUTH_VALIDATION_ERROR: %s", e)
+            raise HTTPException(status_code=401, detail=str(e))
+            
+        except Exception as e:
+            session.rollback()
+            logger.exception("LOGIN_FAILED")
+            raise HTTPException(status_code=500, detail="Internal login error")
