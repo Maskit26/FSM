@@ -3,7 +3,7 @@
 Только HTTP-запросы, без работы с БД.
 """
 import logging
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 from .core_client import CoreClient
 from .mappers.user import to_core_register, from_core_register, to_core_login, from_core_login
 from .exceptions import CoreUnavailableError, CoreValidationError, CoreAdapterError
@@ -14,30 +14,26 @@ class CoreAdapter:
     def __init__(self, core_url: str, core_api_key: str, core_timeout: int = 5):
         self.client = CoreClient(core_url, core_api_key, timeout=core_timeout)
 
-    def register_user_in_core(self, user_data: Dict[str, Any]) -> Tuple[int, str]:
-        """Регистрация в Core. Возвращает (core_u_id, performer_type)."""
+    def register_user_in_core(self, user_data: Dict[str, Any]) -> Tuple[int, str, Optional[str]]:
+        """Регистрация в Core. Возвращает (core_u_id, performer_type, transport_type)."""
         logger.info("register_user_in_core: phone=%s, role=%s", 
                     user_data.get("phone"), user_data.get("role_name"))
-        
         try:
             payload = to_core_register(user_data)
-            
             logger.info("Core register payload (without password): %s", 
-                    {k: v for k, v in payload.items() if k != "password"})
-            logger.debug("Core API request: POST /api/v1/register/ with payload: %s", 
-                        {k: v for k, v in payload.items() if k != "password"}) 
-            
+                        {k: v for k, v in payload.items() if k != "password"})
             response = self.client.post_form("/api/v1/register/", payload)
-            
             parsed = from_core_register(response)
-            logger.info("Core registration success: core_u_id=%s", parsed.get("core_u_id"))
-            return parsed["core_u_id"], parsed["performer_type"]
-            
+            logger.info("Core registration success: core_u_id=%s, transport_type=%s", 
+                        parsed.get("core_u_id"), parsed.get("transport_type"))
+            return (
+                parsed["core_u_id"],
+                parsed["performer_type"]
+            )
         except (CoreUnavailableError, CoreValidationError):
             raise
         except Exception as e:
-            logger.exception("register_user_in_core failed for user_data: %s", 
-                            {k: v for k, v in user_data.items() if k != "password"})
+            logger.exception("register_user_in_core failed")
             raise CoreAdapterError(f"Core error: {e}") from e
 
     def get_user_info(self, core_u_id: int) -> Dict[str, Any]:
@@ -73,3 +69,14 @@ class CoreAdapter:
         except Exception as e:
             logger.exception("authenticate_user failed")
             raise CoreAdapterError(f"Auth failed: {e}") from e
+
+# ========================= Деавторизация =========================
+    def logout_user(self, auth_hash: str) -> Dict[str, Any]:
+        """Деавторизация пользователя в Core."""
+        logger.info("logout_user: auth_hash=%s", auth_hash[:10] + "...")
+        try:
+            response = self.client.logout(auth_hash)
+            return response
+        except Exception as e:
+            logger.error("logout_user failed: %s", e)
+            raise CoreAdapterError(f"Logout failed: {e}") from e

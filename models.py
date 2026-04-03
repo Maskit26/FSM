@@ -168,3 +168,6 @@ class UserLoginResponse(BaseModel):
     core_user_id: Optional[int] = None
     role: Optional[str] = None
     message: str
+
+class LogoutRequest(BaseModel):
+    auth_hash: str

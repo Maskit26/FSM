@@ -86,3 +86,24 @@ class CoreClient:
         except Exception as e:
             logger.error("Core GET error: %s", e)
             raise CoreUnavailableError(str(e)) from e
+
+    def logout(self, auth_hash: str) -> Dict[str, Any]:
+        """
+        Выход из системы (завершение сессии в Core).
+        auth_hash передаётся в заголовке Authorization: Bearer.
+        """
+        url = f"{self.base_url}api/v1/logout/"
+        headers = {**self.headers, "Authorization": f"Bearer {auth_hash}"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise CoreAuthError("Invalid or expired auth_hash")
+            if e.response.status_code >= 500:
+                raise CoreUnavailableError("Core server error")
+            raise
+        except Exception as e:
+            logger.error("Core logout error: %s", e)
+            raise CoreUnavailableError(str(e)) from e
