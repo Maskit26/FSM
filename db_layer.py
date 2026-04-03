@@ -5795,24 +5795,24 @@ class DatabaseLayer:
         session: Session,
         phone: str,
         name: str,
-        role: str,
+        role_name: str, 
         city: Optional[str] = None,
     ) -> int:
         """
         Создать пользователя в локальной БД.
         Returns: user_id
         """
-        logger.debug("create_user_record вызван: phone=%s, role=%s", phone, role)
+        logger.debug("create_user_record вызван: phone=%s, role_name=%s", phone, role_name)
         try:
             result = session.execute(
                 text("""
-                    INSERT INTO users (phone, name, role, city, created_at)
-                    VALUES (:phone, :name, :role, :city, NOW())
+                    INSERT INTO users (phone, name, role_name, city)
+                    VALUES (:phone, :name, :role_name, :city)
                 """),
                 {
                     "phone": phone,
                     "name": name,
-                    "role": role,
+                    "role_name": role_name,
                     "city": city,
                 }
             )
@@ -5822,3 +5822,39 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("create_user_record завершился с ошибкой: %s", e)
             raise DbLayerError(f"create_user_record failed: {e}") from e
+
+    def get_local_user_id_by_core_u_id(
+        self,
+        session: Session,
+        core_u_id: int
+    ) -> Optional[int]:
+        """Получить local_user_id по core_u_id из core_user_mapping."""
+        logger.debug("get_local_user_id_by_core_u_id вызван: core_u_id=%s", core_u_id)
+        try:
+            row = session.execute(
+                text("SELECT local_user_id FROM core_user_mapping WHERE core_u_id = :core_u_id"),
+                {"core_u_id": core_u_id}
+            ).fetchone()
+            result = row[0] if row else None
+            logger.debug("get_local_user_id_by_core_u_id: core_u_id=%s → %s", core_u_id, result)
+            return result
+        except Exception as e:
+            logger.error("get_local_user_id_by_core_u_id завершился с ошибкой: %s", e)
+            raise DbLayerError(f"get_local_user_id_by_core_u_id failed: {e}") from e
+
+    def get_local_user_id_by_core_u_id(
+        self,
+        session: Session,
+        core_u_id: int
+    ) -> Optional[int]:
+        """Поиск local_user_id по core_u_id. Только чтение."""
+        logger.debug("get_local_user_id_by_core_u_id: core_u_id=%s", core_u_id)
+        try:
+            row = session.execute(
+                text("SELECT local_user_id FROM core_user_mapping WHERE core_u_id = :core_u_id"),
+                {"core_u_id": core_u_id}
+            ).fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error("get_local_user_id_by_core_u_id failed: %s", e)
+            raise DbLayerError(f"Mapping lookup failed: {e}") from e

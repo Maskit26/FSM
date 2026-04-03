@@ -1,5 +1,10 @@
 """
 Мапперы данных между Delivery и Core.
 """
+from .user import to_core_register, from_core_register, ROLE_TO_CORE
 
-from .user import to_core_register, from_core_register, get_performer_type_from_core, ROLE_TO_CORE
+__all__ = [
+    "to_core_register",
+    "from_core_register",
+    "ROLE_TO_CORE",
+]

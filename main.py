@@ -9,7 +9,16 @@ from fsm_engine import PROCESS_DEFS
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
-from adapter import CoreAdapter, CoreUnavailableError, CoreValidationError
+from adapter import CoreAdapter
+from adapter import UserMapping
+import logging
+from adapter.exceptions import (
+    CoreUnavailableError,
+    CoreValidationError, 
+    CoreAdapterError,
+    CoreAuthError,
+    CoreMappingError
+)
 
 from db_layer import DatabaseLayer, DbLayerError, FsmCallError
 from models import (
@@ -20,6 +29,16 @@ from models import (
     CellCreateRequest, CellResponse, ButtonResponse,
     ClientCreateOrderRequest, FsmEnqueueRequest,
     UserRegisterRequest,
+)
+
+# ======================
+# ЛОГГЕР
+# ======================
+import logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
 )
 
 # ======================
@@ -1182,7 +1201,7 @@ async def create_user(request: UserCreateRequest, db: DatabaseLayer = Depends(ge
     """Создать пользователя"""
     with get_db_session(read_only=False) as session:
         try:
-            db.create_user(
+            db.create_user_record(
                 session,
                 user_id=request.user_id,
                 name=request.name,
@@ -1370,60 +1389,79 @@ async def register_user(
 ):
     """
     Регистрация пользователя.
-    1. Создаёт в Delivery (через db_layer)
-    2. Синхронизирует с Core (через adapter)
-    3. ⚠️ Откатывает транзакцию если Core недоступен
     """
     with get_db_session(read_only=False) as session:
         try:
-            # 1. Создаём пользователя в Delivery
-            user_id = db.create_user_record(
-                session=session,
-                phone=data.get("phone"),
-                name=data.get("name"),
-                role=data.get("role_name", "client"),
-                city=data.get("city"),
-            )
+            user_mapping = UserMapping(core_adapter=core_adapter, db=db)
             
-            # 2. Синхронизируем с Core
-            core_u_id, performer_type = core_adapter.sync_user_to_core(
-                session, user_id, {
-                    "name": data.get("name"),
-                    "phone": data.get("phone"),
-                    "email": data.get("email"),
-                    "role_name": data.get("role_name", "client"),
-                    "performer_type": data.get("performer_type"),
-                    "transport_type": data.get("transport_type"),
-                    "capabilities": ["delivery"] if data.get("role_name") in ["driver", "courier"] else None,
+            local_id, core_id, perf_type = user_mapping.register_user(
+                session=session,
+                user_data={
+                    "name": data.name,
+                    "phone": data.phone,
+                    "email": data.email,
+                    "role_name": data.role_name,
+                    "performer_type": data.performer_type,
+                    "transport_type": data.transport_type,
+                    "capabilities": ["delivery"] if data.role_name in ["driver", "courier"] else None,
+                    "city": data.city,
                 }
             )
-            
-            # 3. Коммит (если Core успешно ответил)
             session.commit()
-            
             return {
-                "user_id": user_id,
-                "core_user_id": core_u_id,
-                "performer_type": performer_type,
+                "success": True,
+                "user_id": local_id,
+                "core_user_id": core_id,
+                "performer_type": perf_type,
                 "core_sync_status": "success",
                 "message": "Пользователь зарегистрирован"
             }
             
-        except CoreUnavailableError as e:
-            # ⚠️ Core недоступен — откат!
+        # Ошибка валидации данных от Core (400 Bad Request)
+        except CoreValidationError as e:
             session.rollback()
+            logger.warning(f"CORE_VALIDATION_ERROR: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"CORE_VALIDATION_ERROR: {str(e)}"
+            )
+            
+        # Core недоступен — откатываем, но НЕ 500 (пользователь создан локально)
+        except CoreUnavailableError as e:
+            session.rollback()
+            logger.error(f"CORE_UNAVAILABLE: {str(e)}")
             return {
-                "user_id": user_id if 'user_id' in locals() else None,
+                "success": True,
+                "user_id": None,  
                 "core_user_id": None,
                 "performer_type": None,
                 "core_sync_status": "unavailable",
-                "message": "CORE_UNAVAILABLE: попробуйте позже"
+                "message": "CORE_UNAVAILABLE: пользователь создан локально, синхронизация отложена"
             }
-        
+            
+        # Ошибка адаптера (непредвиденная)
+        except CoreAdapterError as e:
+            session.rollback()
+            logger.exception(f"CORE_ADAPTER_ERROR: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"CORE_ADAPTER_ERROR: {str(e)}"
+            )
+            
+        # Ошибка валидации входных данных (Pydantic/DB)
         except DbLayerError as e:
             session.rollback()
-            raise HTTPException(status_code=400, detail=str(e))
-        
+            logger.error(f"DB_LAYER_ERROR: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"DB_ERROR: {str(e)}"
+            )
+            
+        # Любая другая ошибка
         except Exception as e:
             session.rollback()
-            raise HTTPException(status_code=500, detail=f"REGISTRATION_FAILED: {str(e)}")
+            logger.exception(f"REGISTRATION_UNEXPECTED_ERROR: {type(e).__name__}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"INTERNAL_ERROR: {str(e)}"
+            )
