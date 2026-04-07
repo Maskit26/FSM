@@ -19,41 +19,32 @@ class UserMapping:
     def register_user(self, session: Session, user_data: Dict[str, Any]) -> Tuple[int, int, str]:
         logger.info("register_user: начало для phone=%s", user_data.get("phone"))
 
-        # 1. Запрос в Core
+        # 1. Запрос в Core (прокси)
         core_u_id, performer_type = self.core_adapter.register_user_in_core(user_data)
 
         # 2. Определяем локальную роль для таблицы users
         role_name = user_data.get("role_name", "client")
-        transport_type = user_data.get("transport_type")  # берём из запроса
+        transport_type = user_data.get("transport_type")
         if role_name == "driver" and transport_type == "bike":
             local_role = "courier"
         else:
             local_role = role_name
 
-        # 3. Создание локального пользователя
-        local_user_id = self.db.create_user_record(
-            session=session,
-            phone=user_data.get("phone", ""),
-            name=user_data.get("name", f"User_{core_u_id}"),
-            role_name=local_role,
-            city=user_data.get("city"),
-        )
-
-        # 4. Создание связи
-        core_role = self._map_role_to_core(user_data.get("role_name"))
-        if core_role == 2:
-            final_performer_type = "driver"
-        else:
-            final_performer_type = None
-
-        self.db.create_user_core_mapping(
-            session=session,
-            user_id=local_user_id,
-            core_u_id=core_u_id,
-            core_role=core_role,
-            performer_type=final_performer_type,
-            transport_type=transport_type, 
-            capabilities=user_data.get("capabilities"),
+        # 3. Синхронизация (создаст или обновит пользователя и mapping)
+        local_user_id = self.get_or_create_by_core_id(
+            session,
+            core_u_id,
+            auth_data={
+                "user_name": user_data.get("name"),
+                "login": user_data.get("phone") or user_data.get("email"),
+                "core_role": self._map_role_to_core(role_name),
+                "phone": user_data.get("phone"),
+                "email": user_data.get("email"),
+                "city": user_data.get("city"),
+                "performer_type": "driver" if self._map_role_to_core(role_name) == 2 else None,
+                "transport_type": transport_type,
+                "capabilities": user_data.get("capabilities"),
+            }
         )
 
         logger.info("register_user: успешно local=%s, core=%s", local_user_id, core_u_id)
@@ -91,13 +82,13 @@ class UserMapping:
                 phone=phone,
                 name=user_name,
                 role_name=local_role,
-                city=None,
+                city=auth_data.get("city"),
             )
 
-            if core_role == 2:
-                performer_type = "driver"
-            else:
-                performer_type = None
+            # Берём performer_type, transport_type, capabilities из auth_data
+            performer_type = auth_data.get("performer_type")
+            transport_type = auth_data.get("transport_type")
+            capabilities = auth_data.get("capabilities")
 
             self.db.create_user_core_mapping(
                 session=session,
@@ -105,8 +96,8 @@ class UserMapping:
                 core_u_id=core_u_id,
                 core_role=core_role,
                 performer_type=performer_type,
-                transport_type=None,   
-                capabilities=None,
+                transport_type=transport_type,
+                capabilities=capabilities,
             )
 
             logger.info("get_or_create_by_core_id: создан local=%s из auth_data", local_user_id)
