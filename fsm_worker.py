@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 
 from db_layer import DatabaseLayer, DbLayerError
+from adapter.core_adapter import CoreAdapter
 from fsm_engine import (
     build_actions_context,
     run_fsm_step,
@@ -54,6 +55,13 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# ================== CORE ADAPTER ====================
+core_adapter = CoreAdapter(
+    core_url=os.getenv("CORE_URL", "https://ibronevik.ru/taxi/c/0/"),
+    core_api_key=os.getenv("CORE_API_KEY", ""),
+    core_timeout=5
+)
+
 # ================== CONTEXT MANAGER ==================
 
 @contextmanager
@@ -93,6 +101,7 @@ def row_to_instance_dict(row: Tuple[Any, ...]) -> Dict[str, Any]:
 
 def process_instance(
     db: DatabaseLayer,
+    core_adapter: CoreAdapter,
     instance_row: Any,
 ) -> None:
     """
@@ -113,7 +122,7 @@ def process_instance(
                 )
                 instance["metadata"] = {}
 
-            actions_ctx = build_actions_context(db)
+            actions_ctx = build_actions_context(db, core_adapter)
 
             logger.info(
                 "[FSM] start instance_id=%s process=%s state=%s attempts=%s",
@@ -191,10 +200,9 @@ def process_instance(
                     last_error=result.last_error,
                     attempts_increment=result.attempts_increment or 0,
                 )
-                # Контекст-менеджер сделает commit этого апдейта при выходе
-                return # Выходим из функции, чтобы не идти в логику COMPLETED
+                return 
             
-            # Если всё SUCCESS - просто обновляем инстанс (commit сделает контекст-менеджер)
+            # Если всё SUCCESS
             db.update_fsm_instance(
                 session=session,
                 instance_id=instance["id"],
@@ -326,7 +334,7 @@ def main():
 
                 # Обрабатываем каждый инстанс в отдельной транзакции
                 futures = [
-                    executor.submit(process_instance, db, row)
+                    executor.submit(process_instance, db, core_adapter, row)
                     for row in rows
                 ]
 
@@ -336,12 +344,11 @@ def main():
                 # Проверяем зависшие инстансы
                 check_stuck_instances(db)                  
 
-                # ================= НОВОЕ: Создаём инстанс locker_cleanup периодически =================
+                # ================= Создаём инстанс locker_cleanup периодически =================
                 current_time = time.time()
                 if current_time - _last_cleanup_check >= LOCKER_CLEANUP_INTERVAL_SECONDS:
                     try:
                         with get_db_session() as session:
-                            # Вызываем метод DB layer вместо прямого SQL
                             db.ensure_locker_cleanup_instance(
                                 session=session,
                                 threshold_minutes=30

@@ -8,6 +8,7 @@ import json
 import logging
 
 from db_layer import DatabaseLayer, DbLayerError
+from adapter.order_mapping import OrderMapping
 from fsm_actions import (
     OrderCreationActions,
     AssignmentActions,
@@ -36,37 +37,32 @@ FsmStateHandler = Callable[[DatabaseLayer, Session, Dict[str, Any], Dict[str, An
 
 
 # ==================== ORDER CREATION ====================
-def _handle_order_creation_pending(
-    db: DatabaseLayer,
-    session: Session,          
-    ctx: Dict[str, Any],
-    instance: Dict[str, Any]
-) -> FsmStepResult:
-    """
-    Обработчик состояния PENDING для процесса 'order_creation'.
-    Создаёт заказ из заявки и резервирует ячейки.
-    Если ячейки не найдены или заказ не создан → FAILED.
-    """
-    actions: OrderCreationActions = ctx["order_creation_actions"]
-    fsm_id = instance["id"]
+def _handle_order_creation_pending(db, session, ctx, instance):
     request_id = instance["entity_id"]
+    logger.info("FSM order_creation: processing request_id=%s", request_id)
 
-    logger.info(f"[FSM] order_creation PENDING: fsm_id={fsm_id}, request_id={request_id}")
-
-    # Единственный вызов — создание заказа (включает поиск и резерв ячеек)
-    ok, order_id, code = actions.create_order_from_request(session, request_id)  
+    actions = ctx["order_creation_actions"]
+    ok, src_id, dst_id, client_id, recipient_id, err = actions.create_order_from_request(session, request_id)
     if not ok:
-        error_code = code or "ORDER_CREATION_FAILED"
-        logger.error(f"[FSM] create_order_from_request FAILED: request_id={request_id}, code={error_code}")
-        return FsmStepResult(new_state="FAILED", last_error=error_code, attempts_increment=1)
+        logger.error("FSM order_creation: reserve cells failed for request %s: %s", request_id, err)
+        return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
 
-    logger.info(f"[FSM] order_creation COMPLETED: fsm_id={fsm_id}, request_id={request_id}, order_id={order_id}")
-    return FsmStepResult(
-        new_state="COMPLETED", 
-        last_error=None, 
-        attempts_increment=1,
-        payload={"order_id": order_id}  
+    order_mapping = ctx["order_mapping"]
+    ok, core_order_id, err = order_mapping.create_order_in_core(session, request_id, src_id, dst_id)
+    if not ok:
+        logger.error("FSM order_creation: Core call failed for request %s: %s", request_id, err)
+        return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
+
+    ok, local_order_id, err = actions.finalize_order_creation(
+        session, request_id, core_order_id, src_id, dst_id, client_id, recipient_id
     )
+    if not ok:
+        logger.error("FSM order_creation: finalize failed for request %s: %s", request_id, err)
+        return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
+
+    logger.info("FSM order_creation: completed request %s -> local_order_id=%s, core_order_id=%s",
+                request_id, local_order_id, core_order_id)
+    return FsmStepResult(new_state="COMPLETED", payload={"order_id": local_order_id})
 
 
 # ==================== ASSIGN EXECUTOR ====================
@@ -354,14 +350,30 @@ def _handle_cancel_order(
 ) -> FsmStepResult:
     """
     Универсальная отмена заказа.
+    Сначала отменяет заказ в Core (если есть mapping), затем выполняет локальную отмену.
     Роли: client, courier, operator.
     """
     user_role = instance["requested_user_role"]
     order_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
+    metadata = instance.get("metadata", {})
+    reason = metadata.get("reason") 
 
-    logger.info(f"[FSM] cancel_order: role={user_role}, order_id={order_id}, user_id={user_id}")
+    logger.info("[FSM] cancel_order: role=%s, order_id=%s, user_id=%s, reason=%s", user_role, order_id, user_id, reason)
 
+    # 1. Отмена в Core (если доступен OrderMapping)
+    order_mapping = ctx.get("order_mapping")
+    if order_mapping:
+        logger.debug("[FSM] cancel_order: calling Core cancellation for order_id=%s", order_id)
+        ok, err = order_mapping.cancel_order_in_core(session, order_id, user_id, reason=reason)
+        if not ok:
+            logger.error("[FSM] cancel_order: Core cancellation failed for order %s: %s", order_id, err)
+            return FsmStepResult(new_state="FAILED", last_error=f"CORE_CANCEL_FAILED: {err}")
+        logger.info("[FSM] cancel_order: Core cancellation succeeded for order_id=%s", order_id)
+    else:
+        logger.warning("[FSM] cancel_order: order_mapping not available, skipping Core cancellation")
+
+    # 2. Локальная отмена через actions
     if user_role == "client":
         success, error = ctx["client_actions"].cancel_order(session, order_id, user_id)
     elif user_role == "courier":
@@ -369,14 +381,14 @@ def _handle_cancel_order(
     elif user_role == "operator":
         success, error = ctx["operator_actions"].force_cancel_order(session, order_id, user_id)
     else:
-        logger.warning(f"[FSM] cancel_order: not allowed for role {user_role}")
+        logger.warning("[FSM] cancel_order: not allowed for role %s", user_role)
         return FsmStepResult(new_state="FAILED", last_error=f"CANCEL_NOT_ALLOWED_FOR_{user_role}")
 
     if not success:
-        logger.error(f"[FSM] cancel_order FAILED: order_id={order_id}, error={error}")
+        logger.error("[FSM] cancel_order: local cancellation failed for order_id=%s, error=%s", order_id, error)
         return FsmStepResult(new_state="FAILED", last_error=error)
-    
-    logger.info(f"[FSM] cancel_order COMPLETED: order_id={order_id}")
+
+    logger.info("[FSM] cancel_order: COMPLETED for order_id=%s", order_id)
     return FsmStepResult(new_state="COMPLETED")
 
 
@@ -1025,7 +1037,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
 }
 
 
-def build_actions_context(db: DatabaseLayer) -> Dict[str, Any]:
+def build_actions_context(db: DatabaseLayer, core_adapter: CoreAdapter) -> Dict[str, Any]:
     """Собирает actions-контексты для всех процессов."""
     return {
         "order_creation_actions": OrderCreationActions(db),
@@ -1038,6 +1050,7 @@ def build_actions_context(db: DatabaseLayer) -> Dict[str, Any]:
         "access_code_actions": AccessCodeActions(db),
         "trip_actions": TripActions(db),
         "locker_actions": LockerActions(db),
+        "order_mapping": OrderMapping(db, core_adapter),
     }
 
 

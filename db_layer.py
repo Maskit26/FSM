@@ -32,6 +32,7 @@ import json
 import requests
 import secrets
 import hashlib
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -2129,7 +2130,7 @@ class DatabaseLayer:
                 """),
                 {"limit": limit},
             ).fetchall()
-
+            logger.info("FETCHED ROWS: %s", [(r[0], r[4]) for r in rows])
             logger.debug("fetch_ready_fsm_instances: найдено %d инстансов", len(rows))
             return rows
 
@@ -2253,7 +2254,6 @@ class DatabaseLayer:
             ).scalar_one()
             
             # Парсим ENUM: enum('type1','type2',...) → ['type1', 'type2', ...]
-            import re
             types = re.findall(r"'([^']+)'", result)
             
             logger.debug("get_error_types: найдено %d типов", len(types))
@@ -5716,26 +5716,7 @@ class DatabaseLayer:
             return 0, 0, 0
     
 # ==================== CORE USER MAPPING ====================
-    def get_core_user_id(self, session: Session, user_id: int) -> Optional[int]:
-        """
-        Получить core_u_id по local_user_id.
-        """
-        logger.debug("get_core_user_id вызван: user_id=%s", user_id)
-        try:
-            row = session.execute(
-                text("""
-                    SELECT core_u_id FROM core_user_mapping 
-                    WHERE local_user_id = :user_id
-                """),
-                {"user_id": user_id}
-            ).fetchone()
-            result = row[0] if row else None
-            logger.debug("get_core_user_id: user_id=%s → %s", user_id, result)
-            return result
-        except Exception as e:
-            logger.error("get_core_user_id завершился с ошибкой: %s", e)
-            raise DbLayerError(f"get_core_user_id failed: {e}") from e
-
+    
     def create_user_core_mapping(
         self,
         session: Session,
@@ -5754,7 +5735,6 @@ class DatabaseLayer:
             user_id, core_u_id
         )
         try:
-            import json
             session.execute(
                 text("""
                     INSERT INTO core_user_mapping 
@@ -5842,4 +5822,160 @@ class DatabaseLayer:
             logger.error("get_local_user_id_by_core_u_id завершился с ошибкой: %s", e)
             raise DbLayerError(f"get_local_user_id_by_core_u_id failed: {e}") from e
 
+    def get_user_core_tokens(self, session: Session, core_u_id: int) -> Tuple[Optional[str], Optional[str]]:
+        row = session.execute(
+            text("SELECT token, u_hash FROM core_user_mapping WHERE core_u_id = :core_id"),
+            {"core_id": core_u_id}
+        ).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+
+    def update_user_core_tokens(self, session: Session, core_u_id: int, token: str, u_hash: str) -> None:
+        session.execute(
+            text("""
+                UPDATE core_user_mapping
+                SET token = :token, u_hash = :u_hash, last_sync_at = NOW()
+                WHERE core_u_id = :core_u_id
+            """),
+            {"token": token, "u_hash": u_hash, "core_u_id": core_u_id}
+        )
+
+# ==================== CORE ORDERS MAPPING ===================
+    
+    def get_locker_address_by_cell(self, session: Session, cell_id: int) -> str:
+        logger.debug("get_locker_address_by_cell: cell_id=%s", cell_id)
+        row = session.execute(
+            text("""
+                SELECT l.location_address
+                FROM locker_cells lc
+                JOIN lockers l ON l.id = lc.locker_id
+                WHERE lc.id = :cell_id
+            """),
+            {"cell_id": cell_id}
+        ).fetchone()
+        if not row or not row[0]:
+            logger.error("No address found for cell_id=%s", cell_id)
+            raise DbLayerError(f"No address for cell {cell_id}")
+        address = row[0]
+        logger.debug("get_locker_address_by_cell: cell_id=%s -> address='%s'", cell_id, address)
+        return address
+
+    def update_order_request_core_data(
+        self, session: Session, request_id: int, core_order_id: int, src_cell_id: int, dst_cell_id: int
+    ) -> None:
+        logger.debug("update_order_request_core_data: request_id=%s, core_order_id=%s, src=%s, dst=%s",
+                    request_id, core_order_id, src_cell_id, dst_cell_id)
+        session.execute(
+            text("""
+                UPDATE order_requests
+                SET core_order_id = :core_id, src_cell_id = :src, dst_cell_id = :dst
+                WHERE id = :rid
+            """),
+            {"core_id": core_order_id, "src": src_cell_id, "dst": dst_cell_id, "rid": request_id}
+        )
+        logger.info("Updated order_requests %s with core_order_id=%s", request_id, core_order_id)
+
+    def get_or_create_order_by_core_id(
+        self,
+        session: Session,
+        core_order_id: int,
+        client_user_id: int,
+        recipient_user_id: Optional[int],
+        description: str,
+        parcel_type: str,
+        cell_size: str,
+        pickup_type: str,
+        delivery_type: str,
+    ) -> int:
+        logger.debug("get_or_create_order_by_core_id: core_order_id=%s, client=%s, recipient=%s",
+                    core_order_id, client_user_id, recipient_user_id)
+
+        # 1. Проверяем маппинг
+        row = session.execute(
+            text("""
+                SELECT local_entity_id, sync_status
+                FROM core_entity_mapping
+                WHERE core_entity_type = 'order' AND core_entity_id = :core_id
+            """),
+            {"core_id": core_order_id}
+        ).fetchone()
+        if row:
+            local_id, status = row
+            logger.info("Found existing mapping: local_order_id=%s, sync_status=%s", local_id, status)
+            # Обновляем время последней синхронизации и сбрасываем ошибку
+            session.execute(
+                text("""
+                    UPDATE core_entity_mapping
+                    SET last_sync_at = NOW(),
+                        sync_status = 'success',
+                        error_message = NULL
+                    WHERE core_entity_type = 'order' AND core_entity_id = :core_id
+                """),
+                {"core_id": core_order_id}
+            )
+            logger.debug("Updated mapping for core_order_id=%s: last_sync_at=NOW, sync_status=success", core_order_id)
+            return local_id
+
+        # 2. Создаём локальный заказ
+        logger.info("No local order found for core_order_id=%s, creating new order", core_order_id)
+        order_id = self.create_order_record(
+            session=session,
+            description=description,
+            pickup_type=pickup_type,
+            delivery_type=delivery_type,
+            client_user_id=client_user_id,
+            recipient_user_id=recipient_user_id,
+            source_cell_id=None,
+            dest_cell_id=None,
+        )
+        logger.debug("Created local order %s", order_id)
+
+        # 3. Сохраняем маппинг
+        session.execute(
+            text("""
+                INSERT INTO core_entity_mapping
+                    (local_entity_type, local_entity_id, core_entity_type, core_entity_id,
+                    sync_status, last_sync_at, error_message)
+                VALUES ('order', :local_id, 'order', :core_id, 'success', NOW(), NULL)
+            """),
+            {"local_id": order_id, "core_id": core_order_id}
+        )
+        logger.info("Created mapping: local_order_id=%s <-> core_order_id=%s", order_id, core_order_id)
+        return order_id
+
+    def update_order_cells(self, session: Session, order_id: int, src_cell_id: int, dst_cell_id: int) -> None:
+        session.execute(
+            text("UPDATE orders SET source_cell_id = :src, dest_cell_id = :dst WHERE id = :oid"),
+            {"src": src_cell_id, "dst": dst_cell_id, "oid": order_id}
+        )
+
+    def get_core_u_id_by_local_user_id(self, session: Session, local_user_id: int) -> Optional[int]:
+        row = session.execute(
+            text("SELECT core_u_id FROM core_user_mapping WHERE local_user_id = :local_id"),
+            {"local_id": local_user_id}
+        ).fetchone()
+        return row[0] if row else None
+
+# ==================== Отмена заказа =============================
+    def get_core_order_id_by_local_order_id(self, session: Session, local_order_id: int) -> Optional[int]:
+        """
+        Возвращает core_entity_id (b_id) по локальному order_id из core_entity_mapping.
+        """
+        logger.debug("get_core_order_id_by_local_order_id: local_order_id=%s", local_order_id)
+        try:
+            row = session.execute(
+                text("""
+                    SELECT core_entity_id
+                    FROM core_entity_mapping
+                    WHERE local_entity_type = 'order'
+                    AND local_entity_id = :local_id
+                    AND core_entity_type = 'order'
+                """),
+                {"local_id": local_order_id}
+            ).fetchone()
+            result = row[0] if row else None
+            logger.debug("get_core_order_id_by_local_order_id: local_order_id=%s -> %s", local_order_id, result)
+            return result
+        except Exception as e:
+            logger.error("get_core_order_id_by_local_order_id failed for local_order_id=%s: %s", local_order_id, e)
+            raise DbLayerError(f"Failed to get core order id: {e}") from e
     

@@ -171,3 +171,22 @@ class UserLoginResponse(BaseModel):
 
 class LogoutRequest(BaseModel):
     auth_hash: str
+
+    # ========== CORE ORDER MODELS ==========
+class CoreOrderCreateRequest(BaseModel):
+    """Данные для создания заказа в Core (параметры для /api/v1/drive)."""
+    b_start_address: str
+    b_destination_address: str
+    city_start: Optional[str] = None
+    city_destination: Optional[str] = None
+    b_payment_way: int = 2
+    b_start_datetime: str = "any"
+    b_passengers_count: int = 1
+    b_luggage_count: int = 0
+    b_options: Optional[str] = None  # JSON-строка с дополнительными данными
+
+class CoreOrderCreateResponse(BaseModel):
+    """Ответ Core после создания заказа."""
+    code: str
+    status: str
+    data: Dict[str, Any]

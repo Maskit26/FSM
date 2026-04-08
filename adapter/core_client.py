@@ -1,6 +1,7 @@
 # core_client.py
 import requests
 import logging
+import json
 from typing import Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from .exceptions import CoreUnavailableError, CoreAuthError, CoreValidationError
@@ -106,4 +107,50 @@ class CoreClient:
             raise
         except Exception as e:
             logger.error("Core logout error: %s", e)
+            raise CoreUnavailableError(str(e)) from e
+
+    def get_token(self, auth_hash: str) -> Dict[str, Any]:
+        url = f"{self.base_url}api/v1/token/"
+        data = {"auth_hash": auth_hash}
+        try:
+            resp = requests.post(url, data=data, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise CoreAuthError("Invalid or expired auth_hash")
+            if e.response.status_code >= 500:
+                raise CoreUnavailableError("Core server error")
+            raise
+        except Exception as e:
+            logger.error("Core get_token error: %s", e)
+            raise CoreUnavailableError(str(e)) from e
+
+# ===================== CORE ORDER ======================
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=2, max=10),
+        retry=retry_if_exception_type(CoreUnavailableError)
+    )
+    def post_form_without_auth(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST с form-urlencoded, без заголовка Authorization."""
+        url = f"{self.base_url}{endpoint.lstrip('/')}"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        try:
+            resp = requests.post(url, data=data, headers=headers, timeout=self.timeout)
+            logger.info(f"Core response status: {resp.status_code}, body: {resp.text}")   # <-- добавить
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            error_body = e.response.text if e.response else 'No response body'
+            logger.error(f"Core HTTP {e.response.status_code}: {error_body}")
+            if e.response.status_code == 401:
+                raise CoreAuthError(f"Authentication failed for {endpoint}")
+            if e.response.status_code == 400:
+                raise CoreValidationError(f"Bad request: {error_body}")
+            if e.response.status_code >= 500:
+                raise CoreUnavailableError(f"Core 5xx: {e.response.status_code}")
+            raise
+        except Exception as e:
+            logger.error("Core POST form without auth error: %s", e)
             raise CoreUnavailableError(str(e)) from e

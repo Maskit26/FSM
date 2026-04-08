@@ -20,90 +20,91 @@ class OrderCreationActions:
         self,
         session: Session,
         request_id: int,
-    ) -> Tuple[bool, Optional[int], str]:
-        logger.info("[ORDER_CREATE] start request_id=%s", request_id)
-
+    ) -> Tuple[bool, Optional[int], Optional[int], Optional[int], Optional[int], str]:
+        logger.info("create_order_from_request (reserve cells): request_id=%s", request_id)
         try:
             req = self.db.get_order_request(session, request_id)
             if not req or req["status"] != "PENDING":
-                return False, None, "REQ_NOT_FOUND_OR_INVALID"
+                logger.warning("create_order_from_request: request %s not found or status not PENDING", request_id)
+                return False, None, None, None, None, "REQ_NOT_FOUND_OR_INVALID"
 
             client_user_id = req["client_user_id"]
             if not client_user_id:
-                return False, None, "INVALID_DATA"
+                logger.warning("create_order_from_request: client_user_id missing for request %s", request_id)
+                return False, None, None, None, None, "INVALID_DATA"
+
+            cell_size = req["cell_size"]
+            recipient_user_id = req["recipient_user_id"]
+            if not recipient_user_id:
+                logger.warning("create_order_from_request: recipient_user_id missing for request %s", request_id)
+                return False, None, None, None, None, "RECIPIENT_USER_ID_REQUIRED"
+
+            client_city = self.db.get_user_city(session, client_user_id)
+            recipient_city = self.db.get_user_city(session, recipient_user_id)
+            logger.debug("create_order_from_request: cities client=%s recipient=%s", client_city, recipient_city)
+
+            if client_city == recipient_city:
+                logger.warning("create_order_from_request: same city %s for request %s", client_city, request_id)
+                return False, None, None, None, None, f"SELF_CITY_NOT_ALLOWED: {client_city}"
+
+            ok, src_id, dst_id = self.db.find_and_reserve_cells_by_cities(
+                session, client_city, recipient_city, cell_size
+            )
+            if not ok:
+                logger.warning("create_order_from_request: no free cells for route %s -> %s, size=%s",
+                               client_city, recipient_city, cell_size)
+                return False, None, None, None, None, "NO_FREE_CELLS"
+
+            logger.info("create_order_from_request: reserved cells src=%s dst=%s for request %s",
+                        src_id, dst_id, request_id)
+            return True, src_id, dst_id, client_user_id, recipient_user_id, ""
+
+        except Exception as e:
+            logger.exception("create_order_from_request failed for request %s: %s", request_id, e)
+            return False, None, None, None, None, f"EXCEPTION: {e}"
+
+    def finalize_order_creation(
+        self,
+        session: Session,
+        request_id: int,
+        core_order_id: int,
+        src_cell_id: int,
+        dst_cell_id: int,
+        client_user_id: int,
+        recipient_user_id: Optional[int],
+    ) -> Tuple[bool, Optional[int], str]:
+        logger.info("finalize_order_creation: request_id=%s, core_order_id=%s", request_id, core_order_id)
+        try:
+            req = self.db.get_order_request(session, request_id)
+            if not req:
+                logger.error("finalize_order_creation: request %s not found", request_id)
+                return False, None, "REQ_NOT_FOUND"
 
             parcel_type = req["parcel_type"]
-            recipient_user_id = req["recipient_user_id"]
             cell_size = req["cell_size"]
             sender_delivery = req["sender_delivery"]
             recipient_delivery = req["recipient_delivery"]
-
             description = f"{parcel_type} ({cell_size})"
             pickup_type = "self" if sender_delivery == "self" else "courier"
             delivery_type = "self" if recipient_delivery == "self" else "courier"
 
-            # Получаем город клиента и получателя
-            client_city = self.db.get_user_city(session, client_user_id)
-            if not recipient_user_id:
-                return False, None, "RECIPIENT_USER_ID_REQUIRED"
-
-            recipient_city = self.db.get_user_city(session, recipient_user_id)
-
-            # Определяем маршрут: от клиента → к получателю
-            source_city = client_city
-            dest_city = recipient_city
-
-            # Запрещаем отправку в тот же город
-            if source_city == dest_city:
-                return False, None, f"SELF_CITY_NOT_ALLOWED: {source_city}"
-
-            # 🔒 поиск + резерв ячеек
-            ok, src_id, dst_id = self.db.find_and_reserve_cells_by_cities(
-                session, source_city, dest_city, cell_size
+            local_order_id = self.db.get_or_create_order_by_core_id(
+                session, core_order_id, client_user_id, recipient_user_id,
+                description, parcel_type, cell_size, pickup_type, delivery_type
             )
-            if not ok:
-                logger.info("[ORDER_CREATE] no free cells in route %s → %s", source_city, dest_city)
-                return False, None, "NO_FREE_CELLS"
+            logger.info("finalize_order_creation: local_order_id=%s created/retrieved", local_order_id)
 
-            # 🧾 создание заказа
-            order_id = self.db.create_order_record(
-                session,
-                description=description,
-                pickup_type=pickup_type,
-                delivery_type=delivery_type,
-                client_user_id=client_user_id,
-                recipient_user_id=recipient_user_id,
-                source_cell_id=src_id,
-                dest_cell_id=dst_id,
-            )
+            self.db.bind_cells_for_order(session, local_order_id, src_cell_id, dst_cell_id)
+            self.db.update_order_cells(session, local_order_id, src_cell_id, dst_cell_id)
+            self.db.create_stage_order(session, None, local_order_id, "pickup")
+            self.db.create_stage_order(session, None, local_order_id, "delivery")
 
-            # привязываем ячейки к заказу
-            self.db.bind_cells_for_order(session, order_id, src_id, dst_id)
+            logger.info("finalize_order_creation: order %s finalized successfully", local_order_id)
+            return True, local_order_id, ""
 
-            # ✅ СОЗДАЁМ stage_orders с trip_id
-            self.db.create_stage_order(
-                session,
-                trip_id=None, 
-                order_id=order_id,
-                leg="pickup",
-                courier_user_id=None,
-            )
-            self.db.create_stage_order(
-                session,
-                trip_id=None,
-                order_id=order_id,
-                leg="delivery",
-                courier_user_id=None,
-            )
-
-            logger.info("[ORDER_CREATE] success order_id=%s", order_id)
-            return True, order_id, ""
-
-        except DbLayerError:
-            raise
         except Exception as e:
-            logger.exception("create_order_from_request crash")
-            raise DbLayerError(str(e))
+            logger.exception("finalize_order_creation failed for request %s: %s", request_id, e)
+            return False, None, f"EXCEPTION: {e}"
 
 
 class AssignmentActions:
