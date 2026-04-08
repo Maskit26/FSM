@@ -5858,22 +5858,7 @@ class DatabaseLayer:
         address = row[0]
         logger.debug("get_locker_address_by_cell: cell_id=%s -> address='%s'", cell_id, address)
         return address
-
-    def update_order_request_core_data(
-        self, session: Session, request_id: int, core_order_id: int, src_cell_id: int, dst_cell_id: int
-    ) -> None:
-        logger.debug("update_order_request_core_data: request_id=%s, core_order_id=%s, src=%s, dst=%s",
-                    request_id, core_order_id, src_cell_id, dst_cell_id)
-        session.execute(
-            text("""
-                UPDATE order_requests
-                SET core_order_id = :core_id, src_cell_id = :src, dst_cell_id = :dst
-                WHERE id = :rid
-            """),
-            {"core_id": core_order_id, "src": src_cell_id, "dst": dst_cell_id, "rid": request_id}
-        )
-        logger.info("Updated order_requests %s with core_order_id=%s", request_id, core_order_id)
-
+        
     def get_or_create_order_by_core_id(
         self,
         session: Session,

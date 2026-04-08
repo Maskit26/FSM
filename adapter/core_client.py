@@ -35,12 +35,7 @@ class CoreClient:
         except Exception as e:
             logger.error("Core JSON POST error: %s", e)
             raise CoreUnavailableError(str(e)) from e
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(min=2, max=10),
-        retry=retry_if_exception_type(CoreUnavailableError)
-    )
+    
     def post_form(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """POST запрос с application/x-www-form-urlencoded (для регистрации в Core)."""
         logger.debug("CoreClient.post_form: endpoint=%s, data=%s", endpoint, {k: v for k, v in data.items() if k != "password"})
@@ -127,11 +122,7 @@ class CoreClient:
             raise CoreUnavailableError(str(e)) from e
 
 # ===================== CORE ORDER ======================
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(min=2, max=10),
-        retry=retry_if_exception_type(CoreUnavailableError)
-    )
+    
     def post_form_without_auth(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """POST с form-urlencoded, без заголовка Authorization."""
         url = f"{self.base_url}{endpoint.lstrip('/')}"
