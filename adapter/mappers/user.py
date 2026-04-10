@@ -43,6 +43,8 @@ def to_core_register(user_data: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     data_obj = {"u_details": u_details}
+    if core_role == 2:
+        data_obj["u_check_state"] = 2 
     if user_data.get("password"):
         data_obj["password"] = user_data["password"]
 

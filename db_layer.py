@@ -2129,8 +2129,7 @@ class DatabaseLayer:
                     LIMIT :limit
                 """),
                 {"limit": limit},
-            ).fetchall()
-            logger.info("FETCHED ROWS: %s", [(r[0], r[4]) for r in rows])
+            ).fetchall()            
             logger.debug("fetch_ready_fsm_instances: найдено %d инстансов", len(rows))
             return rows
 
@@ -5838,6 +5837,46 @@ class DatabaseLayer:
             """),
             {"token": token, "u_hash": u_hash, "core_u_id": core_u_id}
         )
+
+    def get_car_core_id(self, session: Session, local_user_id: int) -> Optional[int]:
+        """
+        Возвращает car_core_id для локального пользователя из core_user_mapping.
+        """
+        logger.debug("get_car_core_id: local_user_id=%s", local_user_id)
+        try:
+            row = session.execute(
+                text("SELECT car_core_id FROM core_user_mapping WHERE local_user_id = :uid"),
+                {"uid": local_user_id}
+            ).fetchone()
+            car_core_id = row[0] if row else None
+            logger.debug("get_car_core_id: local_user_id=%s -> car_core_id=%s", local_user_id, car_core_id)
+            return car_core_id
+        except Exception as e:
+            logger.error("get_car_core_id failed for local_user_id=%s: %s", local_user_id, e)
+            raise DbLayerError(f"Failed to get car_core_id: {e}") from e
+
+    def update_car_core_id(self, session: Session, local_user_id: int, car_core_id: int) -> bool:
+        """
+        Обновляет car_core_id для локального пользователя.
+        """
+        logger.info("update_car_core_id: local_user_id=%s, car_core_id=%s", local_user_id, car_core_id)
+        try:
+            result = session.execute(
+                text("""
+                    UPDATE core_user_mapping
+                    SET car_core_id = :car_core_id, last_sync_at = NOW()
+                    WHERE local_user_id = :uid
+                """),
+                {"car_core_id": car_core_id, "uid": local_user_id}
+            )
+            if result.rowcount == 0:
+                logger.warning("update_car_core_id: no mapping found for local_user_id=%s", local_user_id)
+                return False
+            logger.info("update_car_core_id: successfully updated car_core_id=%s for user %s", car_core_id, local_user_id)
+            return True
+        except Exception as e:
+            logger.error("update_car_core_id failed for local_user_id=%s: %s", local_user_id, e)
+            raise DbLayerError(f"Failed to update car_core_id: {e}") from e
 
 # ==================== CORE ORDERS MAPPING ===================
     

@@ -68,20 +68,12 @@ def _handle_order_creation_pending(db, session, ctx, instance):
 # ==================== ASSIGN EXECUTOR ====================
 def _handle_assign_executor_pending(
     db: DatabaseLayer,
-    session: Session,          
+    session: Session,
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    """
-    Обработчик назначения исполнителя.
-    target_user_id ВСЕГДА должен быть задан (конкретный исполнитель).
-    НЕ автоматического выбора исполнителя.
-    Работает для процессов:
-    - order_assign_courier1
-    - order_assign_courier2
-    - trip_assign_driver
-    """
     actions: AssignmentActions = ctx["assignment_actions"]
+    order_mapping: OrderMapping = ctx["order_mapping"]
     entity_type = instance["entity_type"]
     entity_id = instance["entity_id"]
     target_user_id = instance.get("target_user_id", 0)
@@ -90,7 +82,7 @@ def _handle_assign_executor_pending(
     if not target_user_id or target_user_id <= 0:
         return FsmStepResult(new_state="FAILED", last_error="TARGET_USER_ID_NOT_SET", attempts_increment=1)
 
-    # Определяем роль исполнителя
+    # Определяем роль
     if "courier1" in process_name:
         role = "courier1"
     elif "courier2" in process_name:
@@ -100,23 +92,27 @@ def _handle_assign_executor_pending(
     else:
         return FsmStepResult(new_state="FAILED", last_error="UNKNOWN_PROCESS_TYPE", attempts_increment=1)
 
-    executor_id = target_user_id
+    # Для курьеров вызываем Core set_performer
+    if role in ("courier1", "courier2"):
+        ok, err = order_mapping.assign_courier_in_core(session, entity_id, target_user_id, role)
+        if not ok:
+            logger.error("[FSM] assign_courier_in_core failed for order %s: %s", entity_id, err)
+            return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
 
-    logger.info(f"[FSM] assign_executor: entity={entity_type}:{entity_id}, executor={executor_id}, role={role}")
-
-    # Назначение через actions 
+    # Локальное назначение
     if entity_type == "order":
-        success = actions.assign_to_order(session, entity_id, executor_id, role)  
+        success = actions.assign_to_order(session, entity_id, target_user_id, role)
     elif entity_type == "trip":
-        success = actions.assign_to_trip(session, entity_id, executor_id, role)    
+        success = actions.assign_to_trip(session, entity_id, target_user_id, role)
     else:
         return FsmStepResult(new_state="FAILED", last_error=f"UNKNOWN_ENTITY_TYPE_{entity_type}", attempts_increment=1)
 
     if not success:
         return FsmStepResult(new_state="FAILED", last_error="ASSIGNMENT_FAILED", attempts_increment=1)
 
-    logger.info(f"[FSM] assign_executor COMPLETED: entity={entity_type}:{entity_id}, executor={executor_id}, role={role}")
-    return FsmStepResult(new_state="COMPLETED", last_error=None, attempts_increment=1)
+    logger.info("[FSM] assign_executor COMPLETED: entity=%s:%s, executor=%s, role=%s",
+                entity_type, entity_id, target_user_id, role)
+    return FsmStepResult(new_state="COMPLETED", attempts_increment=1)
 
 # =========== снять курьера с заказа и водителя с рейса ======
 def _handle_remove_executor_pending(

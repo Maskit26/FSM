@@ -129,7 +129,7 @@ class CoreClient:
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         try:
             resp = requests.post(url, data=data, headers=headers, timeout=self.timeout)
-            logger.info(f"Core response status: {resp.status_code}, body: {resp.text}")   # <-- добавить
+            logger.info(f"Core response status: {resp.status_code}, body: {resp.text}") 
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError as e:
@@ -144,4 +144,41 @@ class CoreClient:
             raise
         except Exception as e:
             logger.error("Core POST form without auth error: %s", e)
+            raise CoreUnavailableError(str(e)) from e
+
+    def post_form_with_params(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """POST с application/x-www-form-urlencoded, параметры в теле запроса."""
+        url = f"{self.base_url}{endpoint.lstrip('/')}"
+        headers = {**self.headers, "Content-Type": "application/x-www-form-urlencoded"}
+        try:
+            resp = requests.post(url, data=params, headers=headers, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise CoreAuthError(f"Core auth error: {endpoint}")
+            if e.response.status_code == 400:
+                raise CoreValidationError(f"Core validation error: {e.response.text}")
+            if e.response.status_code >= 500:
+                raise CoreUnavailableError(f"Core 5xx: {e.response.status_code}")
+            raise
+        except Exception as e:
+            logger.error("Core POST form with params error: %s", e)
+            raise CoreUnavailableError(str(e)) from e
+
+    def get_with_params(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """GET запрос с параметрами в URL."""
+        url = f"{self.base_url}{endpoint.lstrip('/')}"
+        headers = {**self.headers}
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401: raise CoreAuthError(...)
+            if e.response.status_code == 400: raise CoreValidationError(...)
+            if e.response.status_code >= 500: raise CoreUnavailableError(...)
+            raise
+        except Exception as e:
+            logger.error("Core GET with params error: %s", e)
             raise CoreUnavailableError(str(e)) from e

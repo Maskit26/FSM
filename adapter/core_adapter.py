@@ -159,3 +159,62 @@ class CoreAdapter:
         except Exception as e:
             logger.exception("Unexpected error in cancel_drive_order")
             raise CoreAdapterError(f"Cancel drive order failed: {e}") from e
+
+# ===================== Назначение курьера ========================
+    def perform_drive_order(
+        self,
+        core_order_id: int,
+        performer_core_u_id: int,
+        token: str,
+        u_hash: str,
+        c_id: int,
+        c_payment_way: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Назначить исполнителя (performer=1) в Core.
+        Обязательны c_id (идентификатор машины) и c_payment_way.
+        """
+        logger.info(
+            "perform_drive_order: order=%s, performer=%s, c_id=%s, payment_way=%s",
+            core_order_id, performer_core_u_id, c_id, c_payment_way
+        )
+        endpoint = f"/api/v1/drive/get/{core_order_id}"
+        data_obj = {"c_id": c_id, "c_payment_way": c_payment_way}
+        params = {
+            "action": "set_performer",
+            "u_id": performer_core_u_id,
+            "performer": 1,
+            "token": token,
+            "u_hash": u_hash,
+            "data": json.dumps(data_obj),
+        }
+        try:
+            response = self.client.post_form_with_params(endpoint, params)
+            if response.get("status") != "success":
+                error_msg = response.get("message", "Unknown error")
+                logger.error("perform_drive_order failed: %s", error_msg)
+                raise CoreValidationError(f"Core set_performer failed: {error_msg}")
+            logger.info("perform_drive_order success: order=%s, performer=%s", core_order_id, performer_core_u_id)
+            return response
+        except CoreValidationError as e:
+            logger.error("perform_drive_order validation error: %s", e)
+            raise
+        except CoreAuthError as e:
+            logger.error("perform_drive_order auth error: %s", e)
+            raise
+        except Exception as e:
+            logger.exception("perform_drive_order unexpected error")
+            raise CoreAdapterError(f"perform_drive_order failed: {e}") from e
+
+    def get_drive_order(self, b_id: int, token: str, u_hash: str) -> Dict[str, Any]:
+        """Получить данные заказа из Core (GET /api/v1/drive/get/{b_id})."""
+        endpoint = f"/api/v1/drive/get/{b_id}"
+        params = {"token": token, "u_hash": u_hash}
+        try:
+            response = self.client.get_with_params(endpoint, params)
+            return response
+        except CoreAdapterError:
+            raise
+        except Exception as e:
+            logger.exception("get_drive_order failed")
+            raise CoreAdapterError(f"get_drive_order failed: {e}")

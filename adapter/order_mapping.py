@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from db_layer import DatabaseLayer
 from .core_adapter import CoreAdapter
 from .mappers.order import to_core_drive_payload
-from .exceptions import CoreAdapterError
+from .exceptions import CoreAdapterError, CoreValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -71,18 +71,20 @@ class OrderMapping:
                 "delivery_type": delivery_type,
             }
 
-            # core_order_data = to_core_drive_payload(
-            #     start_address, dest_address, client_city, recipient_city, b_options
-            # )
+            # Определяем, нужен ли статус 6 (предложение водителям)
+            only_offer = (pickup_type == "courier" or delivery_type == "courier")
+
             core_order_data = to_core_drive_payload(
-                start_address, dest_address, client_city, recipient_city
+                start_address, dest_address, client_city, recipient_city,
+                b_options=b_options,
+                only_offer=only_offer,
             )
 
             # 3. Вызов Core с токенами
             try:
                 core_response = self.core_adapter.create_drive_order(core_order_data, token, u_hash)
                 core_order_id = core_response["data"]["b_id"]
-                logger.info("create_order_in_core: core_order_id=%s created", core_order_id)
+                logger.info("create_order_in_core: core_order_id=%s created (only_offer=%s)", core_order_id, only_offer)
             except CoreAdapterError as e:
                 logger.error("create_order_in_core: Core call failed: %s", e)
                 return False, None, f"CORE_ERROR: {e}"
@@ -130,3 +132,70 @@ class OrderMapping:
         except Exception as e:
             logger.exception("cancel_order_in_core: unexpected error")
             return False, f"EXCEPTION: {e}"
+
+# ======================= Назначение курьера ==================
+    def assign_courier_in_core(
+        self,
+        session: Session,
+        local_order_id: int,
+        courier_local_user_id: int,
+        role: str,
+    ) -> Tuple[bool, str]:
+        """
+        Назначить курьера (performer) в Core.
+        """
+        logger.info(
+            "assign_courier_in_core: local_order=%s, courier=%s, role=%s",
+            local_order_id, courier_local_user_id, role
+        )
+
+        try:
+            # 1. Получить core_order_id
+            core_order_id = self.db.get_core_order_id_by_local_order_id(session, local_order_id)
+            if not core_order_id:
+                logger.warning("assign_courier_in_core: core_order_id not found for local_order=%s", local_order_id)
+                return False, "CORE_ORDER_ID_NOT_FOUND"
+
+            # 2. Получить core_u_id курьера
+            core_courier_id = self.db.get_core_u_id_by_local_user_id(session, courier_local_user_id)
+            if not core_courier_id:
+                logger.warning("assign_courier_in_core: courier %s not mapped to Core", courier_local_user_id)
+                return False, "COURIER_NOT_MAPPED_TO_CORE"
+
+            # 3. Получить car_core_id (машина курьера)
+            car_core_id = self.db.get_car_core_id(session, courier_local_user_id)
+            if not car_core_id:
+                logger.warning("assign_courier_in_core: courier %s has no car_core_id", courier_local_user_id)
+                return False, "COURIER_HAS_NO_CAR_IN_CORE"
+
+            # 4. Получить токены курьера
+            token, u_hash = self.db.get_user_core_tokens(session, core_courier_id)
+            if not token or not u_hash:
+                logger.warning("assign_courier_in_core: missing tokens for core_u_id=%s", core_courier_id)
+                return False, "COURIER_CORE_TOKENS_MISSING"
+
+            # 5. Вызвать Core set_performer
+            self.core_adapter.perform_drive_order(
+                core_order_id,
+                core_courier_id,
+                token,
+                u_hash,
+                c_id=car_core_id,
+                c_payment_way=2
+            )
+            logger.info("assign_courier_in_core success: core_order=%s, courier=%s, car=%s",
+                        core_order_id, core_courier_id, car_core_id)
+            return True, ""
+
+        except CoreValidationError as e:
+            logger.error("assign_courier_in_core validation error: %s", e)
+            return False, f"CORE_VALIDATION_ERROR: {e}"
+        except CoreAuthError as e:
+            logger.error("assign_courier_in_core auth error: %s", e)
+            return False, f"CORE_AUTH_ERROR: {e}"
+        except CoreAdapterError as e:
+            logger.error("assign_courier_in_core adapter error: %s", e)
+            return False, f"CORE_ADAPTER_ERROR: {e}"
+        except Exception as e:
+            logger.exception("assign_courier_in_core unexpected error")
+            return False, f"UNEXPECTED_ERROR: {e}"
