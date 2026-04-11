@@ -83,26 +83,20 @@ class CoreClient:
             logger.error("Core GET error: %s", e)
             raise CoreUnavailableError(str(e)) from e
 
-    def logout(self, auth_hash: str) -> Dict[str, Any]:
-        """
-        Выход из системы (завершение сессии в Core).
-        auth_hash передаётся в заголовке Authorization: Bearer.
-        """
+    def logout_with_token(self, token: str, u_hash: str) -> Dict[str, Any]:
         url = f"{self.base_url}api/v1/logout/"
-        headers = {**self.headers, "Authorization": f"Bearer {auth_hash}"}
+        params = {"token": token, "u_hash": u_hash}
         try:
-            resp = requests.get(url, headers=headers, timeout=self.timeout)
+            resp = requests.get(url, params=params, timeout=self.timeout)
+            logger.info("Core logout response: status=%s, body=%s", resp.status_code, resp.text)
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                raise CoreAuthError("Invalid or expired auth_hash")
-            if e.response.status_code >= 500:
-                raise CoreUnavailableError("Core server error")
-            raise
+            logger.error("Core logout HTTP error: %s", e.response.text)
+            raise CoreAuthError("Logout failed")
         except Exception as e:
             logger.error("Core logout error: %s", e)
-            raise CoreUnavailableError(str(e)) from e
+            raise CoreUnavailableError(str(e))
 
     def get_token(self, auth_hash: str) -> Dict[str, Any]:
         url = f"{self.base_url}api/v1/token/"
@@ -146,6 +140,21 @@ class CoreClient:
             logger.error("Core POST form without auth error: %s", e)
             raise CoreUnavailableError(str(e)) from e
 
+    def get_without_auth(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """GET запрос без заголовка Authorization, параметры в URL."""
+        url = f"{self.base_url}{endpoint.lstrip('/')}"
+        try:
+            resp = requests.get(url, params=params, timeout=self.timeout)
+            logger.info("Core GET without auth response: status=%s, body=%s", resp.status_code, resp.text)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error("Core GET without auth HTTP error: %s", e.response.text)
+            raise CoreAuthError("Request failed")
+        except Exception as e:
+            logger.error("Core GET without auth error: %s", e)
+            raise CoreUnavailableError(str(e))
+
     def post_form_with_params(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """POST с application/x-www-form-urlencoded, параметры в теле запроса."""
         url = f"{self.base_url}{endpoint.lstrip('/')}"
@@ -182,3 +191,36 @@ class CoreClient:
         except Exception as e:
             logger.error("Core GET with params error: %s", e)
             raise CoreUnavailableError(str(e)) from e
+
+    def get_with_token(self, endpoint: str, token: str, u_hash: str) -> Dict[str, Any]:
+        """GET запрос с авторизацией через Bearer token и передачей u_hash как параметр."""
+        url = f"{self.base_url}{endpoint.lstrip('/')}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        params = {"u_hash": u_hash}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise CoreAuthError("Unauthorized")
+            raise
+        except Exception as e:
+            logger.error("GET with token error: %s", e)
+            raise CoreUnavailableError(str(e))
+
+    def post_form_with_token(self, endpoint: str, token: str, u_hash: str) -> Dict[str, Any]:
+        url = f"{self.base_url}{endpoint.lstrip('/')}"
+        data = {"token": token, "u_hash": u_hash}
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        try:
+            resp = requests.post(url, data=data, headers=headers, timeout=self.timeout)
+            logger.info("POST with token response: status=%s, body=%s", resp.status_code, resp.text)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("POST with token error: %s", e)
+            raise CoreUnavailableError(str(e))

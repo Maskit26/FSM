@@ -50,7 +50,6 @@ def to_core_drive_payload(
         "b_start_datetime": "any",
         "b_passengers_count": 1,
         "b_luggage_count": 0,
-        "b_options": b_options or {},
     }
     if only_offer:
         payload["b_only_offer"] = 1

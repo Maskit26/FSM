@@ -4,7 +4,7 @@
 """
 import logging
 import json
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 from .core_client import CoreClient
 from .mappers.user import to_core_register, from_core_register, to_core_login, from_core_login
 from .exceptions import CoreUnavailableError, CoreValidationError, CoreAuthError, CoreAdapterError
@@ -79,16 +79,25 @@ class CoreAdapter:
             logger.exception("authenticate_user failed")
             raise CoreAdapterError(f"Auth failed: {e}") from e
 
-# ========================= Деавторизация =========================
-    def logout_user(self, auth_hash: str) -> Dict[str, Any]:
-        """Деавторизация пользователя в Core."""
-        logger.info("logout_user: auth_hash=%s", auth_hash[:10] + "...")
+    def get_user_cars(self, core_u_id: int, token: str, u_hash: str) -> List[int]:
+        logger.info("get_user_cars: core_u_id=%s", core_u_id)
+        endpoint = f"/api/v1/user/{core_u_id}/car/"
         try:
-            response = self.client.logout(auth_hash)
-            return response
+            response = self.client.post_form_with_token(endpoint, token, u_hash)
+            if response.get("status") != "success":
+                logger.warning("Failed to get cars: %s", response.get("message"))
+                return []
+            data = response.get("data", {})
+            cars = data.get("car", {})
+            return [int(cid) for cid in cars.keys()] if cars else []
         except Exception as e:
-            logger.error("logout_user failed: %s", e)
-            raise CoreAdapterError(f"Logout failed: {e}") from e
+            logger.error("get_user_cars failed: %s", e)
+            return []
+
+# ========================= Деавторизация =========================
+    def logout_user_with_token(self, token: str, u_hash: str) -> Dict[str, Any]:
+        logger.info("logout_user_with_token")
+        return self.client.logout_with_token(token, u_hash)
 
 # ======================== CORE ORDER ==============================
     def create_drive_order(self, order_data: Dict[str, Any], token: str, u_hash: str) -> Dict[str, Any]:
@@ -204,3 +213,5 @@ class CoreAdapter:
         except Exception as e:
             logger.exception("get_drive_order failed")
             raise CoreAdapterError(f"get_drive_order failed: {e}")
+
+    

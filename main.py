@@ -1464,25 +1464,27 @@ async def login_user(
 
 # =========================== Деавторизация ======================
 @app.post("/api/users/logout", response_model=ApiResponse)
-async def logout_user(
-    request: LogoutRequest,
-    db: DatabaseLayer = Depends(get_db)
-):
+async def logout_user(request: LogoutRequest, db: DatabaseLayer = Depends(get_db)):
     with get_db_session(read_only=False) as session:
         try:
             user_mapping = UserMapping(core_adapter=core_adapter, db=db)
-            result = user_mapping.logout_user(request.auth_hash)
-            # Опционально: можно записать в БД лог выхода
+            result = user_mapping.logout_user_by_id(session, request.user_id)
             session.commit()
             return ApiResponse(
                 success=True,
                 message="Logged out successfully",
                 data=result
             )
+        except CoreAuthError as e:
+            session.rollback()
+            raise HTTPException(status_code=401, detail=str(e))
         except CoreAdapterError as e:
             session.rollback()
             raise HTTPException(status_code=502, detail=str(e))
+        except DbLayerError as e:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             session.rollback()
-            logger.exception("LOGOUT_FAILED")
-            raise HTTPException(status_code=500, detail="Internal logout error")
+            logger.exception("Logout error")
+            raise HTTPException(status_code=500, detail="Internal error")

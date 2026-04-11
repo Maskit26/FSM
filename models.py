@@ -168,7 +168,7 @@ class UserLoginResponse(BaseModel):
     message: str
 
 class LogoutRequest(BaseModel):
-    auth_hash: str
+    user_id: int
 
     # ========== CORE ORDER MODELS ==========
 class CoreOrderCreateRequest(BaseModel):

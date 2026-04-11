@@ -59,24 +59,11 @@ class OrderMapping:
             dest_address = self.db.get_locker_address_by_cell(session, dst_cell_id)
             logger.debug("create_order_in_core: addresses start=%s dest=%s", start_address, dest_address)
 
-            b_options = {
-                "parcel_type": parcel_type,
-                "cell_size": cell_size,
-                "sender_delivery": sender_delivery,
-                "recipient_delivery": recipient_delivery,
-                "client_user_id": client_user_id,
-                "recipient_user_id": recipient_user_id,
-                "description": description,
-                "pickup_type": pickup_type,
-                "delivery_type": delivery_type,
-            }
-
             # Определяем, нужен ли статус 6 (предложение водителям)
-            only_offer = (pickup_type == "courier" or delivery_type == "courier")
+            only_offer = (pickup_type == "courier")
 
             core_order_data = to_core_drive_payload(
                 start_address, dest_address, client_city, recipient_city,
-                b_options=b_options,
                 only_offer=only_offer,
             )
 

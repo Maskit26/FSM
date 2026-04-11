@@ -5818,6 +5818,27 @@ class DatabaseLayer:
             {"token": token, "u_hash": u_hash, "core_u_id": core_u_id}
         )
 
+    def get_user_tokens(self, session: Session, local_user_id: int) -> Tuple[Optional[str], Optional[str]]:
+        """Возвращает (token, u_hash) для локального пользователя."""
+        logger.debug("get_user_tokens: local_user_id=%s", local_user_id)
+        row = session.execute(
+            text("SELECT token, u_hash FROM core_user_mapping WHERE local_user_id = :uid"),
+            {"uid": local_user_id}
+        ).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+
+    def clear_user_u_hash(self, session: Session, local_user_id: int) -> None:
+        """Очищает u_hash для пользователя."""
+        logger.info("clear_user_u_hash: local_user_id=%s", local_user_id)
+        try:
+            session.execute(
+                text("UPDATE core_user_mapping SET u_hash = NULL WHERE local_user_id = :uid"),
+                {"uid": local_user_id}
+            )
+        except Exception as e:
+            logger.error("clear_user_u_hash failed: %s", e)
+            raise DbLayerError(f"Failed to clear u_hash: {e}")
+
 # ==================== CORE ORDERS MAPPING ===================
     
     def get_locker_address_by_cell(self, session: Session, cell_id: int) -> str:
@@ -5942,4 +5963,37 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("get_core_order_id_by_local_order_id failed for local_order_id=%s: %s", local_order_id, e)
             raise DbLayerError(f"Failed to get core order id: {e}") from e
+
+# ===================== Назначение курьера ========================
+    def get_car_core_id(self, session: Session, local_user_id: int) -> Optional[int]:
+        """
+        Возвращает car_core_id для локального пользователя из core_user_mapping.
+        """
+        logger.debug("get_car_core_id: local_user_id=%s", local_user_id)
+        try:
+            row = session.execute(
+                text("SELECT car_core_id FROM core_user_mapping WHERE local_user_id = :uid"),
+                {"uid": local_user_id}
+            ).fetchone()
+            car_core_id = row[0] if row else None
+            logger.debug("get_car_core_id: local_user_id=%s -> car_core_id=%s", local_user_id, car_core_id)
+            return car_core_id
+        except Exception as e:
+            logger.error("get_car_core_id failed for local_user_id=%s: %s", local_user_id, e)
+            raise DbLayerError(f"Failed to get car_core_id: {e}") from e
+
+    def update_car_core_id(self, session: Session, local_user_id: int, car_core_id: int) -> None:
+        logger.debug("update_car_core_id: local_user_id=%s, car_id=%s", local_user_id, car_core_id)
+        try:
+            result = session.execute(
+                text("UPDATE core_user_mapping SET car_core_id = :car_id WHERE local_user_id = :uid"),
+                {"car_id": car_core_id, "uid": local_user_id}
+            )
+            if result.rowcount == 0:
+                logger.warning("update_car_core_id: no mapping found for local_user_id=%s", local_user_id)
+            else:
+                logger.info("update_car_core_id: updated car_core_id=%s for user %s", car_core_id, local_user_id)
+        except Exception as e:
+            logger.error("update_car_core_id failed: %s", e)
+            raise DbLayerError(f"Failed to update car_core_id: {e}")
     

@@ -124,50 +124,72 @@ class UserMapping:
 # ==================== Авторизация ===============================
     def authenticate_user(self, session: Session, login: str, password: str, type: str = "phone") -> Dict[str, Any]:
         logger.info("authenticate_user: login=%s", login)
-        auth_data = self.core_adapter.authenticate_user(login, password, type)
-        core_u_id = auth_data["core_u_id"]
-        auth_hash = auth_data["auth_hash"]
+        try:
+            auth_data = self.core_adapter.authenticate_user(login, password, type)
+            core_u_id = auth_data["core_u_id"]
+            auth_hash = auth_data["auth_hash"]
 
-        # Получаем токены
-        token_data = self.core_adapter.get_token(auth_hash)
-        logger.info(f"get_token response: {token_data}")
+            # Получаем токены
+            token_data = self.core_adapter.get_token(auth_hash)
+            logger.info(f"get_token response: {token_data}")
 
-        # Проверяем статус ответа
-        if isinstance(token_data, dict) and token_data.get("status") != "success":
-            raise CoreAdapterError(f"Failed to get token: {token_data.get('message')}")
+            if isinstance(token_data, dict) and token_data.get("status") != "success":
+                raise CoreAdapterError(f"Failed to get token: {token_data.get('message')}")
 
-        # Нормализация: если ответ — список (может быть при ошибке), берём первый
-        if isinstance(token_data, list):
-            if not token_data:
-                raise CoreAdapterError("Empty token response")
-            token_data = token_data[0]
+            if isinstance(token_data, list):
+                if not token_data:
+                    raise CoreAdapterError("Empty token response")
+                token_data = token_data[0]
 
-        # Получаем data (может быть словарём или списком)
-        data = token_data.get("data")
-        if not isinstance(data, dict):
-            raise CoreAdapterError(f"Invalid token response data: {data}")
+            data = token_data.get("data")
+            if not isinstance(data, dict):
+                raise CoreAdapterError(f"Invalid token response data: {data}")
 
-        token = data.get("token")
-        u_hash = data.get("u_hash")
-        if not token or not u_hash:
-            raise CoreAdapterError("Missing token or u_hash in response")
+            token = data.get("token")
+            u_hash = data.get("u_hash")
+            if not token or not u_hash:
+                raise CoreAdapterError("Missing token or u_hash in response")
 
-        # Сначала создаём/получаем mapping
-        local_user_id = self.get_or_create_by_core_id(session, core_u_id, auth_data)
+            # Создаём/получаем локального пользователя
+            local_user_id = self.get_or_create_by_core_id(session, core_u_id, auth_data)
 
-        # Сохраняем токены
-        self.db.update_user_core_tokens(session, core_u_id, token, u_hash)
+            # Сохраняем токены
+            self.db.update_user_core_tokens(session, core_u_id, token, u_hash)
 
-        return {
-            "local_user_id": local_user_id,
-            "core_user_id": core_u_id,
-            "auth_hash": auth_hash,
-            "role": auth_data.get("core_role"),
-            "message": "Успешно"
-        }
+            # ===== получаем и сохраняем car_core_id =====
+            car_ids = self.core_adapter.get_user_cars(core_u_id, token, u_hash)
+            if car_ids:
+                car_core_id = car_ids[0]
+                self.db.update_car_core_id(session, local_user_id, car_core_id)
+                logger.info("Updated car_core_id=%s for user %s", car_core_id, local_user_id)
+            else:
+                logger.debug("No cars found for core_u_id=%s", core_u_id)
+
+            session.commit()
+            return {
+                "local_user_id": local_user_id,
+                "core_user_id": core_u_id,
+                "auth_hash": auth_hash,
+                "role": auth_data.get("core_role"),
+                "message": "Успешно"
+            }
+        except CoreValidationError as e:
+            logger.error("Auth validation error: %s", e)
+            raise
+        except CoreAdapterError as e:
+            logger.error("Auth adapter error: %s", e)
+            raise
+        except Exception as e:
+            logger.exception("Unexpected error in authenticate_user")
+            raise CoreAdapterError(f"Auth failed: {e}")
 
 # ===================== Деаторизация ============================
-    def logout_user(self, auth_hash: str) -> Dict[str, Any]:
-        """Выход пользователя."""
-        logger.info("logout_user")
-        return self.core_adapter.logout_user(auth_hash)
+    def logout_user_by_id(self, session: Session, local_user_id: int) -> Dict[str, Any]:
+        logger.info("logout_user_by_id: user_id=%s", local_user_id)
+        token, u_hash = self.db.get_user_tokens(session, local_user_id)
+        if not token or not u_hash:
+            raise CoreAdapterError("No active tokens for user")
+        result = self.core_adapter.logout_user_with_token(token, u_hash)
+        
+        self.db.clear_user_u_hash(session, local_user_id)
+        return result
