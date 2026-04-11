@@ -17,30 +17,30 @@ class CoreAdapter:
         self.token = None
         self.u_hash = None
 
-    def register_user_in_core(self, user_data: Dict[str, Any]) -> Tuple[int, str, Optional[str], Optional[str]]:
-        """Регистрация в Core. Возвращает (core_u_id, performer_type, token, u_hash)."""
+    def register_user_in_core(self, user_data: Dict[str, Any]) -> Tuple[int, Optional[str], Optional[str]]:
         logger.info("register_user_in_core: phone=%s, role=%s", 
                     user_data.get("phone"), user_data.get("role_name"))
         try:
             payload = to_core_register(user_data)
-            logger.info("Core register payload (without password): %s", 
+            logger.debug("Core register payload (without password): %s", 
                         {k: v for k, v in payload.items() if k != "password"})
             response = self.client.post_form("/api/v1/register/", payload)
             parsed = from_core_register(response)
-            logger.info("Core registration success: core_u_id=%s, transport_type=%s, token=%s", 
-                        parsed.get("core_u_id"), parsed.get("transport_type"), 
-                        "yes" if parsed.get("token") else "no")
-            return (
-                parsed["core_u_id"],
-                parsed["performer_type"],
-                parsed.get("token"),
-                parsed.get("u_hash"),
-            )
-        except (CoreUnavailableError, CoreValidationError):
+            core_u_id = parsed["core_u_id"]
+            token = parsed.get("token")
+            u_hash = parsed.get("u_hash")
+            logger.info("Core registration success: core_u_id=%s, token=%s", 
+                        core_u_id, "yes" if token else "no")
+            return core_u_id, token, u_hash
+        except CoreValidationError as e:
+            logger.error("Ошибка валидации Core при регистрации: %s", e)
+            raise
+        except CoreUnavailableError as e:
+            logger.error("Core недоступен при регистрации: %s", e)
             raise
         except Exception as e:
-            logger.exception("register_user_in_core failed")
-            raise CoreAdapterError(f"Core error: {e}") from e
+            logger.exception("Неожиданная ошибка при регистрации в Core")
+            raise CoreAdapterError(f"Core registration error: {e}")
 
     def get_user_info(self, core_u_id: int) -> Dict[str, Any]:
         """Получение данных пользователя из Core."""
@@ -167,44 +167,30 @@ class CoreAdapter:
         performer_core_u_id: int,
         token: str,
         u_hash: str,
-        c_id: int,
-        c_payment_way: int = 2,
     ) -> Dict[str, Any]:
         """
-        Назначить исполнителя (performer=1) в Core.
-        Обязательны c_id (идентификатор машины) и c_payment_way.
+        Вызов set_performer в Core: утвердить исполнителя (курьера/водителя).
         """
-        logger.info(
-            "perform_drive_order: order=%s, performer=%s, c_id=%s, payment_way=%s",
-            core_order_id, performer_core_u_id, c_id, c_payment_way
-        )
+        logger.info("perform_drive_order: order=%s, performer=%s", core_order_id, performer_core_u_id)
         endpoint = f"/api/v1/drive/get/{core_order_id}"
-        data_obj = {"c_id": c_id, "c_payment_way": c_payment_way}
         params = {
             "action": "set_performer",
             "u_id": performer_core_u_id,
             "performer": 1,
             "token": token,
             "u_hash": u_hash,
-            "data": json.dumps(data_obj),
         }
         try:
             response = self.client.post_form_with_params(endpoint, params)
             if response.get("status") != "success":
-                error_msg = response.get("message", "Unknown error")
-                logger.error("perform_drive_order failed: %s", error_msg)
-                raise CoreValidationError(f"Core set_performer failed: {error_msg}")
-            logger.info("perform_drive_order success: order=%s, performer=%s", core_order_id, performer_core_u_id)
+                logger.error("Core set_performer error: %s", response)
+                raise CoreValidationError(f"Core set_performer failed: {response.get('message')}")
             return response
-        except CoreValidationError as e:
-            logger.error("perform_drive_order validation error: %s", e)
-            raise
-        except CoreAuthError as e:
-            logger.error("perform_drive_order auth error: %s", e)
+        except CoreAdapterError:
             raise
         except Exception as e:
-            logger.exception("perform_drive_order unexpected error")
-            raise CoreAdapterError(f"perform_drive_order failed: {e}") from e
+            logger.exception("perform_drive_order failed")
+            raise CoreAdapterError(f"perform_drive_order failed: {e}")
 
     def get_drive_order(self, b_id: int, token: str, u_hash: str) -> Dict[str, Any]:
         """Получить данные заказа из Core (GET /api/v1/drive/get/{b_id})."""

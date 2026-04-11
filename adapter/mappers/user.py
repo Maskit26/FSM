@@ -18,7 +18,6 @@ ROLE_TO_CORE = {
 }
 
 def to_core_register(user_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Преобразует данные в формат Core для регистрации (form-data)."""
     role_name = user_data.get("role_name", "client")
     core_role = ROLE_TO_CORE.get(role_name, 1)
 
@@ -27,71 +26,48 @@ def to_core_register(user_data: Dict[str, Any]) -> Dict[str, Any]:
         "u_role": core_role,
         "st": 1,
     }
-
     if user_data.get("phone"):
         payload["u_phone"] = user_data["phone"]
     if user_data.get("email"):
         payload["u_email"] = user_data["email"]
 
     u_details = {"source": "fsm_backend"}
-
-    if core_role == 2:
-        u_details["performer"] = {
-            "type": user_data.get("performer_type", "driver"),
-            "transport": {"type": user_data.get("transport_type", "car")},
-            "capabilities": user_data.get("capabilities", ["delivery"]),
-        }
-
     data_obj = {"u_details": u_details}
-    if core_role == 2:
-        data_obj["u_check_state"] = 2 
     if user_data.get("password"):
         data_obj["password"] = user_data["password"]
 
     payload["data"] = json.dumps(data_obj)
-
     logger.debug("to_core_register: role=%s → core_role=%s", role_name, core_role)
     return payload
 
 def from_core_register(core_response: Any) -> Dict[str, Any]:
-    """Парсит ответ Core после регистрации."""
     if isinstance(core_response, list):
         core_response = core_response[0] if core_response else {}
     if not isinstance(core_response, dict):
-        raise CoreMappingError(f"Core вернул неожиданный тип: {type(core_response)}")
+        logger.error("Неожиданный тип ответа Core: %s", type(core_response))
+        raise CoreMappingError(f"Неожиданный тип ответа: {type(core_response)}")
 
     if core_response.get("status") == "error":
-        raise CoreValidationError(f"Core error: {core_response.get('message')}")
-    if core_response.get("code") and str(core_response.get("code")).startswith("4"):
-        raise CoreValidationError(f"Core error {core_response.get('code')}: {core_response.get('message')}")
+        error_msg = core_response.get("message", "Unknown error")
+        logger.error("Core вернул ошибку: %s", error_msg)
+        raise CoreValidationError(f"Ошибка Core: {error_msg}")
 
     data = core_response.get("data", {})
     if isinstance(data, str):
-        data = json.loads(data)
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError as e:
+            logger.error("Ошибка парсинга data JSON: %s", e)
+            raise CoreMappingError(f"Невалидный JSON в data: {e}")
 
-    u_details = json.loads(data.get("u_details", "{}"))
-    performer = u_details.get("performer", {})
-    transport = performer.get("transport", {})
-    core_role = data.get("u_role")
-
-    if core_role == 2:
-        performer_type = "driver"
-        transport_type = transport.get("type")
-        capabilities = performer.get("capabilities", [])
-    else:
-        performer_type = None
-        transport_type = None
-        capabilities = []
-
-    return {
+    result = {
         "core_u_id": data.get("u_id"),
-        "core_role": core_role,
-        "performer_type": performer_type,
-        "transport_type": transport_type,
-        "capabilities": capabilities,
+        "core_role": data.get("u_role"),
         "token": data.get("token"),
         "u_hash": data.get("u_hash"),
     }
+    logger.debug("Парсинг регистрации успешен: core_u_id=%s", result["core_u_id"])
+    return result
 
 # ========================= Авторизация ===============================
 

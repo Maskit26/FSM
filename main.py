@@ -1386,23 +1386,16 @@ async def register_user(
     data: UserRegisterRequest,
     db: DatabaseLayer = Depends(get_db)
 ):
-    """
-    Регистрация пользователя.
-    """
     with get_db_session(read_only=False) as session:
         try:
             user_mapping = UserMapping(core_adapter=core_adapter, db=db)
-            
-            local_id, core_id, perf_type = user_mapping.register_user(
+            local_id, core_id = user_mapping.register_user(
                 session=session,
                 user_data={
                     "name": data.name,
                     "phone": data.phone,
                     "email": data.email,
                     "role_name": data.role_name,
-                    "performer_type": data.performer_type,
-                    "transport_type": data.transport_type,
-                    "capabilities": ["delivery"] if data.role_name in ["driver", "courier"] else None,
                     "city": data.city,
                     "password": data.password,
                 }
@@ -1412,59 +1405,29 @@ async def register_user(
                 "success": True,
                 "user_id": local_id,
                 "core_user_id": core_id,
-                "performer_type": perf_type,
                 "core_sync_status": "success",
                 "message": "Пользователь зарегистрирован"
             }
-            
-        # Ошибка валидации данных от Core (400 Bad Request)
         except CoreValidationError as e:
             session.rollback()
-            logger.warning(f"CORE_VALIDATION_ERROR: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"CORE_VALIDATION_ERROR: {str(e)}"
-            )
-            
-        # Core недоступен — откатываем, но НЕ 500 (пользователь создан локально)
-        except CoreUnavailableError as e:
-            session.rollback()
-            logger.error(f"CORE_UNAVAILABLE: {str(e)}")
-            return {
-                "success": True,
-                "user_id": None,  
-                "core_user_id": None,
-                "performer_type": None,
-                "core_sync_status": "unavailable",
-                "message": "CORE_UNAVAILABLE: пользователь создан локально, синхронизация отложена"
-            }
-            
-        # Ошибка адаптера (непредвиденная)
+            logger.warning("Core validation error: %s", e)
+            raise HTTPException(status_code=400, detail=str(e))
         except CoreAdapterError as e:
             session.rollback()
-            logger.exception(f"CORE_ADAPTER_ERROR: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"CORE_ADAPTER_ERROR: {str(e)}"
-            )
-            
-        # Ошибка валидации входных данных (Pydantic/DB)
+            logger.error("Core adapter error: %s", e)
+            raise HTTPException(status_code=502, detail=str(e))
+        except CoreUnavailableError as e:
+            session.rollback()
+            logger.error("Core unavailable: %s", e)
+            raise HTTPException(status_code=503, detail="Core service unavailable")
         except DbLayerError as e:
             session.rollback()
-            logger.error(f"DB_LAYER_ERROR: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"DB_ERROR: {str(e)}"
-            )
-            
-        # Любая другая ошибка
+            logger.error("Database error: %s", e)
+            raise HTTPException(status_code=500, detail=f"Database error: {e}")
         except Exception as e:
             session.rollback()
-            logger.exception(f"REGISTRATION_UNEXPECTED_ERROR: {type(e).__name__}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"INTERNAL_ERROR: {str(e)}"
-            )
+            logger.exception("Unexpected registration error")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/users/login", response_model=dict)
 async def login_user(

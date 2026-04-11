@@ -5722,32 +5722,18 @@ class DatabaseLayer:
         user_id: int,
         core_u_id: int,
         core_role: int,
-        performer_type: str,
-        transport_type: Optional[str] = None,
-        capabilities: Optional[List[str]] = None,
     ) -> bool:
-        """
-        Создать соответствие user_id ↔ core_u_id (идемпотентно с UPSERT).
-        """
-        logger.debug(
-            "create_user_core_mapping вызван: user_id=%s, core_u_id=%s",
-            user_id, core_u_id
-        )
+        logger.debug("create_user_core_mapping: user_id=%s, core_u_id=%s", user_id, core_u_id)
         try:
             session.execute(
                 text("""
                     INSERT INTO core_user_mapping 
-                        (local_user_id, core_u_id, core_role, performer_type, transport_type, 
-                        capabilities, sync_status, registered_at, last_sync_at)
+                        (local_user_id, core_u_id, core_role, sync_status, registered_at, last_sync_at)
                     VALUES 
-                        (:local_id, :core_id, :core_role, :performer_type, :transport_type, 
-                        :capabilities, 'success', NOW(), NOW())
+                        (:local_id, :core_id, :core_role, 'success', NOW(), NOW())
                     ON DUPLICATE KEY UPDATE 
                         core_u_id = VALUES(core_u_id),
                         core_role = VALUES(core_role),
-                        performer_type = VALUES(performer_type),
-                        transport_type = VALUES(transport_type),
-                        capabilities = VALUES(capabilities),
                         last_sync_at = NOW(),
                         sync_status = 'success'
                 """),
@@ -5755,18 +5741,12 @@ class DatabaseLayer:
                     "local_id": user_id,
                     "core_id": core_u_id,
                     "core_role": core_role,
-                    "performer_type": performer_type,
-                    "transport_type": transport_type,
-                    "capabilities": json.dumps(capabilities) if capabilities else None,
                 }
             )
-            logger.info(
-                "create_user_core_mapping: user_id=%s ↔ core_u_id=%s",
-                user_id, core_u_id
-            )
+            logger.info("create_user_core_mapping: user_id=%s ↔ core_u_id=%s", user_id, core_u_id)
             return True
         except Exception as e:
-            logger.error("create_user_core_mapping завершился с ошибкой: %s", e)
+            logger.error("create_user_core_mapping failed: %s", e)
             raise DbLayerError(f"create_user_core_mapping failed: {e}") from e
 
     def create_user_record(
@@ -5837,46 +5817,6 @@ class DatabaseLayer:
             """),
             {"token": token, "u_hash": u_hash, "core_u_id": core_u_id}
         )
-
-    def get_car_core_id(self, session: Session, local_user_id: int) -> Optional[int]:
-        """
-        Возвращает car_core_id для локального пользователя из core_user_mapping.
-        """
-        logger.debug("get_car_core_id: local_user_id=%s", local_user_id)
-        try:
-            row = session.execute(
-                text("SELECT car_core_id FROM core_user_mapping WHERE local_user_id = :uid"),
-                {"uid": local_user_id}
-            ).fetchone()
-            car_core_id = row[0] if row else None
-            logger.debug("get_car_core_id: local_user_id=%s -> car_core_id=%s", local_user_id, car_core_id)
-            return car_core_id
-        except Exception as e:
-            logger.error("get_car_core_id failed for local_user_id=%s: %s", local_user_id, e)
-            raise DbLayerError(f"Failed to get car_core_id: {e}") from e
-
-    def update_car_core_id(self, session: Session, local_user_id: int, car_core_id: int) -> bool:
-        """
-        Обновляет car_core_id для локального пользователя.
-        """
-        logger.info("update_car_core_id: local_user_id=%s, car_core_id=%s", local_user_id, car_core_id)
-        try:
-            result = session.execute(
-                text("""
-                    UPDATE core_user_mapping
-                    SET car_core_id = :car_core_id, last_sync_at = NOW()
-                    WHERE local_user_id = :uid
-                """),
-                {"car_core_id": car_core_id, "uid": local_user_id}
-            )
-            if result.rowcount == 0:
-                logger.warning("update_car_core_id: no mapping found for local_user_id=%s", local_user_id)
-                return False
-            logger.info("update_car_core_id: successfully updated car_core_id=%s for user %s", car_core_id, local_user_id)
-            return True
-        except Exception as e:
-            logger.error("update_car_core_id failed for local_user_id=%s: %s", local_user_id, e)
-            raise DbLayerError(f"Failed to update car_core_id: {e}") from e
 
 # ==================== CORE ORDERS MAPPING ===================
     

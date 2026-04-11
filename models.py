@@ -142,9 +142,7 @@ class UserRegisterRequest(BaseModel):
     name: str
     phone: str
     email: Optional[str] = None
-    role_name: str = "client"  # client, courier, driver, admin
-    performer_type: Optional[str] = None  # courier, driver (для исполнителей)
-    transport_type: Optional[str] = None  # car, bike, foot
+    role_name: str = "client"
     city: Optional[str] = None
     password: str
 
