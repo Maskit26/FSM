@@ -176,18 +176,20 @@ class CoreAdapter:
         performer_core_u_id: int,
         token: str,
         u_hash: str,
+        c_id: int,
+        c_payment_way: int = 2,
     ) -> Dict[str, Any]:
-        """
-        Вызов set_performer в Core: утвердить исполнителя (курьера/водителя).
-        """
-        logger.info("perform_drive_order: order=%s, performer=%s", core_order_id, performer_core_u_id)
+        logger.info("perform_drive_order: order=%s, performer=%s, c_id=%s, payment_way=%s",
+                    core_order_id, performer_core_u_id, c_id, c_payment_way)
         endpoint = f"/api/v1/drive/get/{core_order_id}"
+        data_obj = {"c_id": c_id, "c_payment_way": c_payment_way}
         params = {
             "action": "set_performer",
             "u_id": performer_core_u_id,
             "performer": 1,
             "token": token,
             "u_hash": u_hash,
+            "data": json.dumps(data_obj),
         }
         try:
             response = self.client.post_form_with_params(endpoint, params)

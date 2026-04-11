@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from db_layer import DatabaseLayer
 from .core_adapter import CoreAdapter
 from .mappers.order import to_core_drive_payload
-from .exceptions import CoreAdapterError, CoreValidationError
+from .exceptions import CoreAdapterError, CoreValidationError, CoreAuthError
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class OrderMapping:
             logger.debug("create_order_in_core: addresses start=%s dest=%s", start_address, dest_address)
 
             # Определяем, нужен ли статус 6 (предложение водителям)
-            only_offer = (pickup_type == "courier")
+            only_offer = False
 
             core_order_data = to_core_drive_payload(
                 start_address, dest_address, client_city, recipient_city,
