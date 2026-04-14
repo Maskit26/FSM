@@ -25,62 +25,92 @@ class OrderMapping:
         try:
             req = self.db.get_order_request(session, request_id)
             if not req:
-                logger.error("create_order_in_core: request %s not found", request_id)
                 return False, None, "REQ_NOT_FOUND"
 
             client_user_id = req["client_user_id"]
-            recipient_user_id = req.get("recipient_user_id")
-
-            # 1. Получаем core_u_id и токены клиента
             core_u_id = self.db.get_core_u_id_by_local_user_id(session, client_user_id)
             if not core_u_id:
-                logger.error("create_order_in_core: client %s not mapped to Core", client_user_id)
                 return False, None, "CLIENT_NOT_MAPPED_TO_CORE"
 
             token, u_hash = self.db.get_user_core_tokens(session, core_u_id)
             if not token or not u_hash:
-                logger.error("create_order_in_core: missing tokens for core_u_id=%s", core_u_id)
                 return False, None, "MISSING_CORE_TOKENS"
 
-            # 2. Подготовка данных
-            parcel_type = req["parcel_type"]
-            cell_size = req["cell_size"]
-            sender_delivery = req["sender_delivery"]
-            recipient_delivery = req["recipient_delivery"]
-            description = f"{parcel_type} ({cell_size})"
-            pickup_type = "self" if sender_delivery == "self" else "courier"
-            delivery_type = "self" if recipient_delivery == "self" else "courier"
-
             client_city = self.db.get_user_city(session, client_user_id)
-            recipient_city = self.db.get_user_city(session, recipient_user_id) if recipient_user_id else client_city
-            logger.debug("create_order_in_core: cities client=%s recipient=%s", client_city, recipient_city)
-
+            recipient_city = self.db.get_user_city(session, req["recipient_user_id"]) if req["recipient_user_id"] else client_city
             start_address = self.db.get_locker_address_by_cell(session, src_cell_id)
             dest_address = self.db.get_locker_address_by_cell(session, dst_cell_id)
-            logger.debug("create_order_in_core: addresses start=%s dest=%s", start_address, dest_address)
-
-            # Определяем, нужен ли статус 6 (предложение водителям)
-            only_offer = False
 
             core_order_data = to_core_drive_payload(
                 start_address, dest_address, client_city, recipient_city,
-                only_offer=only_offer,
+                kind=1,  # главный заказ
             )
 
-            # 3. Вызов Core с токенами
-            try:
-                core_response = self.core_adapter.create_drive_order(core_order_data, token, u_hash)
-                core_order_id = core_response["data"]["b_id"]
-                logger.info("create_order_in_core: core_order_id=%s created (only_offer=%s)", core_order_id, only_offer)
-            except CoreAdapterError as e:
-                logger.error("create_order_in_core: Core call failed: %s", e)
-                return False, None, f"CORE_ERROR: {e}"
-
+            response = self.core_adapter.create_drive_order(core_order_data, token, u_hash, kind=1)
+            core_order_id = response["data"]["b_id"]
             return True, core_order_id, ""
 
         except Exception as e:
-            logger.exception("create_order_in_core failed for request %s: %s", request_id, e)
-            return False, None, f"EXCEPTION: {e}"
+            logger.exception("create_order_in_core failed for request %s", request_id)
+            return False, None, str(e)
+
+    def create_suborder_in_core(
+        self,
+        session: Session,
+        local_order_id: int,
+        role: str,
+        start_address: str,
+        dest_address: str,
+        performer_local_user_id: int,
+    ) -> Tuple[bool, Optional[int], str]:
+        logger.info("create_suborder_in_core: local=%s, role=%s, performer=%s", local_order_id, role, performer_local_user_id)
+        try:
+            # 1. Проверяем, не создан ли уже подзаказ для этой роли
+            existing_core_id = self.db.get_core_order_id_by_role(session, local_order_id, role=role)
+            if existing_core_id is not None:
+                logger.info("Подзаказ для роли %s уже существует: core_id=%s", role, existing_core_id)
+                return True, existing_core_id, ""
+
+            # 2. Получаем главный core-заказ
+            main_core_id = self.db.get_core_order_id_by_role(session, local_order_id, role="main")
+            if not main_core_id:
+                return False, None, "MAIN_ORDER_NOT_FOUND"
+
+            # 3. Получаем данные исполнителя
+            performer_core_id = self.db.get_core_u_id_by_local_user_id(session, performer_local_user_id)
+            if not performer_core_id:
+                return False, None, "PERFORMER_NOT_MAPPED_TO_CORE"
+
+            token, u_hash = self.db.get_user_core_tokens(session, performer_core_id)
+            if not token or not u_hash:
+                return False, None, "MISSING_CORE_TOKENS"
+
+            kind = 2 if role == "driver" else 3
+
+            order_data = {
+                "b_start_address": start_address,
+                "b_destination_address": dest_address,
+                "b_payment_way": 2,
+                "b_start_datetime": "any",
+            }
+
+            # 4. Создаём подзаказ в Core (без only_offer)
+            response = self.core_adapter.create_drive_order(order_data, token, u_hash, kind=kind, upper=main_core_id)
+            core_sub_id = response["data"]["b_id"]
+
+            # 5. Сохраняем mapping для подзаказа
+            self.db.save_core_order_mapping(session, local_order_id, core_sub_id, role=role)
+
+            # 6. Назначаем исполнителя на подзаказ
+            car_core_id = self.db.get_car_core_id(session, performer_local_user_id)
+            self.core_adapter.perform_drive_order(core_sub_id, performer_core_id, token, u_hash, c_id=car_core_id, c_payment_way=2)
+
+            logger.info("Подзаказ создан: core_id=%s для роли %s", core_sub_id, role)
+            return True, core_sub_id, ""
+
+        except Exception as e:
+            logger.exception("create_suborder_in_core failed")
+            return False, None, str(e)
 
 # ======================= Отмена заказа ============================
     def cancel_order_in_core(self, session: Session, local_order_id: int, user_id: int, reason: str = None) -> Tuple[bool, str]:

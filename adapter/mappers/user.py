@@ -94,3 +94,50 @@ def from_core_login(core_response: Any) -> Dict[str, Any]:
         "core_role": auth_user.get("u_role"),
         "user_name": auth_user.get("u_name"),
     }
+
+# =================== Создание авто ===================
+def to_core_car_payload(
+    registration_plate: str,
+    car_type: str,
+    seats: int = 1,
+    custom_body_ru: Optional[str] = None,
+    custom_body_en: Optional[str] = None,
+    custom_make_ru: Optional[str] = None,
+    custom_make_en: Optional[str] = None,
+    custom_model_ru: Optional[str] = None,
+    custom_model_en: Optional[str] = None,
+    custom_model_year: Optional[int] = None,
+    custom_model_doors: Optional[int] = None,
+) -> Dict[str, Any]:
+    cc_id = 5 if car_type == 'courier' else 6
+    car_data = {
+        "registration_plate": registration_plate,
+        "seats": seats,
+        "cc_id": cc_id,
+        "cm_id": None,        
+    }
+    details = {}
+    if custom_body_ru or custom_body_en:
+        details["car_bodies"] = {
+            "ru": custom_body_ru or "",
+            "en": custom_body_en or "",
+        }
+    if custom_make_ru or custom_make_en:
+        details["car_makes"] = {
+            "ru": custom_make_ru or "",
+            "en": custom_make_en or "",
+        }
+    if custom_model_ru or custom_model_en:
+        model_details = {
+            "ru": custom_model_ru or "",
+            "en": custom_model_en or "",
+        }
+        if custom_model_year:
+            model_details["year"] = custom_model_year
+        if custom_model_doors is not None:
+            model_details["door"] = custom_model_doors
+        details["car_models"] = model_details
+
+    if details:
+        car_data["details"] = details
+    return car_data

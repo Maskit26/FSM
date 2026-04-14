@@ -224,3 +224,41 @@ class CoreClient:
         except Exception as e:
             logger.error("POST with token error: %s", e)
             raise CoreUnavailableError(str(e))
+
+# =================== Создание авто =====================
+    def create_car(
+        self,
+        token: str,
+        u_hash: str,
+        core_u_id: int,
+        car_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        logger.debug("CoreClient.create_car: core_u_id=%s, token=%s..., u_hash=%s...",
+                    core_u_id, token[:10] if token else "None", u_hash[:10] if u_hash else "None")
+        url = f"{self.base_url}api/v1/user/{core_u_id}/car/"
+        payload = {
+            "token": token,
+            "u_hash": u_hash,
+            "data": json.dumps(car_data, ensure_ascii=False),
+        }
+        try:
+            resp = requests.post(url, data=payload, timeout=self.timeout)
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info("Core create_car raw response: %s", json.dumps(result, indent=2))
+            if result.get("status") != "success":
+                error_msg = result.get("message", "Unknown error")
+                logger.error("Core create_car error: %s", error_msg)
+                raise CoreValidationError(f"Core create_car failed: {error_msg}")
+            logger.info("Core create_car success: core_car_id=%s",
+                        result.get("data", {}).get("cteated_car", {}).get("c_id"))
+            return result
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise CoreAuthError("Invalid or expired token")
+            if e.response.status_code >= 500:
+                raise CoreUnavailableError("Core server error")
+            raise
+        except Exception as e:
+            logger.error("Core create_car error: %s", e)
+            raise CoreUnavailableError(str(e)) from e

@@ -27,7 +27,8 @@ from models import (
     UserCreateRequest, LockerCreateRequest,
     CellCreateRequest, CellResponse, ButtonResponse,
     ClientCreateOrderRequest, FsmEnqueueRequest,
-    UserRegisterRequest, UserLoginRequest, LogoutRequest,
+    UserRegisterRequest, UserLoginRequest, LogoutRequest, 
+    CarType, CarCreateRequest,
 )
 
 # ======================
@@ -262,7 +263,7 @@ async def create_order_request(
 ):
     with get_db_session(read_only=False) as session:
         try:
-            request_id = db.create_order_request_and_fsm(
+            request_id, instance_id = db.create_order_request_and_fsm(
                 session,
                 client_user_id=request.client_user_id,
                 recipient_user_id=request.recipient_user_id,
@@ -274,7 +275,7 @@ async def create_order_request(
             return ApiResponse(
                 success=True,
                 message="Заявка создана, обработка начата",
-                data={"request_id": request_id}
+                data={"request_id": request_id, "instance_id": instance_id}
             )
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -399,6 +400,37 @@ async def handle_parcel_confirmed(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/api/orders/{order_id}", response_model=dict)
+async def get_order(order_id: int, db: DatabaseLayer = Depends(get_db)):
+    """Получить заказ по ID"""
+    with get_db_session(read_only=True) as session:
+        try:
+            order = db.get_order(session, order_id)
+            if not order:
+                raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+            return order
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/orders", response_model=List[dict])
+async def get_all_orders(
+    statuses: Optional[str] = None,
+    db: DatabaseLayer = Depends(get_db),
+):
+    """
+    Получить все заказы без привязки к маршруту.
+    Опционально: фильтр по статусам, через запятую, например:
+    ?statuses=order_created,order_parcel_confirmed
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            status_list = statuses.split(",") if statuses else None
+            orders = db.get_all_orders(session, status_list)
+            return orders
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
 @app.get("/api/orders/by-route", response_model=List[dict])
 async def get_orders_by_route(
     from_city: str,
@@ -424,6 +456,21 @@ async def get_orders_by_route(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+
+@app.get("/api/cities", response_model=List[str])
+async def get_cities(db: DatabaseLayer = Depends(get_db)):
+    """
+    Получить список всех уникальных городов из таблицы users.
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            cities = db.get_all_cities(session)
+            return cities
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.exception("Ошибка при получении списка городов")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
 # == получение информации о заказах/рейсах для клиента/курьера/водителя ====
 @app.get("/api/orders/user/{user_id}", response_model=List[dict])
@@ -520,6 +567,28 @@ async def get_user_fsm_errors(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
+@app.get("/api/fsm/instance/{instance_id}/stream")
+async def stream_instance_status(instance_id: int, db: DatabaseLayer = Depends(get_db)):
+    async def event_generator():
+        while True:
+            with get_db_session(read_only=True) as session:
+                try:
+                    state, error = db.get_fsm_instance_state(session, instance_id)
+                    if state is None:
+                        yield {"event": "error", "data": "Instance not found"}
+                        break
+                    if state == "FAILED":
+                        yield {"event": "error", "data": error or "Unknown error"}
+                        break
+                    if state == "COMPLETED":
+                        yield {"event": "success", "data": "Process completed successfully"}
+                        break
+                except DbLayerError as e:
+                    yield {"event": "error", "data": str(e)}
+                    break
+            await asyncio.sleep(2)
+    return EventSourceResponse(event_generator())
+
 # Для получения 6-тизначного пин кода. Для теста, удалить на продакшне
 @app.get("/api/access-code/view", response_model=Dict[str, Any])
 async def view_access_code(
@@ -609,37 +678,6 @@ async def view_access_code(
                 "leg": leg
             }
             
-        except DbLayerError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/api/orders/{order_id}", response_model=dict)
-async def get_order(order_id: int, db: DatabaseLayer = Depends(get_db)):
-    """Получить заказ по ID"""
-    with get_db_session(read_only=True) as session:
-        try:
-            order = db.get_order(session, order_id)
-            if not order:
-                raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
-            return order
-        except DbLayerError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.get("/api/orders", response_model=List[dict])
-async def get_all_orders(
-    statuses: Optional[str] = None,
-    db: DatabaseLayer = Depends(get_db),
-):
-    """
-    Получить все заказы без привязки к маршруту.
-    Опционально: фильтр по статусам, через запятую, например:
-    ?statuses=order_created,order_parcel_confirmed
-    """
-    with get_db_session(read_only=True) as session:
-        try:
-            status_list = statuses.split(",") if statuses else None
-            orders = db.get_all_orders(session, status_list)
-            return orders
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -1488,3 +1526,59 @@ async def logout_user(request: LogoutRequest, db: DatabaseLayer = Depends(get_db
             session.rollback()
             logger.exception("Logout error")
             raise HTTPException(status_code=500, detail="Internal error")
+
+# ==================== Создание авто =================
+@app.post("/api/users/{local_user_id}/car/create", response_model=dict)
+async def create_user_car(
+    local_user_id: int,
+    request: CarCreateRequest,
+    db: DatabaseLayer = Depends(get_db),
+):
+    with get_db_session(read_only=False) as session:
+        try:
+            core_u_id = db.get_core_u_id_by_local_user_id(session, local_user_id)
+            if not core_u_id:
+                raise HTTPException(status_code=400, detail="User not mapped to Core")
+
+            user_mapping = UserMapping(core_adapter=core_adapter, db=db)
+            core_car_id = user_mapping.create_car_for_core_user(
+                session=session,
+                core_u_id=core_u_id,
+                car_type=request.car_type.value,
+                seats=request.seats,
+                custom_body_ru=request.custom_body_ru,
+                custom_body_en=request.custom_body_en,
+                custom_make_ru=request.custom_make_ru,
+                custom_make_en=request.custom_make_en,
+                custom_model_ru=request.custom_model_ru,
+                custom_model_en=request.custom_model_en,
+                custom_model_year=request.custom_model_year,
+                custom_model_doors=request.custom_model_doors,
+            )
+            session.commit()
+            return {
+                "success": True,
+                "core_car_id": core_car_id,
+                "car_type": request.car_type.value,
+                "registration_plate": registration_plate,
+                "message": "Car created successfully"
+            }
+        except CoreMappingError as e:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+        except CoreAuthError as e:
+            session.rollback()
+            raise HTTPException(status_code=401, detail=str(e))
+        except CoreValidationError as e:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+        except CoreUnavailableError as e:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=str(e))
+        except CoreAdapterError as e:
+            session.rollback()
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:
+            session.rollback()
+            logger.exception("Unexpected error")
+            raise HTTPException(status_code=500, detail="Internal server error")

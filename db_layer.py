@@ -2092,6 +2092,28 @@ class DatabaseLayer:
             logger.error("get_user_fsm_errors завершился с ошибкой: %s", e)
             raise DbLayerError(f"get_user_fsm_errors failed: {e}") from e
 
+    def get_fsm_instance_state(
+        self,
+        session: Session,
+        instance_id: int
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Возвращает (fsm_state, last_error) для FSM-инстанса.
+        Если инстанс не найден, возвращает (None, None).
+        """
+        logger.debug("get_fsm_instance_state: instance_id=%s", instance_id)
+        try:
+            row = session.execute(
+                text("SELECT fsm_state, last_error FROM server_fsm_instances WHERE id = :id"),
+                {"id": instance_id}
+            ).fetchone()
+            if not row:
+                return None, None
+            return row[0], row[1]
+        except Exception as e:
+            logger.error("get_fsm_instance_state failed: %s", e)
+            raise DbLayerError(f"Failed to get FSM instance state: {e}") from e
+
     def fetch_ready_fsm_instances(
         self,
         session: Session,
@@ -2332,26 +2354,16 @@ class DatabaseLayer:
         cell_size: str,
         sender_delivery: str,
         recipient_delivery: str,
-    ) -> int:
-        """
-        Создаёт заявку в order_requests + инстанс серверного FSM процесса 'order_creation'.
-        Возвращает request_id.
-        """
-        logger.debug(
-            "create_order_request_and_fsm вызван: client=%s, parcel=%s, size=%s",
-            client_user_id, parcel_type, cell_size
-        )
+    ) -> Tuple[int, int]: 
+        logger.debug("create_order_request_and_fsm: client=%s", client_user_id)
         try:
-            # 1. INSERT в order_requests
             session.execute(
-                text(
-                    """
+                text("""
                     INSERT INTO order_requests
                         (client_user_id, recipient_user_id, parcel_type, cell_size, sender_delivery, recipient_delivery)
                     VALUES
                         (:client_user_id, :recipient_user_id, :parcel_type, :cell_size, :sender_delivery, :recipient_delivery)
-                    """
-                ),
+                """),
                 {
                     "client_user_id": client_user_id,
                     "recipient_user_id": recipient_user_id,
@@ -2361,20 +2373,16 @@ class DatabaseLayer:
                     "recipient_delivery": recipient_delivery,
                 },
             )
-
             request_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
             request_id = int(request_id)
 
-            # 2. INSERT в server_fsm_instances для процесса 'order_creation'
             session.execute(
-                text(
-                    """
+                text("""
                     INSERT INTO server_fsm_instances
                         (entity_type, entity_id, process_name, fsm_state, attempts_count)
                     VALUES
                         (:entity_type, :entity_id, :process_name, :fsm_state, :attempts_count)
-                    """
-                ),
+                """),
                 {
                     "entity_type": "order_request",
                     "entity_id": request_id,
@@ -2383,18 +2391,20 @@ class DatabaseLayer:
                     "attempts_count": 0,
                 },
             )
+            instance_id = session.execute(
+                text("""
+                    SELECT id FROM server_fsm_instances
+                    WHERE entity_type = 'order_request' AND entity_id = :request_id
+                    AND process_name = 'order_creation'
+                """),
+                {"request_id": request_id}
+            ).scalar_one()
 
-            logger.info(
-                "Создана заявка %s и FSM-инстанс для клиента %s",
-                request_id, client_user_id
-            )
-            return request_id
+            logger.info("Создана заявка %s и FSM-инстанс %s", request_id, instance_id)
+            return request_id, instance_id
 
         except Exception as e:
-            logger.error(
-                "create_order_request_and_fsm завершился с ошибкой для клиента %s: %s",
-                client_user_id, e
-            )
+            logger.error("create_order_request_and_fsm failed: %s", e)
             raise DbLayerError(f"create_order_request_and_fsm failed: {e}") from e
 
     def get_order(self, session: Session, order_id: int) -> Optional[Dict[str, Any]]:
@@ -3273,6 +3283,22 @@ class DatabaseLayer:
         else:
             logger.error("handle_parcel_confirmed: неизвестный delivery_type='%s' для заказа %s", delivery_type, order_id)
             raise DbLayerError(f"Неизвестный delivery_type: {delivery_type}")
+
+    def get_all_cities(self, session: Session) -> List[str]:
+        """
+        Получить список уникальных городов из таблицы users (не пустые).
+        """
+        logger.debug("get_all_cities вызван")
+        try:
+            rows = session.execute(
+                text("SELECT DISTINCT city FROM users WHERE city IS NOT NULL AND city != '' ORDER BY city")
+            ).fetchall()
+            cities = [row[0] for row in rows]
+            logger.debug("get_all_cities: найдено %d городов", len(cities))
+            return cities
+        except Exception as e:
+            logger.error("get_all_cities завершился с ошибкой: %s", e)
+            raise DbLayerError(f"Failed to fetch cities: {e}") from e
 
     # ==================== НОВЫЕ МЕТОДЫ: БИРЖИ ====================
 
@@ -5801,6 +5827,14 @@ class DatabaseLayer:
             logger.error("get_local_user_id_by_core_u_id завершился с ошибкой: %s", e)
             raise DbLayerError(f"get_local_user_id_by_core_u_id failed: {e}") from e
 
+    def get_core_u_id_by_local_user_id(self, session: Session, local_user_id: int) -> Optional[int]:
+        """Получить core_u_id по local_user_id из core_user_mapping."""
+        row = session.execute(
+            text("SELECT core_u_id FROM core_user_mapping WHERE local_user_id = :local_id"),
+            {"local_id": local_user_id}
+        ).fetchone()
+        return row[0] if row else None
+
     def get_user_core_tokens(self, session: Session, core_u_id: int) -> Tuple[Optional[str], Optional[str]]:
         row = session.execute(
             text("SELECT token, u_hash FROM core_user_mapping WHERE core_u_id = :core_id"),
@@ -5837,7 +5871,7 @@ class DatabaseLayer:
             )
         except Exception as e:
             logger.error("clear_user_u_hash failed: %s", e)
-            raise DbLayerError(f"Failed to clear u_hash: {e}")
+            raise DbLayerError(f"Failed to clear u_hash: {e}")    
 
 # ==================== CORE ORDERS MAPPING ===================
     
@@ -5931,14 +5965,79 @@ class DatabaseLayer:
         session.execute(
             text("UPDATE orders SET source_cell_id = :src, dest_cell_id = :dst WHERE id = :oid"),
             {"src": src_cell_id, "dst": dst_cell_id, "oid": order_id}
-        )
+        )    
 
-    def get_core_u_id_by_local_user_id(self, session: Session, local_user_id: int) -> Optional[int]:
-        row = session.execute(
-            text("SELECT core_u_id FROM core_user_mapping WHERE local_user_id = :local_id"),
-            {"local_id": local_user_id}
-        ).fetchone()
-        return row[0] if row else None
+    def save_core_order_mapping(
+        self,
+        session: Session,
+        local_order_id: int,
+        core_order_id: int,
+        role: str = "main",
+    ) -> None:
+        logger.debug("save_core_order_mapping: local=%s, core=%s, role=%s", local_order_id, core_order_id, role)
+        try:
+            session.execute(
+                text("""
+                    INSERT INTO core_entity_mapping
+                        (local_entity_type, local_entity_id, core_entity_type, core_entity_id,
+                        role, sync_status, last_sync_at)
+                    VALUES ('order', :local_id, 'order', :core_id, :role, 'success', NOW())
+                    ON DUPLICATE KEY UPDATE
+                        core_entity_id = VALUES(core_entity_id),
+                        last_sync_at = NOW(),
+                        sync_status = 'success'
+                """),
+                {"local_id": local_order_id, "core_id": core_order_id, "role": role}
+            )
+            logger.info("Mapping сохранён: local_order=%s, core=%s, role=%s", local_order_id, core_order_id, role)
+        except Exception as e:
+            logger.error("save_core_order_mapping failed: %s", e)
+            raise DbLayerError(f"save_core_order_mapping failed: {e}") from e
+
+    def get_core_order_id_by_role(
+        self,
+        session: Session,
+        local_order_id: int,
+        role: str,
+    ) -> Optional[int]:
+        logger.debug("get_core_order_id_by_role: local=%s, role=%s", local_order_id, role)
+        try:
+            row = session.execute(
+                text("""
+                    SELECT core_entity_id
+                    FROM core_entity_mapping
+                    WHERE local_entity_type = 'order'
+                    AND local_entity_id = :local_id
+                    AND core_entity_type = 'order'
+                    AND role = :role
+                """),
+                {"local_id": local_order_id, "role": role}
+            ).fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error("get_core_order_id_by_role failed: %s", e)
+            raise DbLayerError(f"get_core_order_id_by_role failed: {e}") from e
+
+    def update_core_mapping_role(
+        self,
+        session: Session,
+        core_order_id: int,
+        role: str,
+    ) -> None:
+        logger.debug("update_core_mapping_role: core=%s, role=%s", core_order_id, role)
+        try:
+            session.execute(
+                text("""
+                    UPDATE core_entity_mapping
+                    SET role = :role
+                    WHERE core_entity_type = 'order' AND core_entity_id = :core_id
+                """),
+                {"role": role, "core_id": core_order_id}
+            )
+            logger.info("Роль %s установлена для core_order_id=%s", role, core_order_id)
+        except Exception as e:
+            logger.error("update_core_mapping_role failed: %s", e)
+            raise DbLayerError(f"update_core_mapping_role failed: {e}") from e
 
 # ==================== Отмена заказа =============================
     def get_core_order_id_by_local_order_id(self, session: Session, local_order_id: int) -> Optional[int]:

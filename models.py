@@ -1,3 +1,4 @@
+from enum import Enum
 from pydantic import BaseModel
 from typing import Optional, List, Any, Dict, Literal
 
@@ -181,10 +182,27 @@ class CoreOrderCreateRequest(BaseModel):
     b_start_datetime: str = "any"
     b_passengers_count: int = 1
     b_luggage_count: int = 0
-    b_options: Optional[str] = None  # JSON-строка с дополнительными данными
+    b_options: Optional[str] = None
 
 class CoreOrderCreateResponse(BaseModel):
     """Ответ Core после создания заказа."""
     code: str
     status: str
     data: Dict[str, Any]
+
+# ==================== Создание авто ================
+class CarType(str, Enum):
+    COURIER = "courier"
+    DRIVER = "driver"
+
+class CarCreateRequest(BaseModel):
+    car_type: CarType
+    seats: int = 1
+    custom_body_ru: Optional[str] = None
+    custom_body_en: Optional[str] = None
+    custom_make_ru: Optional[str] = None
+    custom_make_en: Optional[str] = None
+    custom_model_ru: Optional[str] = None
+    custom_model_en: Optional[str] = None
+    custom_model_year: Optional[int] = None
+    custom_model_doors: Optional[int] = None

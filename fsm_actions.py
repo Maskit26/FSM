@@ -77,7 +77,6 @@ class OrderCreationActions:
         try:
             req = self.db.get_order_request(session, request_id)
             if not req:
-                logger.error("finalize_order_creation: request %s not found", request_id)
                 return False, None, "REQ_NOT_FOUND"
 
             parcel_type = req["parcel_type"]
@@ -88,22 +87,26 @@ class OrderCreationActions:
             pickup_type = "self" if sender_delivery == "self" else "courier"
             delivery_type = "self" if recipient_delivery == "self" else "courier"
 
+            # Создаём локальный заказ (или получаем существующий)
             local_order_id = self.db.get_or_create_order_by_core_id(
                 session, core_order_id, client_user_id, recipient_user_id,
                 description, parcel_type, cell_size, pickup_type, delivery_type
             )
-            logger.info("finalize_order_creation: local_order_id=%s created/retrieved", local_order_id)
+            logger.info("finalize_order_creation: local_order_id=%s", local_order_id)
 
+            # Привязываем ячейки
             self.db.bind_cells_for_order(session, local_order_id, src_cell_id, dst_cell_id)
             self.db.update_order_cells(session, local_order_id, src_cell_id, dst_cell_id)
             self.db.create_stage_order(session, None, local_order_id, "pickup")
             self.db.create_stage_order(session, None, local_order_id, "delivery")
 
-            logger.info("finalize_order_creation: order %s finalized successfully", local_order_id)
+            # Обновляем роль в маппинге на 'main' (если ещё не установлена)
+            self.db.update_core_mapping_role(session, core_order_id, role='main')
+
             return True, local_order_id, ""
 
         except Exception as e:
-            logger.exception("finalize_order_creation failed for request %s: %s", request_id, e)
+            logger.exception("finalize_order_creation failed for request %s", request_id)
             return False, None, f"EXCEPTION: {e}"
 
 

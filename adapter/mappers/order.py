@@ -37,12 +37,9 @@ def to_core_drive_payload(
     start_city: str,
     dest_city: str,
     b_options: Optional[Dict[str, Any]] = None,
-    only_offer: bool = False,
+    kind: int = 1,
+    upper: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Преобразует данные заказа в формат Core API (/api/v1/drive).
-    Если only_offer=True, то заказ создаётся в статусе 6 (предлагается водителям).
-    """
     payload = {
         "b_start_address": start_address,
         "b_destination_address": dest_address,
@@ -50,7 +47,9 @@ def to_core_drive_payload(
         "b_start_datetime": "any",
         "b_passengers_count": 1,
         "b_luggage_count": 0,
+        "b_options": b_options or {},
+        "kind": kind,
     }
-    if only_offer:
-        payload["b_only_offer"] = 1
+    if upper is not None:
+        payload["upper"] = upper
     return payload

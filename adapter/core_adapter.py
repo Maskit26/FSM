@@ -7,7 +7,7 @@ import json
 from typing import Dict, Any, Tuple, Optional, List
 from .core_client import CoreClient
 from .mappers.user import to_core_register, from_core_register, to_core_login, from_core_login
-from .exceptions import CoreUnavailableError, CoreValidationError, CoreAuthError, CoreAdapterError
+from .exceptions import CoreAdapterError, CoreMappingError, CoreAuthError, CoreValidationError, CoreUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -100,35 +100,35 @@ class CoreAdapter:
         return self.client.logout_with_token(token, u_hash)
 
 # ======================== CORE ORDER ==============================
-    def create_drive_order(self, order_data: Dict[str, Any], token: str, u_hash: str) -> Dict[str, Any]:
-        """Создать поездку в Core от имени пользователя."""
-        logger.info("create_drive_order: using token=%s..., u_hash=%s...",
-                    token[:10] if token else "None", u_hash[:10] if u_hash else "None")
+    def create_drive_order(
+        self,
+        order_data: Dict[str, Any],
+        token: str,
+        u_hash: str,
+        kind: int = 1,
+        upper: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        logger.info("create_drive_order: kind=%s, upper=%s", kind, upper)
         try:
-            logger.info(f"Order data for Core: {json.dumps(order_data, ensure_ascii=False)}")
+            data = order_data.copy()
+            data["kind"] = kind
+            if upper is not None:
+                data["upper"] = upper
             payload = {
-                "data": json.dumps(order_data, ensure_ascii=False),
+                "data": json.dumps(data, ensure_ascii=False),
                 "token": token,
                 "u_hash": u_hash,
             }
             response = self.client.post_form_without_auth("/api/v1/drive", payload)
             if response.get("status") != "success":
-                error_msg = response.get("message", "Unknown error")
-                logger.error("Core drive order error: %s", error_msg)
-                raise CoreValidationError(f"Core returned error: {error_msg}")
+                raise CoreValidationError(f"Core error: {response.get('message')}")
+            logger.info("create_drive_order success: b_id=%s", response["data"]["b_id"])
             return response
-        except CoreUnavailableError as e:
-            logger.error("Core unavailable while creating drive order: %s", e)
-            raise
-        except CoreValidationError as e:
-            logger.error("Core validation error: %s", e)
-            raise
-        except CoreAuthError as e:
-            logger.error("Core auth error (token may be expired): %s", e)
+        except CoreValidationError:
             raise
         except Exception as e:
-            logger.exception("Unexpected error in create_drive_order")
-            raise CoreAdapterError(f"Create drive order failed: {e}") from e
+            logger.exception("create_drive_order failed")
+            raise CoreAdapterError(f"create_drive_order failed: {e}") from e   
 
 # ====================== Отмена заказа =========================
     def cancel_drive_order(self, b_id: int, token: str, u_hash: str, reason: str = None, cancel_states: str = None) -> Dict[str, Any]:
@@ -216,4 +216,15 @@ class CoreAdapter:
             logger.exception("get_drive_order failed")
             raise CoreAdapterError(f"get_drive_order failed: {e}")
 
-    
+# ==================== Создание авто ===========================
+    def create_car(self, token: str, u_hash: str, core_u_id: int, car_data: Dict[str, Any]) -> int:
+        response = self.client.create_car(token, u_hash, core_u_id, car_data)
+        logger.info("create_car: full Core response = %s", json.dumps(response, indent=2))
+        # В ответе используется created_car, а не car
+        created_car = response.get("data", {}).get("created_car", {})
+        if created_car:
+            core_car_id = created_car.get("c_id")
+            if core_car_id:
+                logger.info("create_car: extracted core_car_id=%s", core_car_id)
+                return int(core_car_id)
+        raise CoreAdapterError("Core did not return car id")

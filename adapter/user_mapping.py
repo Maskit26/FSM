@@ -6,8 +6,9 @@ from typing import Dict, Any, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from .core_adapter import CoreAdapter
-from db_layer import DatabaseLayer  
-from .exceptions import CoreAdapterError
+from db_layer import DatabaseLayer 
+from .mappers.user import to_core_car_payload 
+from .exceptions import CoreAuthError, CoreMappingError, CoreAdapterError, CoreValidationError, CoreUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -193,3 +194,52 @@ class UserMapping:
         
         self.db.clear_user_u_hash(session, local_user_id)
         return result
+
+# ================== Создание авто ======================== 
+    def create_car_for_core_user(
+        self,
+        session: Session,
+        core_u_id: int,
+        car_type: str,
+        seats: int = 1,
+        custom_body_ru: Optional[str] = None,
+        custom_body_en: Optional[str] = None,
+        custom_make_ru: Optional[str] = None,
+        custom_make_en: Optional[str] = None,
+        custom_model_ru: Optional[str] = None,
+        custom_model_en: Optional[str] = None,
+        custom_model_year: Optional[int] = None,
+        custom_model_doors: Optional[int] = None,
+    ) -> int:
+        # 1. Найти local_user_id
+        local_user_id = self.db.get_local_user_id_by_core_u_id(session, core_u_id)
+        if not local_user_id:
+            raise CoreMappingError(f"Core user {core_u_id} not mapped locally")
+        # 2. Проверить, нет ли машины
+        if self.db.get_car_core_id(session, local_user_id):
+            raise CoreMappingError("User already has a car")
+        # 3. Получить токены
+        token, u_hash = self.db.get_user_core_tokens(session, core_u_id)
+        if not token or not u_hash:
+            raise CoreAuthError(f"Missing tokens for core_u_id {core_u_id}")
+        # 4. Сформировать данные машины
+        prefix = "BIKE" if car_type == "courier" else "CAR"
+        registration_plate = f"{prefix}-{core_u_id}"
+        car_data = to_core_car_payload(
+            registration_plate=registration_plate,
+            car_type=car_type,
+            seats=seats,
+            custom_body_ru=custom_body_ru,
+            custom_body_en=custom_body_en,
+            custom_make_ru=custom_make_ru,
+            custom_make_en=custom_make_en,
+            custom_model_ru=custom_model_ru,
+            custom_model_en=custom_model_en,
+            custom_model_year=custom_model_year,
+            custom_model_doors=custom_model_doors,
+        )
+        # 5. Вызвать Core
+        core_car_id = self.core_adapter.create_car(token, u_hash, core_u_id, car_data)
+        # 6. Обновить car_core_id
+        self.db.update_car_core_id(session, local_user_id, core_car_id)
+        return core_car_id, registration_plate
