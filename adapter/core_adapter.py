@@ -102,24 +102,22 @@ class CoreAdapter:
 # ======================== CORE ORDER ==============================
     def create_drive_order(
         self,
-        order_data: Dict[str, Any],
+        payload: Dict[str, Any],
         token: str,
         u_hash: str,
-        kind: int = 1,
-        upper: Optional[int] = None,
     ) -> Dict[str, Any]:
-        logger.info("create_drive_order: kind=%s, upper=%s", kind, upper)
+        """
+        Универсальное создание заказа в Core.
+        payload должен уже содержать все необходимые поля (kind, upper и т.д.)
+        """
+        logger.info("create_drive_order: payload keys=%s", list(payload.keys()))
         try:
-            data = order_data.copy()
-            data["kind"] = kind
-            if upper is not None:
-                data["upper"] = upper
-            payload = {
-                "data": json.dumps(data, ensure_ascii=False),
+            request_data = {
+                "data": json.dumps(payload, ensure_ascii=False),
                 "token": token,
                 "u_hash": u_hash,
             }
-            response = self.client.post_form_without_auth("/api/v1/drive", payload)
+            response = self.client.post_form_without_auth("/api/v1/drive", request_data)
             if response.get("status") != "success":
                 raise CoreValidationError(f"Core error: {response.get('message')}")
             logger.info("create_drive_order success: b_id=%s", response["data"]["b_id"])
@@ -128,7 +126,7 @@ class CoreAdapter:
             raise
         except Exception as e:
             logger.exception("create_drive_order failed")
-            raise CoreAdapterError(f"create_drive_order failed: {e}") from e   
+            raise CoreAdapterError(f"create_drive_order failed: {e}") from e
 
 # ====================== Отмена заказа =========================
     def cancel_drive_order(self, b_id: int, token: str, u_hash: str, reason: str = None, cancel_states: str = None) -> Dict[str, Any]:
@@ -193,6 +191,7 @@ class CoreAdapter:
         }
         try:
             response = self.client.post_form_with_params(endpoint, params)
+            logger.info("perform_drive_order response: %s", response)
             if response.get("status") != "success":
                 logger.error("Core set_performer error: %s", response)
                 raise CoreValidationError(f"Core set_performer failed: {response.get('message')}")
@@ -208,7 +207,9 @@ class CoreAdapter:
         endpoint = f"/api/v1/drive/get/{b_id}"
         params = {"token": token, "u_hash": u_hash}
         try:
+            logger.info("get_drive_order request: endpoint=%s, params=%s", endpoint, {**params, "token": "***", "u_hash": "***"})
             response = self.client.get_with_params(endpoint, params)
+            logger.info("get_drive_order response: status_code=%s, body=%s", response.get('code'), response)
             return response
         except CoreAdapterError:
             raise

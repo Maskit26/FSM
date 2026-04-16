@@ -16,7 +16,7 @@ class OrderCreationActions:
     def __init__(self, db: DatabaseLayer):
         self.db = db
 
-    def create_order_from_request(
+    def find_cell_for_order(
         self,
         session: Session,
         request_id: int,
@@ -72,6 +72,9 @@ class OrderCreationActions:
         dst_cell_id: int,
         client_user_id: int,
         recipient_user_id: Optional[int],
+        b_state: int,
+        kind: Optional[int],
+        upper: Optional[int],
     ) -> Tuple[bool, Optional[int], str]:
         logger.info("finalize_order_creation: request_id=%s, core_order_id=%s", request_id, core_order_id)
         try:
@@ -87,10 +90,21 @@ class OrderCreationActions:
             pickup_type = "self" if sender_delivery == "self" else "courier"
             delivery_type = "self" if recipient_delivery == "self" else "courier"
 
-            # Создаём локальный заказ (или получаем существующий)
+            # Создаём или получаем локальный заказ, передаём все параметры
             local_order_id = self.db.get_or_create_order_by_core_id(
-                session, core_order_id, client_user_id, recipient_user_id,
-                description, parcel_type, cell_size, pickup_type, delivery_type
+                session=session,
+                core_order_id=core_order_id,
+                client_user_id=client_user_id,
+                recipient_user_id=recipient_user_id,
+                description=description,
+                parcel_type=parcel_type,
+                cell_size=cell_size,
+                pickup_type=pickup_type,
+                delivery_type=delivery_type,
+                role="main",
+                kind=kind,
+                upper=upper,
+                b_state=b_state,
             )
             logger.info("finalize_order_creation: local_order_id=%s", local_order_id)
 
@@ -99,10 +113,6 @@ class OrderCreationActions:
             self.db.update_order_cells(session, local_order_id, src_cell_id, dst_cell_id)
             self.db.create_stage_order(session, None, local_order_id, "pickup")
             self.db.create_stage_order(session, None, local_order_id, "delivery")
-
-            # Обновляем роль в маппинге на 'main' (если ещё не установлена)
-            self.db.update_core_mapping_role(session, core_order_id, role='main')
-
             return True, local_order_id, ""
 
         except Exception as e:

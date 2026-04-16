@@ -39,29 +39,22 @@ FsmStateHandler = Callable[[DatabaseLayer, Session, Dict[str, Any], Dict[str, An
 # ==================== ORDER CREATION ====================
 def _handle_order_creation_pending(db, session, ctx, instance):
     request_id = instance["entity_id"]
-    logger.info("FSM order_creation: processing request_id=%s", request_id)
-
     actions = ctx["order_creation_actions"]
-    ok, src_id, dst_id, client_id, recipient_id, err = actions.create_order_from_request(session, request_id)
+    ok, src_id, dst_id, client_id, recipient_id, err = actions.find_cell_for_order(session, request_id)
     if not ok:
-        logger.error("FSM order_creation: reserve cells failed for request %s: %s", request_id, err)
         return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
 
     order_mapping = ctx["order_mapping"]
-    ok, core_order_id, err = order_mapping.create_order_in_core(session, request_id, src_id, dst_id)
+    ok, core_order_id, b_state, kind, upper, err = order_mapping.create_order_in_core(session, request_id, src_id, dst_id)
     if not ok:
-        logger.error("FSM order_creation: Core call failed for request %s: %s", request_id, err)
         return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
 
     ok, local_order_id, err = actions.finalize_order_creation(
-        session, request_id, core_order_id, src_id, dst_id, client_id, recipient_id
+        session, request_id, core_order_id, src_id, dst_id, client_id, recipient_id, b_state, kind, upper
     )
     if not ok:
-        logger.error("FSM order_creation: finalize failed for request %s: %s", request_id, err)
         return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
 
-    logger.info("FSM order_creation: completed request %s -> local_order_id=%s, core_order_id=%s",
-                request_id, local_order_id, core_order_id)
     return FsmStepResult(new_state="COMPLETED", payload={"order_id": local_order_id})
 
 

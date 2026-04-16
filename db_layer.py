@@ -1,9 +1,6 @@
 #"""
 #ORM слой для работы с базой данных логистической системы.
 #
-#FSM имена: trip_vzyat_reis, trip_start_trip (с подчёркиваниями!)
-#Все поля: from_city, to_city, driver_user_id (с подчёркиваниями!)
-#
 #Требования:
 #pip install sqlalchemy mysql-connector-python
 
@@ -11,8 +8,6 @@
 #from db_layer import DatabaseLayer, DbLayerError, FsmCallError
 
 #db = DatabaseLayer(port=3306, password="6eF1zb")
-#order_id = db.create_order(...)
-#trip_id, success, msg = db.assign_order_to_trip_smart(order_id, "Москва", "СПб")
 #"""
 
 from typing import List, Dict, Any, Optional, Tuple
@@ -5892,6 +5887,12 @@ class DatabaseLayer:
         address = row[0]
         logger.debug("get_locker_address_by_cell: cell_id=%s -> address='%s'", cell_id, address)
         return address
+
+    def update_order_cells(self, session: Session, order_id: int, src_cell_id: int, dst_cell_id: int) -> None:
+        session.execute(
+            text("UPDATE orders SET source_cell_id = :src, dest_cell_id = :dst WHERE id = :oid"),
+            {"src": src_cell_id, "dst": dst_cell_id, "oid": order_id}
+        )    
         
     def get_or_create_order_by_core_id(
         self,
@@ -5904,155 +5905,144 @@ class DatabaseLayer:
         cell_size: str,
         pickup_type: str,
         delivery_type: str,
+        role: str,  
+        kind: Optional[int], 
+        upper: Optional[int], 
+        b_state: int,  
     ) -> int:
-        logger.debug("get_or_create_order_by_core_id: core_order_id=%s, client=%s, recipient=%s",
-                    core_order_id, client_user_id, recipient_user_id)
+        logger.debug("get_or_create_order_by_core_id: core=%s, role=%s, kind=%s, upper=%s, b_state=%s",
+                    core_order_id, role, kind, upper, b_state)
+        try:
+            # Проверяем существующий маппинг
+            row = session.execute(
+                text("SELECT local_order_id FROM core_order_mapping WHERE core_order_id = :core_id"),
+                {"core_id": core_order_id}
+            ).fetchone()
+            if row:
+                return row[0]
 
-        # 1. Проверяем маппинг
-        row = session.execute(
-            text("""
-                SELECT local_entity_id, sync_status
-                FROM core_entity_mapping
-                WHERE core_entity_type = 'order' AND core_entity_id = :core_id
-            """),
-            {"core_id": core_order_id}
-        ).fetchone()
-        if row:
-            local_id, status = row
-            logger.info("Found existing mapping: local_order_id=%s, sync_status=%s", local_id, status)
-            # Обновляем время последней синхронизации и сбрасываем ошибку
+            # Создаём локальный заказ
+            order_id = self.create_order_record(
+                session=session,
+                description=description,
+                pickup_type=pickup_type,
+                delivery_type=delivery_type,
+                client_user_id=client_user_id,
+                recipient_user_id=recipient_user_id,
+                source_cell_id=None,
+                dest_cell_id=None,
+            )
+
+            # Сохраняем маппинг
             session.execute(
                 text("""
-                    UPDATE core_entity_mapping
-                    SET last_sync_at = NOW(),
-                        sync_status = 'success',
-                        error_message = NULL
-                    WHERE core_entity_type = 'order' AND core_entity_id = :core_id
+                    INSERT INTO core_order_mapping
+                        (local_order_id, core_order_id, role, kind, upper, b_state, created_at, updated_at)
+                    VALUES (:local_id, :core_id, :role, :kind, :upper, :b_state, NOW(), NOW())
                 """),
-                {"core_id": core_order_id}
+                {
+                    "local_id": order_id,
+                    "core_id": core_order_id,
+                    "role": role,
+                    "kind": kind,
+                    "upper": upper,
+                    "b_state": b_state,
+                }
             )
-            logger.debug("Updated mapping for core_order_id=%s: last_sync_at=NOW, sync_status=success", core_order_id)
-            return local_id
-
-        # 2. Создаём локальный заказ
-        logger.info("No local order found for core_order_id=%s, creating new order", core_order_id)
-        order_id = self.create_order_record(
-            session=session,
-            description=description,
-            pickup_type=pickup_type,
-            delivery_type=delivery_type,
-            client_user_id=client_user_id,
-            recipient_user_id=recipient_user_id,
-            source_cell_id=None,
-            dest_cell_id=None,
-        )
-        logger.debug("Created local order %s", order_id)
-
-        # 3. Сохраняем маппинг
-        session.execute(
-            text("""
-                INSERT INTO core_entity_mapping
-                    (local_entity_type, local_entity_id, core_entity_type, core_entity_id,
-                    sync_status, last_sync_at, error_message)
-                VALUES ('order', :local_id, 'order', :core_id, 'success', NOW(), NULL)
-            """),
-            {"local_id": order_id, "core_id": core_order_id}
-        )
-        logger.info("Created mapping: local_order_id=%s <-> core_order_id=%s", order_id, core_order_id)
-        return order_id
-
-    def update_order_cells(self, session: Session, order_id: int, src_cell_id: int, dst_cell_id: int) -> None:
-        session.execute(
-            text("UPDATE orders SET source_cell_id = :src, dest_cell_id = :dst WHERE id = :oid"),
-            {"src": src_cell_id, "dst": dst_cell_id, "oid": order_id}
-        )    
+            logger.info("Created mapping: local=%s, core=%s", order_id, core_order_id)
+            return order_id
+        except Exception as e:
+            logger.exception("get_or_create_order_by_core_id failed")
+            raise DbLayerError(f"get_or_create_order_by_core_id failed: {e}") from e
 
     def save_core_order_mapping(
         self,
         session: Session,
         local_order_id: int,
         core_order_id: int,
-        role: str = "main",
+        role: str,
+        kind: int,
+        upper: Optional[int],
+        b_state: int,
     ) -> None:
-        logger.debug("save_core_order_mapping: local=%s, core=%s, role=%s", local_order_id, core_order_id, role)
+        logger.debug("save_core_order_mapping: local=%s, core=%s, role=%s, kind=%s, upper=%s, b_state=%s",
+                    local_order_id, core_order_id, role, kind, upper, b_state)
         try:
             session.execute(
                 text("""
-                    INSERT INTO core_entity_mapping
-                        (local_entity_type, local_entity_id, core_entity_type, core_entity_id,
-                        role, sync_status, last_sync_at)
-                    VALUES ('order', :local_id, 'order', :core_id, :role, 'success', NOW())
+                    INSERT INTO core_order_mapping
+                        (local_order_id, core_order_id, role, kind, upper, b_state, created_at, updated_at)
+                    VALUES (:local_id, :core_id, :role, :kind, :upper, :b_state, NOW(), NOW())
                     ON DUPLICATE KEY UPDATE
-                        core_entity_id = VALUES(core_entity_id),
-                        last_sync_at = NOW(),
-                        sync_status = 'success'
+                        local_order_id = VALUES(local_order_id),
+                        role = VALUES(role),
+                        kind = VALUES(kind),
+                        upper = VALUES(upper),
+                        b_state = VALUES(b_state),
+                        updated_at = NOW()
                 """),
-                {"local_id": local_order_id, "core_id": core_order_id, "role": role}
+                {
+                    "local_id": local_order_id,
+                    "core_id": core_order_id,
+                    "role": role,
+                    "kind": kind,
+                    "upper": upper,
+                    "b_state": b_state,
+                }
             )
-            logger.info("Mapping сохранён: local_order=%s, core=%s, role=%s", local_order_id, core_order_id, role)
+            logger.info("Mapping saved: local=%s, core=%s", local_order_id, core_order_id)
+        except SQLAlchemyError as e:
+            logger.error("Database error in save_core_order_mapping for core=%s: %s", core_order_id, e)
+            raise DbLayerError(f"Database error: {e}") from e
         except Exception as e:
-            logger.error("save_core_order_mapping failed: %s", e)
-            raise DbLayerError(f"save_core_order_mapping failed: {e}") from e
+            logger.exception("Unexpected error in save_core_order_mapping")
+            raise DbLayerError(f"Unexpected error: {e}") from e
 
-    def get_core_order_id_by_role(
-        self,
-        session: Session,
-        local_order_id: int,
-        role: str,
-    ) -> Optional[int]:
-        logger.debug("get_core_order_id_by_role: local=%s, role=%s", local_order_id, role)
+    def get_main_core_order_id(self, session: Session, local_order_id: int) -> Optional[int]:
+        logger.debug("get_main_core_order_id: local=%s", local_order_id)
         try:
             row = session.execute(
-                text("""
-                    SELECT core_entity_id
-                    FROM core_entity_mapping
-                    WHERE local_entity_type = 'order'
-                    AND local_entity_id = :local_id
-                    AND core_entity_type = 'order'
-                    AND role = :role
-                """),
-                {"local_id": local_order_id, "role": role}
+                text("SELECT core_order_id FROM core_order_mapping WHERE local_order_id = :local_id AND role = 'main' AND kind = 1 LIMIT 1"),
+                {"local_id": local_order_id}
             ).fetchone()
-            return row[0] if row else None
+            result = row[0] if row else None
+            logger.debug("get_main_core_order_id: local=%s -> core=%s", local_order_id, result)
+            return result
+        except SQLAlchemyError as e:
+            logger.error("Database error in get_main_core_order_id: %s", e)
+            raise DbLayerError(f"Database error: {e}") from e
         except Exception as e:
-            logger.error("get_core_order_id_by_role failed: %s", e)
-            raise DbLayerError(f"get_core_order_id_by_role failed: {e}") from e
+            logger.exception("Unexpected error in get_main_core_order_id")
+            raise DbLayerError(f"Unexpected error: {e}") from e
 
-    def update_core_mapping_role(
-        self,
-        session: Session,
-        core_order_id: int,
-        role: str,
-    ) -> None:
-        logger.debug("update_core_mapping_role: core=%s, role=%s", core_order_id, role)
+    def get_suborder_core_id(self, session: Session, local_order_id: int, role: str, upper: int) -> Optional[int]:
+        logger.debug("get_suborder_core_id: local=%s, role=%s, upper=%s", local_order_id, role, upper)
         try:
-            session.execute(
-                text("""
-                    UPDATE core_entity_mapping
-                    SET role = :role
-                    WHERE core_entity_type = 'order' AND core_entity_id = :core_id
-                """),
-                {"role": role, "core_id": core_order_id}
-            )
-            logger.info("Роль %s установлена для core_order_id=%s", role, core_order_id)
+            row = session.execute(
+                text("SELECT core_order_id FROM core_order_mapping WHERE local_order_id = :local_id AND role = :role AND upper = :upper LIMIT 1"),
+                {"local_id": local_order_id, "role": role, "upper": upper}
+            ).fetchone()
+            result = row[0] if row else None
+            logger.debug("get_suborder_core_id: local=%s, role=%s -> core=%s", local_order_id, role, result)
+            return result
+        except SQLAlchemyError as e:
+            logger.error("Database error in get_suborder_core_id: %s", e)
+            raise DbLayerError(f"Database error: {e}") from e
         except Exception as e:
-            logger.error("update_core_mapping_role failed: %s", e)
-            raise DbLayerError(f"update_core_mapping_role failed: {e}") from e
+            logger.exception("Unexpected error in get_suborder_core_id")
+            raise DbLayerError(f"Unexpected error: {e}") from e    
 
-# ==================== Отмена заказа =============================
     def get_core_order_id_by_local_order_id(self, session: Session, local_order_id: int) -> Optional[int]:
         """
-        Возвращает core_entity_id (b_id) по локальному order_id из core_entity_mapping.
+        Возвращает core_order_id (b_id) по локальному order_id из core_order_mapping.
         """
         logger.debug("get_core_order_id_by_local_order_id: local_order_id=%s", local_order_id)
         try:
             row = session.execute(
                 text("""
-                    SELECT core_entity_id
-                    FROM core_entity_mapping
-                    WHERE local_entity_type = 'order'
-                    AND local_entity_id = :local_id
-                    AND core_entity_type = 'order'
+                    SELECT core_order_id
+                    FROM core_order_mapping
+                    WHERE local_order_id = :local_id
                 """),
                 {"local_id": local_order_id}
             ).fetchone()
@@ -6063,7 +6053,7 @@ class DatabaseLayer:
             logger.error("get_core_order_id_by_local_order_id failed for local_order_id=%s: %s", local_order_id, e)
             raise DbLayerError(f"Failed to get core order id: {e}") from e
 
-# ===================== Назначение курьера ========================
+# ===================== Создание авто ========================
     def get_car_core_id(self, session: Session, local_user_id: int) -> Optional[int]:
         """
         Возвращает car_core_id для локального пользователя из core_user_mapping.
