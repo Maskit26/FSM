@@ -217,6 +217,27 @@ class CoreAdapter:
             logger.exception("get_drive_order failed")
             raise CoreAdapterError(f"get_drive_order failed: {e}")
 
+    def complete_drive_order(self, b_id: int, token: str, u_hash: str) -> Dict[str, Any]:
+        """
+        Завершить поездку (подзаказ) в Core.
+        """
+        logger.info("complete_drive_order: b_id=%s", b_id)
+        endpoint = f"/api/v1/drive/get/{b_id}"
+        params = {
+            "action": "set_complete_state",
+            "token": token,
+            "u_hash": u_hash,
+        }
+        try:
+            response = self.client.post_form_with_params(endpoint, params)
+            if response.get("status") != "success":
+                raise CoreValidationError(f"Core complete order error: {response.get('message')}")
+            logger.info("complete_drive_order success: b_id=%s", b_id)
+            return response
+        except Exception as e:
+            logger.exception("complete_drive_order failed")
+            raise CoreAdapterError(f"complete_drive_order failed: {e}") from e
+
 # ==================== Создание авто ===========================
     def create_car(self, token: str, u_hash: str, core_u_id: int, car_data: Dict[str, Any]) -> int:
         response = self.client.create_car(token, u_hash, core_u_id, car_data)

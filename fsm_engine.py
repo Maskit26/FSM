@@ -290,34 +290,76 @@ def _handle_close_cell(
 ) -> FsmStepResult:
     """
     Универсальный обработчик закрытия ячейки.
-    Поддерживаемые роли: client, recipient, courier, operator, driver.
-    entity_type: "order" или "locker".
+    entity_type = "order"  → роли: client, recipient, courier, operator
+    entity_type = "locker" → роль:  driver
     """
     user_role = instance["requested_user_role"]
     entity_type = instance["entity_type"]
     entity_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
+    target_user_id = instance.get("target_user_id")
+    target_role = instance.get("target_role")
 
     logger.info(f"[FSM] close_cell: role={user_role}, entity={entity_type}:{entity_id}, user={user_id}")
 
+    order_mapping = ctx.get("order_mapping")
+
     if entity_type == "order":
+        # ----- CLIENT -----
         if user_role == "client":
             success, error = ctx["client_actions"].close_cell_for_client(session, entity_id, user_id)
+
+        # ----- RECIPIENT -----
         elif user_role == "recipient":
+            if order_mapping:
+                ok, err = order_mapping.complete_main_order_in_core(session, entity_id, user_id)
+                if not ok:
+                    logger.error("Core main completion failed for recipient: %s", err)
+                    return FsmStepResult(new_state="FAILED", last_error=f"CORE_MAIN_COMPLETION_FAILED: {err}")
             success, error = ctx["recipient_actions"].close_cell_for_recipient(session, entity_id, user_id)
+
+        # ----- COURIER -----
         elif user_role == "courier":
+            if order_mapping:
+                ok, err = order_mapping.complete_suborder_in_core(session, entity_id, user_id)
+                if not ok:
+                    logger.error("Core suborder completion failed for courier: %s", err)
+                    return FsmStepResult(new_state="FAILED", last_error=f"CORE_SUBORDER_COMPLETION_FAILED: {err}")
             success, error = ctx["courier_actions"].close_cell(session, entity_id, user_id)
+
+        # ----- OPERATOR -----
         elif user_role == "operator":
+            actual_user = target_user_id or user_id
+            if order_mapping:
+                if target_role in ("client", "recipient"):
+                    ok, err = order_mapping.complete_main_order_in_core(session, entity_id, actual_user)
+                elif target_role in ("courier", "driver"):
+                    ok, err = order_mapping.complete_suborder_in_core(session, entity_id, actual_user)
+                else:
+                    ok, err = True, ""
+                if not ok:
+                    logger.error("Core completion by operator failed: %s", err)
+                    return FsmStepResult(new_state="FAILED", last_error=f"CORE_OPERATOR_COMPLETION_FAILED: {err}")
             success, error = ctx["operator_actions"].close_cell_for_operator(session, entity_id, user_id)
+
         else:
             logger.warning(f"[FSM] close_cell: unsupported role {user_role} for order")
             return FsmStepResult(new_state="FAILED", last_error=f"ROLE_NOT_SUPPORTED_{user_role}")
+
+    # --------- Driver --------------------
     elif entity_type == "locker":
         if user_role == "driver":
+            order_id = db.get_order_id_by_cell_id(session, entity_id)
+            if order_id and order_mapping:
+                ok, err = order_mapping.complete_suborder_in_core(session, order_id, user_id)
+                if not ok:
+                    logger.error("Core suborder completion failed for driver (locker): %s", err)
+                    return FsmStepResult(new_state="FAILED", last_error=f"CORE_SUBORDER_COMPLETION_FAILED: {err}")
             success, error = ctx["driver_actions"].close_cell_for_driver(session, entity_id, user_id)
         else:
             logger.warning(f"[FSM] close_cell: locker access denied for role {user_role}")
             return FsmStepResult(new_state="FAILED", last_error=f"LOCKER_ACCESS_DENIED_FOR_{user_role}")
+
     else:
         logger.error(f"[FSM] close_cell: unsupported entity_type {entity_type}")
         return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
@@ -325,7 +367,7 @@ def _handle_close_cell(
     if not success:
         logger.error(f"[FSM] close_cell FAILED: entity={entity_type}:{entity_id}, error={error or 'CLOSE_FAILED'}")
         return FsmStepResult(new_state="FAILED", last_error=error or "CLOSE_FAILED")
-    
+
     logger.info(f"[FSM] close_cell COMPLETED: entity={entity_type}:{entity_id}")
     return FsmStepResult(new_state="COMPLETED")
 

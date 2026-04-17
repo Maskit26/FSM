@@ -5905,10 +5905,11 @@ class DatabaseLayer:
         cell_size: str,
         pickup_type: str,
         delivery_type: str,
-        role: str,  
-        kind: Optional[int], 
-        upper: Optional[int], 
-        b_state: int,  
+        role: str,
+        kind: Optional[int],
+        upper: Optional[int],
+        b_state: int,
+        performer_local_user_id: Optional[int] = None,
     ) -> int:
         logger.debug("get_or_create_order_by_core_id: core=%s, role=%s, kind=%s, upper=%s, b_state=%s",
                     core_order_id, role, kind, upper, b_state)
@@ -5934,20 +5935,16 @@ class DatabaseLayer:
             )
 
             # Сохраняем маппинг
-            session.execute(
-                text("""
-                    INSERT INTO core_order_mapping
-                        (local_order_id, core_order_id, role, kind, upper, b_state, created_at, updated_at)
-                    VALUES (:local_id, :core_id, :role, :kind, :upper, :b_state, NOW(), NOW())
-                """),
-                {
-                    "local_id": order_id,
-                    "core_id": core_order_id,
-                    "role": role,
-                    "kind": kind,
-                    "upper": upper,
-                    "b_state": b_state,
-                }
+            self.save_core_order_mapping(
+                session=session,
+                local_order_id=order_id,
+                core_order_id=core_order_id,
+                role=role,
+                kind=kind,
+                upper=upper,
+                b_state=b_state,
+                client_local_user_id=client_user_id if role == "main" else None,
+                performer_local_user_id=performer_local_user_id if role != "main" else None,
             )
             logger.info("Created mapping: local=%s, core=%s", order_id, core_order_id)
             return order_id
@@ -5964,21 +5961,27 @@ class DatabaseLayer:
         kind: int,
         upper: Optional[int],
         b_state: int,
+        client_local_user_id: Optional[int] = None,
+        performer_local_user_id: Optional[int] = None,  
     ) -> None:
-        logger.debug("save_core_order_mapping: local=%s, core=%s, role=%s, kind=%s, upper=%s, b_state=%s",
-                    local_order_id, core_order_id, role, kind, upper, b_state)
+        logger.debug("save_core_order_mapping: local=%s, core=%s, role=%s, client=%s, performer=%s",
+                    local_order_id, core_order_id, role, client_local_user_id, performer_local_user_id)
         try:
             session.execute(
                 text("""
                     INSERT INTO core_order_mapping
-                        (local_order_id, core_order_id, role, kind, upper, b_state, created_at, updated_at)
-                    VALUES (:local_id, :core_id, :role, :kind, :upper, :b_state, NOW(), NOW())
+                        (local_order_id, core_order_id, role, kind, upper, b_state,
+                        client_local_user_id, performer_local_user_id, created_at, updated_at)
+                    VALUES (:local_id, :core_id, :role, :kind, :upper, :b_state,
+                            :client_id, :performer_id, NOW(), NOW())
                     ON DUPLICATE KEY UPDATE
-                        local_order_id = VALUES(local_order_id),
+                        core_order_id = VALUES(core_order_id),
                         role = VALUES(role),
                         kind = VALUES(kind),
                         upper = VALUES(upper),
                         b_state = VALUES(b_state),
+                        client_local_user_id = VALUES(client_local_user_id),
+                        performer_local_user_id = VALUES(performer_local_user_id),
                         updated_at = NOW()
                 """),
                 {
@@ -5988,15 +5991,14 @@ class DatabaseLayer:
                     "kind": kind,
                     "upper": upper,
                     "b_state": b_state,
+                    "client_id": client_local_user_id,
+                    "performer_id": performer_local_user_id,
                 }
             )
             logger.info("Mapping saved: local=%s, core=%s", local_order_id, core_order_id)
-        except SQLAlchemyError as e:
-            logger.error("Database error in save_core_order_mapping for core=%s: %s", core_order_id, e)
-            raise DbLayerError(f"Database error: {e}") from e
         except Exception as e:
-            logger.exception("Unexpected error in save_core_order_mapping")
-            raise DbLayerError(f"Unexpected error: {e}") from e
+            logger.error("Database error in save_core_order_mapping: %s", e)
+            raise DbLayerError(f"save_core_order_mapping failed: {e}") from e
 
     def get_main_core_order_id(self, session: Session, local_order_id: int) -> Optional[int]:
         logger.debug("get_main_core_order_id: local=%s", local_order_id)
@@ -6030,28 +6032,123 @@ class DatabaseLayer:
             raise DbLayerError(f"Database error: {e}") from e
         except Exception as e:
             logger.exception("Unexpected error in get_suborder_core_id")
-            raise DbLayerError(f"Unexpected error: {e}") from e    
+            raise DbLayerError(f"Unexpected error: {e}") from e       
 
-    def get_core_order_id_by_local_order_id(self, session: Session, local_order_id: int) -> Optional[int]:
+    def get_core_suborder_id_by_performer(
+        self,
+        session: Session,
+        local_order_id: int,
+        performer_local_user_id: int,
+    ) -> Optional[int]:
         """
-        Возвращает core_order_id (b_id) по локальному order_id из core_order_mapping.
+        Возвращает core_order_id подзаказа по локальному заказу и исполнителю.
         """
-        logger.debug("get_core_order_id_by_local_order_id: local_order_id=%s", local_order_id)
+        logger.debug("get_core_suborder_id_by_performer: local_order_id=%s, performer=%s",
+                    local_order_id, performer_local_user_id)
         try:
             row = session.execute(
                 text("""
-                    SELECT core_order_id
-                    FROM core_order_mapping
+                    SELECT core_order_id FROM core_order_mapping
                     WHERE local_order_id = :local_id
+                    AND performer_local_user_id = :performer_id
+                    LIMIT 1
                 """),
-                {"local_id": local_order_id}
+                {"local_id": local_order_id, "performer_id": performer_local_user_id}
             ).fetchone()
             result = row[0] if row else None
-            logger.debug("get_core_order_id_by_local_order_id: local_order_id=%s -> %s", local_order_id, result)
+            logger.debug("get_core_suborder_id_by_performer: result=%s", result)
             return result
         except Exception as e:
-            logger.error("get_core_order_id_by_local_order_id failed for local_order_id=%s: %s", local_order_id, e)
-            raise DbLayerError(f"Failed to get core order id: {e}") from e
+            logger.error("get_core_suborder_id_by_performer failed: %s", e)
+            raise DbLayerError(f"Failed to get core suborder id: {e}") from e
+
+    def get_core_order_completion_info(
+        self,
+        session: Session,
+        local_order_id: int,
+        user_id: int,
+        is_main: bool = False,
+    ) -> Tuple[Optional[int], Optional[int], Optional[int], str]:
+        """
+        Возвращает информацию, необходимую для завершения заказа в Core.
+
+        Для главного заказа (is_main=True):
+        - проверяет, что user_id является клиентом или получателем заказа
+        - возвращает core_order_id и текущий b_state
+
+        Для подзаказа (is_main=False):
+        - ищет подзаказ, связанный с исполнителем (по performer_local_user_id)
+        - возвращает core_order_id, b_state, performer_local_user_id
+
+        Returns:
+            (core_order_id, b_state, assigned_performer, error_message)
+        """
+        logger.debug("get_core_order_completion_info: local_order_id=%s, user_id=%s, is_main=%s",
+                    local_order_id, user_id, is_main)
+        try:
+            if is_main:
+                # Проверка прав: клиент или получатель
+                order = self.get_order(session, local_order_id)
+                if not order:
+                    return None, None, None, "ORDER_NOT_FOUND"
+                if user_id not in (order.get("client_user_id"), order.get("recipient_user_id")):
+                    return None, None, None, "USER_NOT_AUTHORIZED_FOR_MAIN_ORDER"
+
+                core_order_id = self.get_main_core_order_id(session, local_order_id)
+                if not core_order_id:
+                    return None, None, None, "MAIN_CORE_ORDER_NOT_FOUND"
+
+                row = session.execute(
+                    text("SELECT b_state FROM core_order_mapping WHERE core_order_id = :core_id"),
+                    {"core_id": core_order_id}
+                ).fetchone()
+                b_state = row[0] if row else None
+                return core_order_id, b_state, None, ""
+
+            else:
+                # Подзаказ: прямой поиск по performer_local_user_id
+                row = session.execute(
+                    text("""
+                        SELECT core_order_id, b_state, performer_local_user_id
+                        FROM core_order_mapping
+                        WHERE local_order_id = :local_id
+                        AND performer_local_user_id = :performer_id
+                        AND role IN ('courier1', 'courier2')
+                        LIMIT 1
+                    """),
+                    {"local_id": local_order_id, "performer_id": user_id}
+                ).fetchone()
+
+                if not row:
+                    return None, None, None, "SUBORDER_NOT_FOUND"
+
+                core_order_id, b_state, assigned_performer = row
+                if assigned_performer is None:
+                    return None, None, None, "PERFORMER_NOT_ASSIGNED"
+                if assigned_performer != user_id:
+                    return None, None, None, "PERFORMER_MISMATCH"
+
+                return core_order_id, b_state, assigned_performer, ""
+
+        except Exception as e:
+            logger.error("get_core_order_completion_info failed: %s", e)
+            raise DbLayerError(f"Failed to get core order completion info: {e}") from e
+
+    def update_core_order_b_state(self, session: Session, core_order_id: int, b_state: int) -> None:
+        logger.debug("update_core_order_b_state: core_order_id=%s, b_state=%s", core_order_id, b_state)
+        try:
+            session.execute(
+                text("""
+                    UPDATE core_order_mapping
+                    SET b_state = :b_state, updated_at = NOW()
+                    WHERE core_order_id = :core_id
+                """),
+                {"b_state": b_state, "core_id": core_order_id}
+            )
+            logger.info("Updated b_state to %s for core_order_id=%s", b_state, core_order_id)
+        except Exception as e:
+            logger.error("update_core_order_b_state failed: %s", e)
+            raise DbLayerError(f"Failed to update b_state: {e}") from e
 
 # ===================== Создание авто ========================
     def get_car_core_id(self, session: Session, local_user_id: int) -> Optional[int]:

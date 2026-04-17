@@ -154,6 +154,8 @@ class OrderMapping:
                 kind=kind,
                 upper=upper,
                 b_state=b_state,
+                client_local_user_id=None, 
+                performer_local_user_id=performer_local_user_id,
             )
 
             logger.info("create_suborder_in_core success: local=%s, core_sub_id=%s, b_state=%s",
@@ -250,4 +252,95 @@ class OrderMapping:
             logger.exception("Unexpected error in assign_courier_in_core")
             return False, f"UNEXPECTED_ERROR: {e}"
 
-    
+# ======================= Завершение заказа ===================
+    def complete_main_order_in_core(
+        self,
+        session: Session,
+        local_order_id: int,
+        user_id: int, 
+    ) -> Tuple[bool, str]:
+        """
+        Завершить главный заказ в Core (b_state=4).
+        Проверяет, что пользователь имеет право завершить заказ (является клиентом или получателем).
+        """
+        logger.info("complete_main_order_in_core: local_order_id=%s, user_id=%s", local_order_id, user_id)
+
+        try:
+            core_order_id = self.db.get_main_core_order_id(session, local_order_id)
+            if not core_order_id:
+                return False, "MAIN_ORDER_NOT_FOUND_IN_CORE"
+
+            # Проверка прав: пользователя
+            order = self.db.get_order(session, local_order_id)
+            if not order:
+                return False, "ORDER_NOT_FOUND"
+            if user_id not in (order.get("client_user_id"), order.get("recipient_user_id")):
+                return False, "USER_NOT_AUTHORIZED_TO_COMPLETE_ORDER"
+
+            # Проверка текущего b_state
+            row = session.execute(
+                text("SELECT b_state FROM core_order_mapping WHERE core_order_id = :core_id"),
+                {"core_id": core_order_id}
+            ).fetchone()
+            if row and row[0] == 4:
+                logger.info("Main order already completed in Core")
+                return True, ""
+
+            # Токен пользователя
+            core_u_id = self.db.get_core_u_id_by_local_user_id(session, user_id)
+            if not core_u_id:
+                return False, "USER_NOT_MAPPED_TO_CORE"
+
+            token, u_hash = self.db.get_user_core_tokens(session, core_u_id)
+            if not token or not u_hash:
+                return False, "MISSING_CORE_TOKENS"
+
+            self.core_adapter.complete_drive_order(core_order_id, token, u_hash)
+            self.db.update_core_order_b_state(session, core_order_id, 4)
+
+            logger.info("complete_main_order_in_core success: core_order_id=%s", core_order_id)
+            return True, ""
+
+        except Exception as e:
+            logger.exception("complete_main_order_in_core failed")
+            return False, str(e)
+
+    def complete_suborder_in_core(
+        self,
+        session: Session,
+        local_order_id: int,
+        performer_user_id: int,
+    ) -> Tuple[bool, str]:
+        """
+        Завершить подзаказ исполнителя в Core (b_state=4).
+        """
+        logger.info("complete_suborder_in_core: local_order_id=%s, performer=%s",
+                    local_order_id, performer_user_id)
+        try:
+            core_order_id, current_b_state, _, err = self.db.get_core_order_completion_info(
+                session, local_order_id, performer_user_id, is_main=False
+            )
+            if err:
+                return False, err
+
+            if current_b_state == 4:
+                logger.info("Suborder already completed in Core")
+                return True, ""
+
+            core_u_id = self.db.get_core_u_id_by_local_user_id(session, performer_user_id)
+            if not core_u_id:
+                return False, "PERFORMER_NOT_MAPPED_TO_CORE"
+
+            token, u_hash = self.db.get_user_core_tokens(session, core_u_id)
+            if not token or not u_hash:
+                return False, "MISSING_PERFORMER_CORE_TOKENS"
+
+            self.core_adapter.complete_drive_order(core_order_id, token, u_hash)
+            self.db.update_core_order_b_state(session, core_order_id, 4)
+
+            logger.info("complete_suborder_in_core success: core_order_id=%s", core_order_id)
+            return True, ""
+
+        except Exception as e:
+            logger.exception("complete_suborder_in_core failed")
+            return False, str(e)
