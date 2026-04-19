@@ -87,9 +87,9 @@ def _handle_assign_executor_pending(
 
     # Для курьеров вызываем Core set_performer
     if role in ("courier1", "courier2"):
-        ok, err = order_mapping.assign_courier_in_core(session, entity_id, target_user_id, role)
+        ok, err = order_mapping.assign_executor_in_core(session, entity_id, target_user_id, role)
         if not ok:
-            logger.error("[FSM] assign_courier_in_core failed for order %s: %s", entity_id, err)
+            logger.error("[FSM] assign_executor_in_core failed for order %s: %s", entity_id, err)
             return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
 
     # Локальное назначение
@@ -348,13 +348,7 @@ def _handle_close_cell(
 
     # --------- Driver --------------------
     elif entity_type == "locker":
-        if user_role == "driver":
-            order_id = db.get_order_id_by_cell_id(session, entity_id)
-            if order_id and order_mapping:
-                ok, err = order_mapping.complete_suborder_in_core(session, order_id, user_id)
-                if not ok:
-                    logger.error("Core suborder completion failed for driver (locker): %s", err)
-                    return FsmStepResult(new_state="FAILED", last_error=f"CORE_SUBORDER_COMPLETION_FAILED: {err}")
+        if user_role == "driver":            
             success, error = ctx["driver_actions"].close_cell_for_driver(session, entity_id, user_id)
         else:
             logger.warning(f"[FSM] close_cell: locker access denied for role {user_role}")
@@ -478,26 +472,36 @@ def _handle_start_trip(
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    """
-    Начало поездки водителем.
-    Только роль driver разрешена.
-    """
     user_role = instance["requested_user_role"]
     trip_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
 
-    logger.info(f"[FSM] start_trip: role={user_role}, trip_id={trip_id}, user_id={user_id}")
+    logger.info("[FSM] start_trip: role=%s, trip_id=%s, user_id=%s", user_role, trip_id, user_id)
 
     if user_role != "driver":
-        logger.warning(f"[FSM] start_trip: not allowed for role {user_role}")
         return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
 
-    success, error = ctx["driver_actions"].start_trip(session, trip_id, user_id)
-    if not success:
-        logger.error(f"[FSM] start_trip FAILED: trip_id={trip_id}, error={error}")
+    # 1. Проверка готовности рейса и получение списка заказов
+    can_start, blocked_ids, transit_order_ids, error = db.validate_and_get_orders_for_trip_start(session, trip_id)
+    if not can_start:
         return FsmStepResult(new_state="FAILED", last_error=error)
-    
-    logger.info(f"[FSM] start_trip COMPLETED: trip_id={trip_id}")
+
+    # 2. Создание подзаказов водителя в Core для каждого заказа
+    order_mapping = ctx.get("order_mapping")
+    if order_mapping:
+        for order_id in transit_order_ids:
+            success, err = order_mapping.assign_executor_in_core(
+                session, order_id, user_id, role=user_role
+            )
+            if not success:
+                logger.error("[FSM] assign_executor_in_core failed for order %s: %s", order_id, err)
+                return FsmStepResult(new_state="FAILED", last_error=f"DRIVER_SUBORDER_FAILED: {err}")
+
+    # 3. Выполнение локальных FSM-переходов через экшен
+    success, error = ctx["driver_actions"].start_trip(session, trip_id, user_id, transit_order_ids)
+    if not success:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+
     return FsmStepResult(new_state="COMPLETED")
 
 

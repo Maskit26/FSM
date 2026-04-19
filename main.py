@@ -941,24 +941,8 @@ async def start_trip_endpoint(
             trip_id, trip_orders = db.create_trip_for_loading(
                 session, direction_id, driver_user_id
             )
-            
-            # 3. Создаём FSM заявки для ВСЕХ заказов в рейсе
-            for order in trip_orders:
-                order_id = order['order_id']
-                db.enqueue_fsm_instance(
-                    session,
-                    entity_type='order',
-                    entity_id=order_id,
-                    process_name='order_start_transit',
-                    fsm_state='PENDING',
-                    requested_by_user_id=driver_user_id,
-                    requested_user_role='driver',
-                    target_user_id=driver_user_id,
-                    target_role='driver',
-                    metadata={"trip_id": trip_id}
-                )
-            
-            # 4. Создаём FSM заявку для рейса
+
+            # 3. Создаём FSM заявку для рейса
             db.enqueue_fsm_instance(
                 session,
                 entity_type='trip',
@@ -974,7 +958,7 @@ async def start_trip_endpoint(
             
             session.commit()
             
-            # 5. Возвращаем trip_id и все заказы на фронт
+            # 4. Возвращаем trip_id и все заказы на фронт
             return {
                 "success": True,
                 "trip_id": trip_id,

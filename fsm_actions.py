@@ -1,6 +1,6 @@
 # fsm_actions.py
 
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from db_layer import DatabaseLayer, DbLayerError
 from sqlalchemy.orm import Session
 import logging
@@ -904,53 +904,41 @@ class DriverActions:
         self,
         session: Session,
         trip_id: int,
-        user_id: int
+        user_id: int,
+        order_ids: List[int]
     ) -> Tuple[bool, str]:
-        """        
-        1 Делает FSM переход рейса: trip_assigned → trip_in_progress
-        2. Делает FSM переход для каждого заказа: order_picked_up_from_post1 → order_in_transit_to_post2
+        """
+        Выполняет FSM-переходы для старта рейса.
         """
         logger.info(
-            "[DriverActions] start_trip: trip_id=%s, user_id=%s ",
-            trip_id, user_id
+            "[DriverActions] start_trip: trip_id=%s, user_id=%s, orders=%d",
+            trip_id, user_id, len(order_ids)
         )
         
         try:
-            # 1. Проверка готовности рейса
-            can_start, blocked_order_ids, transit_order_ids, error = (
-                self.db.validate_and_get_orders_for_trip_start(session, trip_id)
-            )
-            
-            if not can_start:
-                logger.warning(
-                    "[DriverActions] start_trip blocked: trip_id=%s, error=%s ",
-                    trip_id, error
-                )
-                return False, error
-            
-            # 2. FSM переход для рейса: trip_assigned → trip_in_progress
+            # 1. FSM переход рейса: trip_assigned → trip_in_progress
             self.db.start_trip(session, trip_id, user_id)
             logger.info(
-                "[DriverActions] start_trip: trip %s transitioned to trip_in_progress ",
+                "[DriverActions] start_trip: trip %s transitioned to trip_in_progress",
                 trip_id
             )
             
-            # 3. FSM переход для КАЖДОГО заказа в рейсе
-            for order_id in transit_order_ids:
+            # 2. FSM переход для каждого заказа
+            for order_id in order_ids:
                 self.db.order_start_transit(session, order_id, user_id)
                 logger.debug(
-                    "[DriverActions] start_trip: order %s transitioned to order_in_transit_to_post2 ",
+                    "[DriverActions] start_trip: order %s transitioned to order_in_transit_to_post2",
                     order_id
                 )
             
             logger.info(
-                "[DriverActions] start_trip COMPLETED: trip_id=%s, orders=%d ",
-                trip_id, len(transit_order_ids)
+                "[DriverActions] start_trip COMPLETED: trip_id=%s, orders=%d",
+                trip_id, len(order_ids)
             )
-            return True, f"Рейс {trip_id} начат: {len(transit_order_ids)} заказов в транзите"
+            return True, f"Рейс {trip_id} начат: {len(order_ids)} заказов в транзите"
             
         except Exception as e:
-            logger.exception("[DriverActions] start_trip failed ")
+            logger.exception("[DriverActions] start_trip failed")
             return False, f"START_TRIP_FAILED: {e}"
 
     def arrive_at_destination(

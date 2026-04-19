@@ -214,14 +214,14 @@ class OrderMapping:
             return False, f"EXCEPTION: {e}"
 
 # ======================= Назначение курьера ==================
-    def assign_courier_in_core(
+    def assign_executor_in_core(
         self,
         session: Session,
         local_order_id: int,
         courier_local_user_id: int,
         role: str,
     ) -> Tuple[bool, str]:
-        logger.info("assign_courier_in_core: local=%s, courier=%s, role=%s",
+        logger.info("assign_executor_in_core: local=%s, courier=%s, role=%s",
                     local_order_id, courier_local_user_id, role)
         try:
             main_core_id = self.db.get_main_core_order_id(session, local_order_id)
@@ -243,13 +243,13 @@ class OrderMapping:
             return True, ""
 
         except DbLayerError as e:
-            logger.error("DB error in assign_courier_in_core: %s", e)
+            logger.error("DB error in assign_executor_in_core: %s", e)
             return False, f"DB_ERROR: {e}"
         except CoreAdapterError as e:
             logger.error("Core adapter error: %s", e)
             return False, f"CORE_ERROR: {e}"
         except Exception as e:
-            logger.exception("Unexpected error in assign_courier_in_core")
+            logger.exception("Unexpected error in assign_executor_in_core")
             return False, f"UNEXPECTED_ERROR: {e}"
 
 # ======================= Завершение заказа ===================
