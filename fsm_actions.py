@@ -998,24 +998,14 @@ class DriverActions:
             return False, str(e)
 
     def complete_trip(self, session: Session, trip_id: int, user_id: int) -> Tuple[bool, str]:
-        logger.info("[DRIVER] complete_trip trip=%s user=%s", trip_id, user_id)
-        
+        logger.info("[DriverActions] complete_trip: trip_id=%s, user_id=%s", trip_id, user_id)
         try:
-            can_complete, blocked, completed_ids, error = (
-                self.db.validate_trip_for_completion(session, trip_id)
-            )
-            if not can_complete:
-                logger.warning("[DRIVER] complete_trip blocked: %s", error)
-                return False, error
-            
             self.db.complete_trip(session, trip_id, user_id)
-            
-            logger.info("[DRIVER] trip %s completed: %d orders", trip_id, len(completed_ids))
-            return True, ""
-            
+            logger.info("[DriverActions] complete_trip: trip %s transitioned to trip_completed", trip_id)
+            return True, f"Рейс {trip_id} завершён"
         except Exception as e:
-            logger.error("[DRIVER] failed to complete trip %s: %s", trip_id, str(e))
-            return False, str(e)
+            logger.exception("[DriverActions] complete_trip failed")
+            return False, f"COMPLETE_TRIP_FAILED: {e}"
 
 # =========================================================
 # COURIER

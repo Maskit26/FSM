@@ -6113,7 +6113,6 @@ class DatabaseLayer:
                         FROM core_order_mapping
                         WHERE local_order_id = :local_id
                         AND performer_local_user_id = :performer_id
-                        AND role IN ('courier1', 'courier2')
                         LIMIT 1
                     """),
                     {"local_id": local_order_id, "performer_id": user_id}
@@ -6123,13 +6122,10 @@ class DatabaseLayer:
                     return None, None, None, "SUBORDER_NOT_FOUND"
 
                 core_order_id, b_state, assigned_performer = row
-                if assigned_performer is None:
-                    return None, None, None, "PERFORMER_NOT_ASSIGNED"
                 if assigned_performer != user_id:
                     return None, None, None, "PERFORMER_MISMATCH"
 
                 return core_order_id, b_state, assigned_performer, ""
-
         except Exception as e:
             logger.error("get_core_order_completion_info failed: %s", e)
             raise DbLayerError(f"Failed to get core order completion info: {e}") from e

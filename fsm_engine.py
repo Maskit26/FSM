@@ -568,28 +568,34 @@ def _handle_complete_trip(
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    """
-    Завершение поездки водителем.
-    Только роль driver разрешена.
-    """
     user_role = instance["requested_user_role"]
     trip_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
-    logger.info(f"[FSM] complete_trip: role={user_role}, trip_id={trip_id}, user_id={user_id}")
-    
+
+    logger.info("[FSM] complete_trip: role=%s, trip_id=%s, user_id=%s", user_role, trip_id, user_id)
+
     if user_role != "driver":
-        logger.warning(f"[FSM] complete_trip: not allowed for role {user_role}")
-        return FsmStepResult(
-            new_state="FAILED", 
-            last_error=f"NOT_ALLOWED_FOR_{user_role}"
-        )
-    
+        return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
+
+    # 1. Проверка готовности рейса к завершению
+    can_complete, blocked_ids, completed_order_ids, error = db.validate_trip_for_completion(session, trip_id)
+    if not can_complete:
+        return FsmStepResult(new_state="FAILED", last_error=error)
+
+    # 2. Завершение подзаказов водителя в Core
+    order_mapping = ctx.get("order_mapping")
+    if order_mapping:
+        for order_id in completed_order_ids:
+            ok, err = order_mapping.complete_suborder_in_core(session, order_id, user_id)
+            if not ok:
+                logger.error("[FSM] complete_suborder_in_core failed for order %s: %s", order_id, err)
+                return FsmStepResult(new_state="FAILED", last_error=f"DRIVER_SUBORDER_COMPLETION_FAILED: {err}")
+
+    # 3. Локальные FSM-переходы
     success, error = ctx["driver_actions"].complete_trip(session, trip_id, user_id)
     if not success:
-        logger.error(f"[FSM] complete_trip FAILED: trip_id={trip_id}, error={error}")
         return FsmStepResult(new_state="FAILED", last_error=error)
-    
-    logger.info(f"[FSM] complete_trip COMPLETED: trip_id={trip_id}")
+
     return FsmStepResult(new_state="COMPLETED")
 
 # ==================== Access Code ====================
