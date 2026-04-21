@@ -544,6 +544,22 @@ async def get_driver_reservations_endpoint(
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/api/driver/{driver_id}/trips/in-progress", response_model=List[dict])
+async def get_driver_trips_in_progress(
+    driver_id: int,
+    db: DatabaseLayer = Depends(get_db)
+):
+    """
+    Получить все рейсы водителя в статусе trip_in_progress.
+    """
+    with get_db_session(read_only=True) as session:
+        try:
+            all_active_trips = db.get_active_trips_for_driver(session, driver_id)
+            in_progress = [t for t in all_active_trips if t.get("status") == "trip_in_progress"]
+            return in_progress
+        except DbLayerError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
 @app.get("/api/fsm/user-errors", response_model=dict)
 async def get_user_fsm_errors(
     user_id: int,

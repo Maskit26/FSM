@@ -320,12 +320,31 @@ def _handle_close_cell(
 
         # ----- COURIER -----
         elif user_role == "courier":
-            if order_mapping:
+            # Определяем leg по статусу заказа
+            order = db.get_order(session, entity_id)
+            if not order:
+                return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
+            
+            status = order["status"]
+            if status in ("order_courier1_assigned", "order_courier_has_parcel"):
+                leg = "pickup"
+            elif status in ("order_courier2_assigned", "order_courier2_has_parcel"):
+                leg = "delivery"
+            else:
+                return FsmStepResult(new_state="FAILED", last_error=f"UNKNOWN_COURIER_STATUS_{status}")
+
+            # Для pickup завершаем подзаказ в Core
+            if leg == "pickup" and order_mapping:
                 ok, err = order_mapping.complete_suborder_in_core(session, entity_id, user_id)
                 if not ok:
-                    logger.error("Core suborder completion failed for courier: %s", err)
+                    logger.error("Core suborder completion failed for courier (pickup): %s", err)
                     return FsmStepResult(new_state="FAILED", last_error=f"CORE_SUBORDER_COMPLETION_FAILED: {err}")
+            else:
+                logger.info("Courier delivery close_cell: skipping Core completion")
+
             success, error = ctx["courier_actions"].close_cell(session, entity_id, user_id)
+            if not success:
+                return FsmStepResult(new_state="FAILED", last_error=error)
 
         # ----- OPERATOR -----
         elif user_role == "operator":
@@ -346,14 +365,12 @@ def _handle_close_cell(
             logger.warning(f"[FSM] close_cell: unsupported role {user_role} for order")
             return FsmStepResult(new_state="FAILED", last_error=f"ROLE_NOT_SUPPORTED_{user_role}")
 
-    # --------- Driver --------------------
     elif entity_type == "locker":
-        if user_role == "driver":            
+        if user_role == "driver":
             success, error = ctx["driver_actions"].close_cell_for_driver(session, entity_id, user_id)
         else:
             logger.warning(f"[FSM] close_cell: locker access denied for role {user_role}")
             return FsmStepResult(new_state="FAILED", last_error=f"LOCKER_ACCESS_DENIED_FOR_{user_role}")
-
     else:
         logger.error(f"[FSM] close_cell: unsupported entity_type {entity_type}")
         return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
@@ -644,43 +661,60 @@ def _handle_request_locker_access_code(
     return FsmStepResult(new_state="COMPLETED")
 
 def _handle_confirm_courier2_delivery(
-        db: DatabaseLayer,
-        session: Session,
-        ctx: Dict[str, Any],
-        instance: Dict[str, Any]
-    ) -> FsmStepResult:
-        """
-        Подтверждение доставки курьером2 с кодом от получателя.
-        Только роль courier разрешена.
-        Ожидает код в instance["metadata"]["pin"].
-        """
-        user_role = instance["requested_user_role"]
-        order_id = instance["entity_id"]
-        user_id = instance["requested_by_user_id"]
-        metadata = instance.get("metadata", {})
-        pin = metadata.get("pin")
-        
-        logger.info(f"[FSM] confirm_courier2_delivery: role={user_role}, order_id={order_id}, user_id={user_id}")
-        
-        # 1. Проверка роли
-        if user_role != "courier":
-            logger.warning(f"[FSM] confirm_courier2_delivery: not allowed for role {user_role}")
-            return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
-        
-        # 2. Проверка наличия кода
-        if not pin:
-            logger.warning(f"[FSM] confirm_courier2_delivery: missing pin in metadata")
-            return FsmStepResult(new_state="FAILED", last_error="MISSING_PIN_IN_METADATA")
-        
-        # 3. Вызов экшена
-        success, error = ctx["courier_actions"].confirm_delivery_with_code(session, order_id, user_id, pin)
-        
-        if not success:
-            logger.error(f"[FSM] confirm_courier2_delivery FAILED: order_id={order_id}, error={error}")
-            return FsmStepResult(new_state="FAILED", last_error=error)
-        
-        logger.info(f"[FSM] confirm_courier2_delivery COMPLETED: order_id={order_id}")
-        return FsmStepResult(new_state="COMPLETED")
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Подтверждение доставки курьером2 с кодом от получателя.
+    Только роль courier разрешена.
+    Ожидает код в instance["metadata"]["pin"].
+    """
+    user_role = instance["requested_user_role"]
+    order_id = instance["entity_id"]
+    user_id = instance["requested_by_user_id"]
+    metadata = instance.get("metadata", {})
+    pin = metadata.get("pin")
+
+    logger.info(f"[FSM] confirm_courier2_delivery: role={user_role}, order_id={order_id}, user_id={user_id}")
+
+    if user_role != "courier":
+        logger.warning(f"[FSM] confirm_courier2_delivery: not allowed for role {user_role}")
+        return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
+
+    if not pin:
+        logger.warning(f"[FSM] confirm_courier2_delivery: missing pin in metadata")
+        return FsmStepResult(new_state="FAILED", last_error="MISSING_PIN_IN_METADATA")
+
+    # 1. Проверяем PIN-код
+    valid, error = db.validate_courier2_delivery_code(session, order_id, user_id, pin)
+    if not valid:
+        logger.warning(f"[FSM] confirm_courier2_delivery: invalid PIN: {error}")
+        return FsmStepResult(new_state="FAILED", last_error=f"INVALID_PIN: {error}")
+
+    # 2. Завершаем подзаказ курьера2 в Core
+    order_mapping = ctx.get("order_mapping")
+    if order_mapping:
+        ok, err = order_mapping.complete_suborder_in_core(session, order_id, user_id)
+        if not ok:
+            logger.error("Core suborder completion failed for courier2: %s", err)
+            return FsmStepResult(new_state="FAILED", last_error=f"CORE_SUBORDER_COMPLETION_FAILED: {err}")
+
+        # 3. Завершаем главный заказ в Core от имени клиента
+        ok, err = order_mapping.complete_main_order_in_core(session, order_id, user_id)
+        if not ok:
+            logger.error("Core main completion failed for courier delivery: %s", err)
+            return FsmStepResult(new_state="FAILED", last_error=f"CORE_MAIN_COMPLETION_FAILED: {err}")
+
+    # 4. Локальный FSM-переход
+    success, error = ctx["courier_actions"].confirm_delivery_with_code(session, order_id, user_id, pin)
+    if not success:
+        logger.error(f"[FSM] confirm_courier2_delivery FAILED: order_id={order_id}, error={error}")
+        return FsmStepResult(new_state="FAILED", last_error=error)
+
+    logger.info(f"[FSM] confirm_courier2_delivery COMPLETED: order_id={order_id}")
+    return FsmStepResult(new_state="COMPLETED")
 
 # ==================== РЕЙСЫ ====================
 def _handle_bind_order_to_trip(

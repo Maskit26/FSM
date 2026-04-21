@@ -6146,6 +6146,13 @@ class DatabaseLayer:
             logger.error("update_core_order_b_state failed: %s", e)
             raise DbLayerError(f"Failed to update b_state: {e}") from e
 
+    def get_core_order_b_state(self, session: Session, core_order_id: int) -> Optional[int]:
+        row = session.execute(
+            text("SELECT b_state FROM core_order_mapping WHERE core_order_id = :core_id"),
+            {"core_id": core_order_id}
+        ).fetchone()
+        return row[0] if row else None
+
 # ===================== Создание авто ========================
     def get_car_core_id(self, session: Session, local_user_id: int) -> Optional[int]:
         """

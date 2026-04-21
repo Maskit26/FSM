@@ -1205,25 +1205,15 @@ class CourierActions:
         pin: str
     ) -> Tuple[bool, str]:
         """
-        Курьер2 подтверждает доставку с кодом от получателя.        
-        
+        Курьер2 подтверждает доставку с кодом от получателя.
         """
         logger.info("[COURIER] confirm_delivery_with_code order=%s user=%s", order_id, user_id)
         
         try:
-            # 1. Проверка кода
-            valid, error = self.db.validate_courier2_delivery_code(session, order_id, user_id, pin)
-            if not valid:
-                logger.warning("[COURIER] confirm_delivery_with_code: код не прошёл проверку: %s", error)
-                return False, f"INVALID_CODE: {error}"
-            
-            # 2. FSM переход: order_courier2_parcel_delivered → order_completed
-            logger.info("[COURIER] executing FSM transition: order_recipient_confirmed for order %s", order_id)
+            # FSM переход: order_courier2_parcel_delivered → order_completed
             self.db.order_recipient_confirmed(session, order_id, user_id)
-            
             logger.info("[COURIER] order %s completed successfully with code confirmation", order_id)
             return True, ""
-            
         except Exception as e:
             logger.error("[COURIER] confirm_delivery_with_code failed: %s", e)
             return False, str(e)
