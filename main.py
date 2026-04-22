@@ -550,13 +550,19 @@ async def get_driver_trips_in_progress(
     db: DatabaseLayer = Depends(get_db)
 ):
     """
-    Получить все рейсы водителя в статусе trip_in_progress.
+    Получить все рейсы водителя в статусе trip_in_progress
+    вместе с заказами в каждом рейсе.
     """
     with get_db_session(read_only=True) as session:
         try:
-            all_active_trips = db.get_active_trips_for_driver(session, driver_id)
-            in_progress = [t for t in all_active_trips if t.get("status") == "trip_in_progress"]
-            return in_progress
+            trips = db.get_active_trips_for_driver(session, driver_id)
+            enriched_trips = []
+            for trip in trips:
+                trip_id = trip["id"]
+                orders = db.get_trip_orders(session, trip_id)
+                trip["orders"] = orders
+                enriched_trips.append(trip)
+            return enriched_trips
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -930,68 +936,6 @@ async def start_reservation_loading(
                 status_code=500,
                 detail=f"START_LOADING_FAILED: {str(e)}"
             )   
-
-@app.post("/api/driver/direction/{direction_id}/start-trip", response_model=dict)
-async def start_trip_endpoint(
-    direction_id: int,
-    driver_user_id: int,
-    db: DatabaseLayer = Depends(get_db)
-):
-    """
-    Начать рейс после завершения погрузки.
-    1. Создаёт рейс
-    2. Создаёт FSM заявки для заказов и рейса
-    3. Возвращает trip_id и заказы на фронт
-    """
-    with get_db_session(read_only=False) as session:
-        try:
-            # 1. Проверка роли (только водитель)
-            user_role = db.get_user_role(session, driver_user_id)
-            if user_role != 'driver':
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"USER_NOT_AUTHORIZED: роль '{user_role}' не может начать рейс"
-                )
-            
-            # 2. Создаём рейс через db_layer (внутри получает picked_order_ids)
-            trip_id, trip_orders = db.create_trip_for_loading(
-                session, direction_id, driver_user_id
-            )
-
-            # 3. Создаём FSM заявку для рейса
-            db.enqueue_fsm_instance(
-                session,
-                entity_type='trip',
-                entity_id=trip_id,
-                process_name='start_trip',
-                fsm_state='PENDING',
-                requested_by_user_id=driver_user_id,
-                requested_user_role='driver',
-                target_user_id=driver_user_id,
-                target_role='driver',
-                metadata={}
-            )
-            
-            session.commit()
-            
-            # 4. Возвращаем trip_id и все заказы на фронт
-            return {
-                "success": True,
-                "trip_id": trip_id,
-                "orders": trip_orders,
-                "orders_count": len(trip_orders),
-                "message": f"Рейс {trip_id} создан, {len(trip_orders)} заказов"
-            }
-            
-        except HTTPException:
-            session.rollback()
-            raise
-        except Exception as e:
-            session.rollback()
-            raise HTTPException(
-                status_code=500,
-                detail=f"START_TRIP_FAILED: {str(e)}"
-            )
 
 @app.post("/api/trips/{trip_id}/assign-order/{order_id}", response_model=ApiResponse)
 async def assign_order_to_trip(

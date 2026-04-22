@@ -489,38 +489,42 @@ def _handle_start_trip(
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    user_role = instance["requested_user_role"]
-    trip_id = instance["entity_id"]
+    # entity_type = "direction"
+    direction_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
+    user_role = instance["requested_user_role"]
 
-    logger.info("[FSM] start_trip: role=%s, trip_id=%s, user_id=%s", user_role, trip_id, user_id)
+    logger.info("[FSM] start_trip: direction_id=%s, user_id=%s, role=%s",
+                direction_id, user_id, user_role)
 
     if user_role != "driver":
         return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
 
-    # 1. Проверка готовности рейса и получение списка заказов
-    can_start, blocked_ids, transit_order_ids, error = db.validate_and_get_orders_for_trip_start(session, trip_id)
+    # 1. Валидация готовности заказов
+    can_start, blocked_ids, order_ids, error = db.validate_and_get_orders_for_direction_start(
+        session, direction_id, user_id
+    )
     if not can_start:
         return FsmStepResult(new_state="FAILED", last_error=error)
 
-    # 2. Создание подзаказов водителя в Core для каждого заказа
+    # 2. Создание подзаказов водителя в Core
     order_mapping = ctx.get("order_mapping")
     if order_mapping:
-        for order_id in transit_order_ids:
-            success, err = order_mapping.assign_executor_in_core(
+        for order_id in order_ids:
+            ok, err = order_mapping.assign_executor_in_core(
                 session, order_id, user_id, role=user_role
             )
-            if not success:
+            if not ok:
                 logger.error("[FSM] assign_executor_in_core failed for order %s: %s", order_id, err)
                 return FsmStepResult(new_state="FAILED", last_error=f"DRIVER_SUBORDER_FAILED: {err}")
 
-    # 3. Выполнение локальных FSM-переходов через экшен
-    success, error = ctx["driver_actions"].start_trip(session, trip_id, user_id, transit_order_ids)
+    # 3. Создание рейса и FSM-переходы
+    success, error = ctx["driver_actions"].start_trip(session, direction_id, user_id, order_ids)
     if not success:
         return FsmStepResult(new_state="FAILED", last_error=error)
 
+    logger.info("[FSM] start_trip COMPLETED: direction_id=%s, orders=%d", direction_id, len(order_ids))
     return FsmStepResult(new_state="COMPLETED")
-
 
 def _handle_arrive_at_destination(
     db: DatabaseLayer,

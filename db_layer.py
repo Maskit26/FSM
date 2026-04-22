@@ -3939,50 +3939,55 @@ class DatabaseLayer:
             logger.error("release_unpicked_orders_by_driver_and_direction завершился с ошибкой: %s", e)
             raise DbLayerError("release_unpicked_orders_by_driver_and_direction failed: %s" % e) from e 
     
-    def create_trip_for_loading(
+    def validate_and_get_orders_for_direction_start(
         self,
         session: Session,
         direction_id: int,
         driver_user_id: int,
-    ) -> Tuple[int, List[Dict[str, Any]]]:
+    ) -> Tuple[bool, List[int], List[int], str]:
         logger.debug(
-            "[DatabaseLayer] create_trip_for_loading: direction_id=%s, driver_user_id=%s",
+            "validate_and_get_orders_for_direction_start: direction_id=%s, driver_user_id=%s",
             direction_id, driver_user_id
         )
         try:
-            # 1. Получаем фактически забранные заказы
             picked_order_ids = self.get_picked_orders_by_driver_and_direction(
                 session, direction_id, driver_user_id
             )
             if not picked_order_ids:
-                raise DbLayerError("NO_PICKED_ORDERS: Нет забранных заказов для создания рейса")
+                return False, [], [], "NO_PICKED_ORDERS"
 
-            logger.info(
-                "[DatabaseLayer] create_trip_for_loading: found %d picked orders",
-                len(picked_order_ids)
-            )
+            expected_status = "order_picked_up_from_post1"
+            blocked = []
+            ready = []
+            for oid in picked_order_ids:
+                status = session.execute(
+                    text("SELECT status FROM orders WHERE id = :oid"), {"oid": oid}
+                ).scalar()
+                if status == expected_status:
+                    ready.append(oid)
+                else:
+                    blocked.append(oid)
 
-            # 2. ✅ ЯВНОЕ ПРЕОБРАЗОВАНИЕ К INT
-            picked_order_ids = [int(oid) for oid in picked_order_ids]
+            if blocked:
+                return False, blocked, [], f"ORDERS_NOT_READY: {blocked}"
 
-            # 3. Проверка: не в рейсе ли уже эти заказы
-            if picked_order_ids:
-                order_placeholders = ', '.join([f':order_{i}' for i in range(len(picked_order_ids))])
-                order_params = {f'order_{i}': oid for i, oid in enumerate(picked_order_ids)}
-                
-                existing_trip_check = session.execute(text(f"""
-                    SELECT trip_id
-                    FROM stage_orders
-                    WHERE order_id IN ({order_placeholders})
-                    AND leg = 'pickup'
-                    AND trip_id IS NOT NULL
-                    LIMIT 1
-                """), order_params).fetchone()
+            return True, [], ready, ""
+        except Exception as e:
+            logger.error("validate_and_get_orders_for_direction_start failed: %s", e)
+            raise DbLayerError(f"validate_and_get_orders_for_direction_start failed: {e}") from e
 
-                if existing_trip_check:
-                    raise DbLayerError(f"ORDERS_ALREADY_IN_TRIP: Заказы уже в рейсе {existing_trip_check[0]}")
-
-            # 4. Получаем данные направления
+    def create_trip_for_direction(
+        self,
+        session: Session,
+        direction_id: int,
+        driver_user_id: int,
+        order_ids: List[int],
+    ) -> int:
+        logger.debug(
+            "create_trip_for_direction: direction_id=%s, driver_user_id=%s, orders=%d",
+            direction_id, driver_user_id, len(order_ids)
+        )
+        try:
             direction = session.execute(text("""
                 SELECT from_city, to_city, pickup_locker_id, delivery_locker_id
                 FROM directions WHERE id = :direction_id
@@ -3991,7 +3996,6 @@ class DatabaseLayer:
                 raise DbLayerError(f"Направление {direction_id} не найдено")
             from_city, to_city, pickup_locker_id, delivery_locker_id = direction
 
-            # 5. Создаём рейс
             session.execute(text("""
                 INSERT INTO trips (
                     driver_user_id, from_city, to_city,
@@ -4010,51 +4014,29 @@ class DatabaseLayer:
                 "delivery_locker_id": delivery_locker_id,
             })
 
-            # 6. ✅ ПОЛУЧАЕМ trip_id ЧЕРЕЗ fetchone()[0]
-            trip_id_row = session.execute(text("SELECT LAST_INSERT_ID()")).fetchone()
-            if not trip_id_row or trip_id_row[0] is None:
+            trip_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+            if trip_id is None:
                 raise DbLayerError("Не удалось получить trip_id после INSERT")
-            trip_id = int(trip_id_row[0])
+            trip_id = int(trip_id)
 
-            logger.info("[DatabaseLayer] create_trip_for_loading: created trip_id=%s", trip_id)
-
-            # 7. Привязываем заказы к рейсу
-            if picked_order_ids:
-                order_placeholders = ', '.join([f':order_{i}' for i in range(len(picked_order_ids))])
-                order_params = {f'order_{i}': oid for i, oid in enumerate(picked_order_ids)}
-
-                query = text(f"""
+            if order_ids:
+                placeholders = ', '.join([f':order_{i}' for i in range(len(order_ids))])
+                params = {f'order_{i}': oid for i, oid in enumerate(order_ids)}
+                params["trip_id"] = trip_id
+                session.execute(text(f"""
                     UPDATE stage_orders
                     SET trip_id = :trip_id
-                    WHERE order_id IN ({order_placeholders})
+                    WHERE order_id IN ({placeholders})
                     AND leg IN ('pickup', 'delivery')
-                    AND trip_id IS NULL
-                """)
-                params = {
-                    "trip_id": trip_id, 
-                    **order_params,
-                }
-                session.execute(query, params)
-                logger.info(
-                    "[DatabaseLayer] create_trip_for_loading: attached %d orders to trip_id=%s",
-                    len(picked_order_ids), trip_id
-                )
+                """), params)
 
-            # 8. Пересчитываем счётчики направления после привязки к рейсу
             self.recalculate_direction_counters(session, direction_id)
-
-            # 9. Получаем заказы для возврата
-            trip_orders = self.get_trip_orders(session, trip_id)
-
-            logger.info(
-                "[DatabaseLayer] create_trip_for_loading: direction_id=%s, trip_id=%s, orders=%d",
-                direction_id, trip_id, len(picked_order_ids)
-            )
-            return trip_id, trip_orders
-
+            return trip_id
+        except DbLayerError:
+            raise
         except Exception as e:
-            logger.error("[DatabaseLayer] create_trip_for_loading завершился с ошибкой: %s", e)
-            raise DbLayerError("create_trip_for_loading failed: %s" % e) from e
+            logger.error("create_trip_for_direction failed: %s", e)
+            raise DbLayerError(f"create_trip_for_direction failed: {e}") from e
 
     # ================ отмена резерва ===============
     def get_orders_by_reservation(
@@ -4901,6 +4883,9 @@ class DatabaseLayer:
         session: Session,
         driver_id: int
     ) -> List[Dict[str, Any]]:
+        """
+        Вернуть рейсы водителя, находящиеся в процессе выполнения (trip_in_progress).
+        """
         logger.debug("get_active_trips_for_driver вызван: driver_id=%s", driver_id)
         try:
             rows = session.execute(
@@ -4913,36 +4898,25 @@ class DatabaseLayer:
                         to_city, 
                         driver_user_id,
                         pickup_locker_id, 
-                        delivery_locker_id 
+                        delivery_locker_id,
+                        created_at
                     FROM trips  
                     WHERE driver_user_id = :driver_id 
-                    AND active = 1  
-                    AND status != 'trip_completed'
+                    AND status = 'trip_in_progress'
+                    ORDER BY created_at DESC
                 """),
                 {"driver_id": driver_id},
             ).fetchall()
 
-            trips = [
-                {
-                    "id": row[0],
-                    "status": row[1],
-                    "active": row[2],
-                    "from_city": row[3],
-                    "to_city": row[4],
-                    "driver_user_id": row[5],
-                    "pickup_locker_id": row[6],      
-                    "delivery_locker_id": row[7],    
-                }
-                for row in rows
-            ]
-            logger.debug("get_active_trips_for_driver: найдено %d активных рейсов", len(trips))
+            trips = [dict(row._mapping) for row in rows]
+            logger.debug("get_active_trips_for_driver: найдено %d рейсов в trip_in_progress", len(trips))
             return trips
         except Exception as e:
             logger.error(
                 "get_active_trips_for_driver завершился с ошибкой для driver_id=%s: %s",
                 driver_id, e
             )
-            raise DbLayerError(f"Failed to fetch active trips for driver {driver_id}: {e}") from e
+            raise DbLayerError(f"Failed to fetch trips for driver {driver_id}: {e}") from e
 
     def get_trip_orders(
         self,
@@ -5005,7 +4979,7 @@ class DatabaseLayer:
                 text("SELECT trip_id FROM stage_orders WHERE order_id = :order_id LIMIT 1"),
                 {"order_id": order_id}
             ).scalar()
-            return result  # может быть int или None
+            return result 
         except Exception as e:
             logger.error("get_trip_id_by_order_id завершился с ошибкой для order_id=%s: %s", order_id, e)
             raise DbLayerError(f"Failed to get trip_id for order {order_id}: {e}") from e
@@ -5156,80 +5130,7 @@ class DatabaseLayer:
             
         except Exception as e:
             logger.error("get_orders_with_status_in_trip завершился с ошибкой: %s", e)
-            raise DbLayerError(f"get_orders_with_status_in_trip failed: {e}") from e
-
-    def validate_and_get_orders_for_trip_start(
-        self,
-        session: Session,
-        trip_id: int
-    ) -> Tuple[bool, List[int], List[int], str]:
-        """
-        Проверка готовности рейса к старту (забор посылок из Пост1).
-        """
-        logger.debug("validate_and_get_orders_for_trip_start вызван: trip_id=%s", trip_id)
-        
-        try:
-            # 1. Проверка статуса рейса (должен быть trip_assigned)
-            trip = self.get_trip(session, trip_id)
-            if not trip:
-                return False, [], [], f"Рейс {trip_id} не найден"
-            
-            if trip["status"] != "trip_assigned":
-                return False, [], [], (
-                    f"Рейс в статусе '{trip['status']}', ожидается 'trip_assigned'"
-                )
-            
-            # 2. Получаем все заказы рейса с их статусами
-            orders = self.get_orders_with_status_in_trip(session, trip_id)
-            if not orders:
-                return False, [], [], "В рейсе нет заказов"
-            
-            # 3. Статусы заказов
-            expected_order_status = "order_picked_up_from_post1"
-            
-            excluded_order_statuses = [
-                "order_manual_intervention_required",
-                "order_parcel_missing",
-                "order_cancelled",
-            ]
-            
-            # 4. Проверка заказов (БЕЗ проверки ячеек!)
-            blocked_ids: List[int] = []
-            transit_ids: List[int] = []
-            
-            for o in orders:
-                order_id = o["order_id"]
-                order_status = o["status"]
-                
-                # Пропускаем проблемные заказы
-                if order_status in excluded_order_statuses:
-                    logger.debug(
-                        "validate_and_get_orders_for_trip_start: заказ %s в статусе '%s' — исключён",
-                        order_id, order_status
-                    )
-                    continue
-                
-                # Проверяем успешные заказы
-                if order_status == expected_order_status:
-                    transit_ids.append(order_id)
-                else:
-                    blocked_ids.append(order_id)
-            
-            if blocked_ids:
-                return False, blocked_ids, [], (
-                    f"Нельзя начать путь: заказы {blocked_ids} не готовы "
-                    f"(ожидался статус '{expected_order_status}')"
-                )
-            
-            logger.info(
-                "validate_and_get_orders_for_trip_start: trip_id=%s — OK, transit=%d заказов",
-                trip_id, len(transit_ids)
-            )
-            return True, [], transit_ids, ""
-            
-        except Exception as e:
-            logger.error("validate_and_get_orders_for_trip_start завершился с ошибкой: %s", e)
-            raise DbLayerError(f"validate_and_get_orders_for_trip_start failed: {e}") from e
+            raise DbLayerError(f"get_orders_with_status_in_trip failed: {e}") from e    
 
     def validate_trip_for_completion(
         self,

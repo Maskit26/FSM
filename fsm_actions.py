@@ -903,40 +903,33 @@ class DriverActions:
     def start_trip(
         self,
         session: Session,
-        trip_id: int,
+        direction_id: int,
         user_id: int,
         order_ids: List[int]
     ) -> Tuple[bool, str]:
         """
-        Выполняет FSM-переходы для старта рейса.
+        Создаёт рейс, привязывает заказы и выполняет FSM-переходы.
         """
         logger.info(
-            "[DriverActions] start_trip: trip_id=%s, user_id=%s, orders=%d",
-            trip_id, user_id, len(order_ids)
+            "[DriverActions] start_trip: direction_id=%s, user_id=%s, orders=%d",
+            direction_id, user_id, len(order_ids)
         )
-        
         try:
-            # 1. FSM переход рейса: trip_assigned → trip_in_progress
+            # 1. Создание рейса и привязка заказов
+            trip_id = self.db.create_trip_for_direction(session, direction_id, user_id, order_ids)
+            logger.info("[DriverActions] created trip_id=%s", trip_id)
+
+            # 2. FSM-переход рейса
             self.db.start_trip(session, trip_id, user_id)
-            logger.info(
-                "[DriverActions] start_trip: trip %s transitioned to trip_in_progress",
-                trip_id
-            )
-            
-            # 2. FSM переход для каждого заказа
+            logger.info("[DriverActions] trip %s transitioned to trip_in_progress", trip_id)
+
+            # 3. FSM-переход для каждого заказа
             for order_id in order_ids:
                 self.db.order_start_transit(session, order_id, user_id)
-                logger.debug(
-                    "[DriverActions] start_trip: order %s transitioned to order_in_transit_to_post2",
-                    order_id
-                )
-            
-            logger.info(
-                "[DriverActions] start_trip COMPLETED: trip_id=%s, orders=%d",
-                trip_id, len(order_ids)
-            )
+                logger.debug("[DriverActions] order %s transitioned to order_in_transit_to_post2", order_id)
+
+            logger.info("[DriverActions] start_trip COMPLETED: trip_id=%s, orders=%d", trip_id, len(order_ids))
             return True, f"Рейс {trip_id} начат: {len(order_ids)} заказов в транзите"
-            
         except Exception as e:
             logger.exception("[DriverActions] start_trip failed")
             return False, f"START_TRIP_FAILED: {e}"
