@@ -101,6 +101,49 @@ FLUSH PRIVILEGES;
 EXIT;
 EOF
 ```
+### Шаг 2.2. Создание базы для Core API (aristotel_taxi)
+
+Эта база используется внешним сервисом `https://ibronevik.ru/taxi` и локальным `core_adapter.py`.
+Не затрагивает FSM-базу (`testdb`).
+
+```bash
+# 1. Создать базу и пользователя
+sudo mysql -u root <<'EOF'
+CREATE DATABASE IF NOT EXISTS aristotel_taxi CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'aristotel_api'@'%' IDENTIFIED BY 'ВАШ_НАДЁЖНЫЙ_ПАРОЛЬ';
+GRANT SELECT, INSERT, UPDATE, DELETE ON aristotel_taxi.* TO 'aristotel_api'@'%';
+FLUSH PRIVILEGES;
+EOF
+
+# 2. Импортировать дамп
+mysql -u root aristotel_taxi < /opt/FSM/database/aristotel_taxi.sql
+
+# 3. Настроить удалённый доступ (если требуется)
+sudo nano /etc/mysql/mysql.conf.d/mysqld.cnf
+# Изменить: bind-address = 0.0.0.0
+sudo systemctl restart mysql
+sudo ufw allow 3306/tcp
+```
+
+### 2.3. Настройка бэкапов для aristotel_taxi
+```bash
+# 1. Создать директорию
+sudo mkdir -p /opt/backups/aristotel_taxi
+sudo chmod 700 /opt/backups/aristotel_taxi
+
+# 2. Создать скрипт бэкапа
+sudo nano /opt/backups/aristotel_taxi/backup.sh
+# (вставить содержимое из /opt/FSM/docs/backup_aristotel_taxi.sh)
+
+# 3. Сделать исполняемым и протестировать
+sudo chmod +x /opt/backups/aristotel_taxi/backup.sh
+sudo /opt/backups/aristotel_taxi/backup.sh
+
+# 4. Добавить в cron
+sudo crontab -e
+# Добавить строку:
+0 3 * * * /opt/backups/aristotel_taxi/backup.sh
+```
 
 ### Шаг 3. Клонирование проекта с GitHub
 
