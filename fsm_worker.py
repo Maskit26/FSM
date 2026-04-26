@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 # ================== CORE ADAPTER ====================
 core_adapter = CoreAdapter(
-    core_url=os.getenv("CORE_URL", "https://ibronevik.ru/taxi/c/0/"),
+    core_url=os.getenv("CORE_URL", "https://ibronevik.ru/taxi/c/postamat/"),
     core_api_key=os.getenv("CORE_API_KEY", ""),
     core_timeout=5
 )

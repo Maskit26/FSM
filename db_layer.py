@@ -7,7 +7,6 @@
 #Использование:
 #from db_layer import DatabaseLayer, DbLayerError, FsmCallError
 
-#db = DatabaseLayer(port=3306, password="6eF1zb")
 #"""
 
 from typing import List, Dict, Any, Optional, Tuple
@@ -148,6 +147,12 @@ class DatabaseLayer:
         """Переназначение водителя на рейс после поломки (FSM: trip_reassign_driver)."""
         
         return self.call_fsm_action(session, "trip", trip_id, "trip_reassign_driver", driver_id)
+
+    def trip_resume_with_new_driver(self, session: Session, trip_id: int, new_driver_id: int) -> bool:
+        """
+        Назначает нового водителя на сломанный рейс и сразу переводит его в trip_in_progress.
+        """
+        return self.call_fsm_action(session, "trip", trip_id, "trip_resume_with_new_driver", new_driver_id)
 
     def start_trip(self, session: Session, trip_id: int, driver_id: int) -> bool:
         """Старт рейса (FSM: trip_start_trip)."""
@@ -303,13 +308,11 @@ class DatabaseLayer:
     # ---------- ORDER / ЗАКАЗЫ ----------
 
     def get_orders_in_trip(self, session: Session, trip_id: int) -> List[int]:
-        """Возвращает список order_id, привязанных к trip_id через stage_orders."""
         result = session.execute(
-            text("SELECT order_id FROM stage_orders WHERE trip_id = :trip_id"),
+            text("SELECT DISTINCT order_id FROM stage_orders WHERE trip_id = :trip_id"),
             {"trip_id": trip_id},
         ).fetchall()
-
-        return [row[0] for row in result]    
+        return [row[0] for row in result]   
 
     def assign_courier_to_order(
         self,
@@ -620,6 +623,34 @@ class DatabaseLayer:
             user_id,
         )
 
+    def reassign_driver_in_stage_orders(
+        self,
+        session: Session,
+        order_ids: List[int],
+        new_driver_id: int
+    ) -> None:
+        """Обновляет reserved_by_driver_id во всех stage_orders для списка заказов."""
+        if not order_ids:
+            return
+        try:
+            # Генерируем плейсхолдеры :order_0, :order_1, ...
+            placeholders = ", ".join([f":order_{i}" for i in range(len(order_ids))])
+            params = {f"order_{i}": oid for i, oid in enumerate(order_ids)}
+            params["new_driver"] = new_driver_id
+
+            session.execute(
+                text(f"""
+                    UPDATE stage_orders
+                    SET reserved_by_driver_id = :new_driver
+                    WHERE order_id IN ({placeholders})
+                    AND leg IN ('pickup', 'delivery')
+                """),
+                params
+            )
+            logger.info("[DB] Водитель обновлён в stage_orders для заказов: %s", order_ids)
+        except Exception as e:
+            logger.exception("Ошибка при переназначении водителя в stage_orders: %s", e)
+            raise DbLayerError(f"Не удалось обновить stage_orders: {e}") from e
 
     def order_courier1_cancel(
         self,
@@ -4535,7 +4566,7 @@ class DatabaseLayer:
         self,
         session: Session,
         order_id: int,
-        leg: str,  # 'pickup' или 'delivery'
+        leg: str, 
         operator_id: int,
     ) -> bool:
         """
@@ -4602,6 +4633,29 @@ class DatabaseLayer:
             logger.error("remove_courier_from_order завершился с ошибкой: %s", e)
             raise DbLayerError(f"remove_courier_from_order failed: {e}") from e
 
+    def update_order_status_by_leg(self, session: Session, order_id: int, leg: str) -> None:
+        """
+        Устанавливает статус заказа в зависимости от плеча:
+        pickup  → order_created
+        delivery → order_parcel_confirmed_post2
+        """
+        if leg == "pickup":
+            new_status = "order_created"
+        elif leg == "delivery":
+            new_status = "order_parcel_confirmed_post2"
+        else:
+            raise ValueError(f"Неизвестное плечо: {leg}")
+
+        try:
+            session.execute(
+                text("UPDATE orders SET status = :status WHERE id = :oid"),
+                {"status": new_status, "oid": order_id}
+            )
+            logger.info("[DB] Статус заказа %s обновлён на %s (leg=%s)", order_id, new_status, leg)
+        except Exception as e:
+            logger.exception("Ошибка при обновлении статуса заказа %s: %s", order_id, e)
+            raise DbLayerError(f"Не удалось обновить статус заказа {order_id}: {e}") from e
+
     def remove_driver_from_trip(
         self,
         session: Session,
@@ -4654,6 +4708,33 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("remove_driver_from_trip завершился с ошибкой: %s", e)
             raise DbLayerError(f"remove_driver_from_trip failed: {e}") from e
+
+    def clear_driver_from_stage_orders(
+        self,
+        session: Session,
+        order_ids: List[int]
+    ) -> None:
+        """Сбрасывает reserved_by_driver_id для всех переданных заказов в stage_orders."""
+        if not order_ids:
+            return
+        try:
+            # Генерируем плейсхолдеры :order_0, :order_1, ...
+            placeholders = ", ".join([f":order_{i}" for i in range(len(order_ids))])
+            params = {f"order_{i}": oid for i, oid in enumerate(order_ids)}
+
+            session.execute(
+                text(f"""
+                    UPDATE stage_orders
+                    SET reserved_by_driver_id = NULL
+                    WHERE order_id IN ({placeholders})
+                    AND leg IN ('pickup', 'delivery')
+                """),
+                params
+            )
+            logger.info("[DB] Водитель снят со stage_orders для заказов: %s", order_ids)
+        except Exception as e:
+            logger.exception("Ошибка при очистке водителя из stage_orders: %s", e)
+            raise DbLayerError(f"Не удалось очистить stage_orders: {e}") from e
 
     # ================ сброс резерва ================
 
@@ -6053,6 +6134,19 @@ class DatabaseLayer:
             {"core_id": core_order_id}
         ).fetchone()
         return row[0] if row else None
+
+    def get_core_order_mapping_kind(self, session: Session, core_order_id: int) -> Optional[int]:
+        row = session.execute(
+            text("SELECT kind FROM core_order_mapping WHERE core_order_id = :cid"),
+            {"cid": core_order_id}
+        ).fetchone()
+        return row[0] if row else None
+
+    def clear_core_order_performer(self, session: Session, core_order_id: int) -> None:
+        session.execute(
+            text("UPDATE core_order_mapping SET performer_local_user_id = NULL WHERE core_order_id = :cid"),
+            {"cid": core_order_id}
+        )
 
 # ===================== Создание авто ========================
     def get_car_core_id(self, session: Session, local_user_id: int) -> Optional[int]:

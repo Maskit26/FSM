@@ -180,43 +180,39 @@ class AssignmentActions:
             )
             return False
 
-    def assign_to_trip(
+    def reassign_driver_on_trip(
         self,
         session: Session,
         trip_id: int,
-        executor_id: int,
+        order_ids: List[int],
+        new_driver_id: int,
         role: str
     ) -> bool:
-        """
-        Назначает водителя на рейс.
-        """
         logger.info(
-            "[ASSIGNMENT] assign_to_trip trip_id=%s executor=%s role=%s ",
-            trip_id,
-            executor_id,
-            role,
+            "[ASSIGNMENT] reassign_driver_on_trip trip=%s, orders=%s, new_driver=%s, role=%s",
+            trip_id, order_ids, new_driver_id, role
         )
-
         try:
-            if role == "driver":
-                self.db.set_driver_in_trip(session, trip_id, executor_id)
-                self.db.trip_reassign_driver(session, trip_id, executor_id)
-                
-                logger.info(
-                    "[ASSIGNMENT] trip %s reassigned to driver %s (trip_failed → trip_assigned)",
-                    trip_id,
-                    executor_id,
-                )
+            # Обновить водителя в таблице trips
+            self.db.set_driver_in_trip(session, trip_id, new_driver_id)
+
+            # Если рейс был сломан (trip_failed) – активируем его сразу
+            trip = self.db.get_trip(session, trip_id)
+            if trip and trip.get("status") == "trip_failed":
+                self.db.trip_resume_with_new_driver(session, trip_id, new_driver_id)
+                logger.info("[ASSIGNMENT] Рейс %s возобновлён с новым водителем", trip_id)
             else:
-                logger.error("[ASSIGNMENT] unknown role for trip: %s ", role)
-                return False
+                logger.info(
+                    "[ASSIGNMENT] Рейс %s не требует активации (статус: %s)",
+                    trip_id, trip.get("status") if trip else "неизвестен"
+                )
+
+            # Обновить reserved_by_driver_id во всех stage_orders
+            self.db.reassign_driver_in_stage_orders(session, order_ids, new_driver_id)
 
             return True
-
         except Exception:
-            logger.exception(
-                "[ASSIGNMENT] assign_to_trip failed trip_id=%s ", trip_id
-            )
+            logger.exception("[ASSIGNMENT] reassign_driver_on_trip failed")
             return False
 
 # =========== снять курьера с заказа и водителя с рейса ======
@@ -225,79 +221,63 @@ class AssignmentActions:
         session: Session,
         order_id: int,
         executor_id: int,
-        leg: str, 
-        operator_id: int, 
+        leg: str,
+        operator_id: int,
     ) -> bool:
-        """
-        Снимает курьера с заказа.
-        """
         logger.info(
             "[ASSIGNMENT] remove_courier_from_order order_id=%s executor=%s leg=%s operator=%s",
             order_id, executor_id, leg, operator_id,
         )
-
         try:
+            # 1. Удаление курьера из stage_orders 
             success = self.db.remove_courier_from_order(
                 session, order_id, leg, operator_id
             )
-            
-            if success:
-                logger.info(
-                    "[ASSIGNMENT] courier %s removed from order %s (leg=%s)",
-                    executor_id, order_id, leg,
-                )
-            else:
-                logger.error(
-                    "[ASSIGNMENT] failed to remove courier %s from order %s",
-                    executor_id, order_id,
-                )
-            
-            return success
+            if not success:
+                logger.error("[ASSIGNMENT] failed to remove courier %s from order %s", executor_id, order_id)
+                return False
+
+            # 2. Обновить статус заказа в зависимости от плеча 
+            self.db.update_order_status_by_leg(session, order_id, leg)
+
+            logger.info("[ASSIGNMENT] courier %s removed from order %s (leg=%s)", executor_id, order_id, leg)
+            return True
 
         except Exception:
-            logger.exception(
-                "[ASSIGNMENT] remove_courier_from_order failed order_id=%s", order_id
-            )
+            logger.exception("[ASSIGNMENT] remove_courier_from_order failed order_id=%s", order_id)
             return False
 
-
-    def remove_driver_from_trip(
+    def remove_driver_from_trip_with_orders(
         self,
         session: Session,
         trip_id: int,
+        order_ids: List[int],
         executor_id: int,
-        operator_id: int, 
+        operator_id: int
     ) -> bool:
         """
-        Снимает водителя с рейса.
+        Снимает водителя с рейса и очищает его закрепление за всеми заказами рейса.
         """
         logger.info(
-            "[ASSIGNMENT] remove_driver_from_trip trip_id=%s executor=%s operator=%s",
-            trip_id, executor_id, operator_id,
+            "[ASSIGNMENT] remove_driver_from_trip_with_orders trip=%s, executor=%s, orders=%s",
+            trip_id, executor_id, order_ids
         )
-
         try:
-            success = self.db.remove_driver_from_trip(
-                session, trip_id, operator_id
+            # 1. Снять водителя с самого рейса
+            if not self.db.remove_driver_from_trip(session, trip_id, operator_id):
+                raise DbLayerError("Не удалось снять водителя с рейса")
+
+            # 2. Очистить закрепление водителя за всеми заказами рейса
+            self.db.clear_driver_from_stage_orders(session, order_ids)
+
+            logger.info(
+                "[ASSIGNMENT] Водитель %s снят с рейса %s и всех связанных заказов",
+                executor_id, trip_id
             )
-            
-            if success:
-                logger.info(
-                    "[ASSIGNMENT] driver %s removed from trip %s",
-                    executor_id, trip_id,
-                )
-            else:
-                logger.error(
-                    "[ASSIGNMENT] failed to remove driver %s from trip %s",
-                    executor_id, trip_id,
-                )
-            
-            return success
+            return True
 
         except Exception:
-            logger.exception(
-                "[ASSIGNMENT] remove_driver_from_trip failed trip_id=%s", trip_id
-            )
+            logger.exception("[ASSIGNMENT] remove_driver_from_trip_with_orders failed")
             return False
 
 # =========== РАБОТА С ПОСТАМАТОМ ===========================
@@ -906,9 +886,10 @@ class DriverActions:
         direction_id: int,
         user_id: int,
         order_ids: List[int]
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, Optional[int], str]:
         """
         Создаёт рейс, привязывает заказы и выполняет FSM-переходы.
+        Возвращает (success, trip_id, message).
         """
         logger.info(
             "[DriverActions] start_trip: direction_id=%s, user_id=%s, orders=%d",
@@ -929,10 +910,10 @@ class DriverActions:
                 logger.debug("[DriverActions] order %s transitioned to order_in_transit_to_post2", order_id)
 
             logger.info("[DriverActions] start_trip COMPLETED: trip_id=%s, orders=%d", trip_id, len(order_ids))
-            return True, f"Рейс {trip_id} начат: {len(order_ids)} заказов в транзите"
+            return True, trip_id, f"Рейс {trip_id} начат: {len(order_ids)} заказов в транзите"
         except Exception as e:
             logger.exception("[DriverActions] start_trip failed")
-            return False, f"START_TRIP_FAILED: {e}"
+            return False, None, f"START_TRIP_FAILED: {e}"
 
     def arrive_at_destination(
         self,

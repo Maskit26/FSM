@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from sqlalchemy.orm import Session
 from db_layer import DatabaseLayer, DbLayerError
 from .core_adapter import CoreAdapter
@@ -57,27 +57,7 @@ class OrderMapping:
             return True, core_order_id, b_state, kind, upper, ""
         except Exception as e:
             logger.exception("create_order_in_core failed")
-            return False, None, None, None, None, str(e) 
-
-    def _get_order_addresses(self, session: Session, local_order_id: int) -> Tuple[str, str]:
-        """
-        Возвращает (start_address, dest_address) для заказа.
-        Адреса берутся из ячеек source_cell_id и dest_cell_id.
-        """
-        order = self.db.get_order(session, local_order_id)
-        if not order:
-            raise DbLayerError(f"Заказ {local_order_id} не найден")
-        
-        src_cell_id = order.get("source_cell_id")
-        dst_cell_id = order.get("dest_cell_id")
-        
-        if not src_cell_id or not dst_cell_id:
-            raise DbLayerError(f"У заказа {local_order_id} отсутствуют source_cell_id или dest_cell_id")
-        
-        start_address = self.db.get_locker_address_by_cell(session, src_cell_id)
-        dest_address = self.db.get_locker_address_by_cell(session, dst_cell_id)
-        
-        return start_address, dest_address
+            return False, None, None, None, None, str(e)     
 
     def create_suborder_in_core(
         self,
@@ -87,130 +67,148 @@ class OrderMapping:
         performer_local_user_id: int,
         main_core_id: int,
     ) -> Tuple[bool, Optional[int], str]:
-        logger.info("create_suborder_in_core: local=%s, role=%s, main=%s",
-                    local_order_id, role, main_core_id)
+        logger.info(
+            "Создание подзаказа в Core: local=%s, role=%s, main=%s",
+            local_order_id,
+            role,
+            main_core_id,
+        )
         try:
-            # 1. Получаем заказ и его владельца-клиента
             order = self.db.get_order(session, local_order_id)
             if not order:
-                return False, None, "ORDER_NOT_FOUND"
+                return False, None, "ЗАКАЗ_НЕ_НАЙДЕН"
+
             client_local_id = order["client_user_id"]
             client_core_id = self.db.get_core_u_id_by_local_user_id(session, client_local_id)
             if not client_core_id:
-                return False, None, "CLIENT_NOT_MAPPED_TO_CORE"
+                return False, None, "КЛИЕНТ_НЕ_ПРИВЯЗАН_К_CORE"
 
-            # 2. Токен клиента для создания подзаказа
             token, u_hash = self.db.get_user_core_tokens(session, client_core_id)
             if not token or not u_hash:
-                return False, None, "MISSING_CLIENT_CORE_TOKENS"
+                return False, None, "ОТСУТСТВУЮТ_ТОКЕНЫ_КЛИЕНТА"
 
-            # 3. Создаём подзаказ от имени клиента
             kind = 2 if role == "driver" else 3
             start_address, dest_address = self._get_order_addresses(session, local_order_id)
-
             payload = to_core_suborder_payload(start_address, dest_address, kind, main_core_id)
             response = self.core_adapter.create_drive_order(payload, token, u_hash)
+
             if response.get("status") != "success":
-                return False, None, f"Core error: {response.get('message')}"
+                return False, None, f"Ошибка Core: {response.get('message')}"
 
             core_sub_id = response["data"]["b_id"]
 
-            # 4. Назначаем исполнителя
-            performer_core_id = self.db.get_core_u_id_by_local_user_id(session, performer_local_user_id)
-            if not performer_core_id:
-                return False, None, "PERFORMER_NOT_MAPPED_TO_CORE"
-
-            performer_token, performer_u_hash = self.db.get_user_core_tokens(session, performer_core_id)
-            if not performer_token or not performer_u_hash:
-                return False, None, "MISSING_PERFORMER_CORE_TOKENS"
-
             car_core_id = self.db.get_car_core_id(session, performer_local_user_id)
             if not car_core_id:
-                return False, None, "MISSING_CAR_FOR_PERFORMER"
+                return False, None, "У_ИСПОЛНИТЕЛЯ_НЕТ_МАШИНЫ"
 
-            set_performer_response = self.core_adapter.perform_drive_order(
-                core_sub_id,
-                performer_core_id,
-                performer_token,
-                performer_u_hash,
-                c_id=car_core_id
-            )
-            logger.info("set_performer response: %s", set_performer_response)
-
-            data = set_performer_response.get('data', {})
-            b_state_transition = data.get('b_state', '')
-            if '->' in b_state_transition:
-                b_state = int(b_state_transition.split('->')[-1])
-            else:
-                b_state = 2 
-            upper = main_core_id  
-
-            # 5. Сохраняем маппинг
-            self.db.save_core_order_mapping(
-                session=session,
-                local_order_id=local_order_id,
+            # Назначение и маппинг
+            success, msg = self.assign_performer_to_suborder(
+                session,
                 core_order_id=core_sub_id,
+                performer_local_user_id=performer_local_user_id,
+                car_core_id=car_core_id,
+                local_order_id=local_order_id,
+                main_core_id=main_core_id,
                 role=role,
                 kind=kind,
-                upper=upper,
-                b_state=b_state,
-                client_local_user_id=None, 
-                performer_local_user_id=performer_local_user_id,
             )
+            if not success:
+                return False, None, msg
 
-            logger.info("create_suborder_in_core success: local=%s, core_sub_id=%s, b_state=%s",
-                        local_order_id, core_sub_id, b_state)
+            logger.info("Подзаказ успешно создан: core_sub_id=%s", core_sub_id)
             return True, core_sub_id, ""
 
-        except DbLayerError as e:
-            logger.error("DB error in create_suborder_in_core: %s", e)
-            return False, None, f"DB_ERROR: {e}"
-        except CoreValidationError as e:
-            logger.error("Core validation error in create_suborder_in_core: %s", e)
-            return False, None, f"CORE_VALIDATION_ERROR: {e}"
-        except CoreAdapterError as e:
-            logger.error("Core adapter error in create_suborder_in_core: %s", e)
-            return False, None, f"CORE_ADAPTER_ERROR: {e}"
         except Exception as e:
-            logger.exception("Unexpected error in create_suborder_in_core")
-            return False, None, f"UNEXPECTED_ERROR: {e}"
+            logger.exception("Ошибка создания подзаказа в Core")
+            return False, None, f"ИСКЛЮЧЕНИЕ: {e}"
 
 # ======================= Отмена заказа ============================
-    def cancel_order_in_core(self, session: Session, local_order_id: int, user_id: int, reason: str = None) -> Tuple[bool, str]:
-        """
-        Отмена заказа в Core по локальному ID заказа.
-        Возвращает (успех, сообщение_об_ошибке).
-        """
-        logger.info("cancel_order_in_core: local_order_id=%s, user_id=%s", local_order_id, user_id)
+    def cancel_main_order_in_core(
+        self,
+        session: Session,
+        local_order_id: int,
+        user_id: int,
+        reason: str = None
+    ) -> Tuple[bool, str]:
+        logger.info("Отмена главного заказа в Core: local=%s, user=%s", local_order_id, user_id)
         try:
-            # 1. Получить core_order_id
             core_order_id = self.db.get_core_order_id_by_local_order_id(session, local_order_id)
             if not core_order_id:
-                logger.warning("cancel_order_in_core: core_order_id not found for local_order_id=%s", local_order_id)
-                return False, "CORE_ORDER_ID_NOT_FOUND"
+                return False, "MAIN_ORDER_NOT_FOUND"
 
-            # 2. Получить core_u_id пользователя, инициирующего отмену
+            # Проверка, не отменён ли уже
+            current_b_state = self.db.get_core_order_b_state(session, core_order_id)
+            if current_b_state == 3:
+                logger.info("Главный заказ %s уже отменён", core_order_id)
+                return True, ""
+
             core_u_id = self.db.get_core_u_id_by_local_user_id(session, user_id)
             if not core_u_id:
-                logger.warning("cancel_order_in_core: user %s not mapped to Core", user_id)
                 return False, "USER_NOT_MAPPED_TO_CORE"
-
-            # 3. Получить токены пользователя
             token, u_hash = self.db.get_user_core_tokens(session, core_u_id)
             if not token or not u_hash:
-                logger.warning("cancel_order_in_core: missing tokens for core_u_id=%s", core_u_id)
                 return False, "MISSING_CORE_TOKENS"
 
-            # 4. Вызвать Core API
             self.core_adapter.cancel_drive_order(core_order_id, token, u_hash, reason=reason)
-            logger.info("cancel_order_in_core: successfully cancelled core order %s", core_order_id)
+
+            order_info = self.core_adapter.get_drive_order(core_order_id, token, u_hash, kind=1)
+            parsed = from_core_order_response(order_info, core_order_id)
+            new_b_state = parsed["b_state"]
+
+            self.db.update_core_order_b_state(session, core_order_id, new_b_state)
+            logger.info("Главный заказ %s отменён, b_state=%s", core_order_id, new_b_state)
             return True, ""
 
-        except CoreAdapterError as e:
-            logger.error("cancel_order_in_core: Core error: %s", e)
-            return False, f"CORE_ERROR: {e}"
         except Exception as e:
-            logger.exception("cancel_order_in_core: unexpected error")
+            logger.exception("cancel_main_order_in_core failed")
+            return False, f"EXCEPTION: {e}"
+
+    def remove_suborder_performer_in_core(
+        self,
+        session: Session,
+        local_order_id: int,
+        performer_local_user_id: int,
+        user_id: int,  
+    ) -> Tuple[bool, str]:
+        logger.info(
+            "Снятие исполнителя с подзаказа: local=%s, performer=%s, initiator=%s",
+            local_order_id, performer_local_user_id, user_id
+        )
+        try:
+            # 1. Найти подзаказ в Core
+            core_order_id = self.db.get_core_suborder_id_by_performer(
+                session, local_order_id, performer_local_user_id
+            )
+            if not core_order_id:
+                return False, "SUBORDER_NOT_FOUND"
+
+            # 2. Проверить, не снят ли уже исполнитель
+            current_b_state = self.db.get_core_order_b_state(session, core_order_id)
+            if current_b_state == 1:
+                logger.info("Подзаказ %s уже в статусе b_state=1, исполнитель снят ранее", core_order_id)
+                return True, ""
+
+            # 3. Получить токены самого исполнителя (курьера/водителя)
+            performer_core_id = self.db.get_core_u_id_by_local_user_id(session, performer_local_user_id)
+            if not performer_core_id:
+                return False, "PERFORMER_NOT_MAPPED_TO_CORE"
+
+            token, u_hash = self.db.get_user_core_tokens(session, performer_core_id)
+            if not token or not u_hash:
+                return False, "MISSING_PERFORMER_TOKENS"
+
+            # 4. Отменить используем токены исполнителя
+            self.core_adapter.cancel_drive_order(core_order_id, token, u_hash)
+
+            # 5. Обновить маппинг
+            self.db.update_core_order_b_state(session, core_order_id, 1)
+            self.db.clear_core_order_performer(session, core_order_id)
+
+            logger.info("Исполнитель снят, подзаказ %s перешёл в b_state=1", core_order_id)
+            return True, ""
+
+        except Exception as e:
+            logger.exception("Ошибка при снятии исполнителя с подзаказа в Core")
             return False, f"EXCEPTION: {e}"
 
 # ======================= Назначение курьера ==================
@@ -218,39 +216,207 @@ class OrderMapping:
         self,
         session: Session,
         local_order_id: int,
-        courier_local_user_id: int,
+        performer_local_user_id: int,
         role: str,
     ) -> Tuple[bool, str]:
-        logger.info("assign_executor_in_core: local=%s, courier=%s, role=%s",
-                    local_order_id, courier_local_user_id, role)
+        logger.info(
+            "Назначение исполнителя в Core: local=%s, performer=%s, role=%s",
+            local_order_id, performer_local_user_id, role,
+        )
         try:
             main_core_id = self.db.get_main_core_order_id(session, local_order_id)
             if not main_core_id:
-                logger.error("Main core order not found for local_order=%s", local_order_id)
-                return False, "MAIN_ORDER_NOT_FOUND"
+                return False, "ГЛАВНЫЙ_ЗАКАЗ_НЕ_НАЙДЕН"
 
-            existing = self.db.get_suborder_core_id(session, local_order_id, role, main_core_id)
-            if existing:
-                logger.info("Подзаказ для роли %s уже существует: core_id=%s", role, existing)
-                return True, ""
-
-            success, core_sub_id, err = self.create_suborder_in_core(
-                session, local_order_id, role, courier_local_user_id, main_core_id
+            kind = 2 if role == "driver" else 3
+            existing_core_id = self.db.get_suborder_core_id(
+                session, local_order_id, role, main_core_id
             )
-            if not success:
-                logger.error("create_suborder_in_core failed: %s", err)
-                return False, f"CREATE_SUBORDER_FAILED: {err}"
+
+            # Проверяем состояние существующего подзаказа
+            can_reuse = False
+            if existing_core_id:
+                current_state = self.db.get_core_order_b_state(session, existing_core_id)
+                if current_state == 1: 
+                    can_reuse = True
+                    logger.info("Найден подзаказ core_id=%s в b_state=1, будет переназначен", existing_core_id)
+                else:
+                    logger.info("Подзаказ core_id=%s имеет b_state=%s – будет создан новый",
+                                existing_core_id, current_state)
+                    existing_core_id = None
+
+            if can_reuse:
+                core_order_id = existing_core_id
+                car_core_id = self.db.get_car_core_id(session, performer_local_user_id)
+                if not car_core_id:
+                    return False, "У_ИСПОЛНИТЕЛЯ_НЕТ_МАШИНЫ"
+
+                success, msg = self.assign_performer_to_suborder(
+                    session,
+                    core_order_id=core_order_id,
+                    performer_local_user_id=performer_local_user_id,
+                    car_core_id=car_core_id,
+                    local_order_id=local_order_id,
+                    main_core_id=main_core_id,
+                    role=role,
+                    kind=kind,
+                )
+                if not success:
+                    return False, msg
+            else:
+                # Создаём новый подзаказ (назначение произойдёт внутри)
+                success, core_order_id, err = self.create_suborder_in_core(
+                    session, local_order_id, role, performer_local_user_id, main_core_id
+                )
+                if not success:
+                    return False, f"ОШИБКА_СОЗДАНИЯ_ПОДЗАКАЗА: {err}"
+
+            logger.info("Назначение исполнителя выполнено, core_order_id=%s", core_order_id)
             return True, ""
 
-        except DbLayerError as e:
-            logger.error("DB error in assign_executor_in_core: %s", e)
-            return False, f"DB_ERROR: {e}"
-        except CoreAdapterError as e:
-            logger.error("Core adapter error: %s", e)
-            return False, f"CORE_ERROR: {e}"
         except Exception as e:
-            logger.exception("Unexpected error in assign_executor_in_core")
-            return False, f"UNEXPECTED_ERROR: {e}"
+            logger.exception("Ошибка при назначении исполнителя в Core")
+            return False, str(e)
+
+    def assign_performer_to_suborder(
+        self,
+        session: Session,
+        core_order_id: int,
+        performer_local_user_id: int,
+        car_core_id: int,
+        local_order_id: int,
+        main_core_id: int,
+        role: str,
+        kind: int,
+    ) -> Tuple[bool, str]:
+        """Назначает исполнителя в Core и обновляет локальный маппинг (использует токены исполнителя)."""
+        logger.info(
+            "Назначение исполнителя в Core: core_order=%s, performer_local=%s",
+            core_order_id,
+            performer_local_user_id,
+        )
+
+        performer_core_id = self.db.get_core_u_id_by_local_user_id(session, performer_local_user_id)
+        if not performer_core_id:
+            return False, "ИСПОЛНИТЕЛЬ_НЕ_ПРИВЯЗАН_К_CORE"
+
+        performer_token, performer_u_hash = self.db.get_user_core_tokens(session, performer_core_id)
+        if not performer_token or not performer_u_hash:
+            return False, "ОТСУТСТВУЮТ_ТОКЕНЫ_ИСПОЛНИТЕЛЯ"
+
+        if not car_core_id:
+            return False, "У_ИСПОЛНИТЕЛЯ_НЕТ_МАШИНЫ"
+
+        try:
+            response = self.core_adapter.perform_drive_order(
+                core_order_id,
+                performer_core_id,
+                performer_token,
+                performer_u_hash,
+                c_id=car_core_id,
+            )
+        except Exception as e:
+            logger.exception("Ошибка вызова perform_drive_order")
+            return False, f"ОШИБКА_CORE_SET_PERFORMER: {e}"
+
+        if response.get("status") != "success":
+            logger.error("Core set_performer вернул ошибку: %s", response)
+            return False, f"ОШИБКА_CORE_SET_PERFORMER: {response.get('message')}"
+
+        # Обновить b_state
+        data = response.get("data", {})
+        b_state_transition = data.get("b_state", "")
+        if "->" in b_state_transition:
+            new_b_state = int(b_state_transition.split("->")[-1])
+        else:
+            new_b_state = self.db.get_core_order_b_state(session, core_order_id) or 2
+
+        self.db.update_core_order_b_state(session, core_order_id, new_b_state)
+
+        # Сохранить маппинг с новым исполнителем
+        try:
+            self.db.save_core_order_mapping(
+                session=session,
+                local_order_id=local_order_id,
+                core_order_id=core_order_id,
+                role=role,
+                kind=kind,
+                upper=main_core_id,
+                b_state=new_b_state,
+                performer_local_user_id=performer_local_user_id,
+            )
+        except Exception as e:
+            logger.exception("Ошибка сохранения маппинга core_order")
+            return False, f"ОШИБКА_СОХРАНЕНИЯ_МАППИНГА: {e}"
+
+        logger.info("Исполнитель успешно назначен, b_state=%s", new_b_state)
+        return True, ""
+
+# ===================== Переназначение водителя =================        
+    def reassign_driver_for_trip(
+        self,
+        session: Session,
+        trip_id: int,
+        order_ids: List[int],
+        new_driver_local_id: int,
+        role: str
+    ) -> Tuple[bool, str]:
+        logger.info(
+            "Массовое назначение/переназначение для рейса %s, заказов: %s, новый исполнитель: %s, роль: %s",
+            trip_id, order_ids, new_driver_local_id, role
+        )
+        if not order_ids:
+            return False, "Нет заказов в рейсе"
+
+        car_core_id = self.db.get_car_core_id(session, new_driver_local_id)
+        if not car_core_id:
+            return False, "У нового водителя нет машины в Core"
+
+        errors = []
+        kind = 2 if role == "driver" else 3
+
+        for order_id in order_ids:
+            try:
+                main_core_id = self.db.get_main_core_order_id(session, order_id)
+                if not main_core_id:
+                    errors.append(f"Заказ {order_id}: не найден главный Core-заказ")
+                    continue
+
+                existing_core_id = self.db.get_suborder_core_id(
+                    session, order_id, role, main_core_id
+                )
+
+                if existing_core_id:
+                    # Переназначение в существующем подзаказе
+                    ok, msg = self.assign_performer_to_suborder(
+                        session,
+                        core_order_id=existing_core_id,
+                        performer_local_user_id=new_driver_local_id,
+                        car_core_id=car_core_id,
+                        local_order_id=order_id,
+                        main_core_id=main_core_id,
+                        role=role,
+                        kind=kind,
+                    )
+                    if not ok:
+                        errors.append(f"Заказ {order_id}: {msg}")
+                else:
+                    # Создание нового подзаказа + назначение
+                    success, _, msg = self.create_suborder_in_core(
+                        session,
+                        local_order_id=order_id,
+                        role=role,
+                        performer_local_user_id=new_driver_local_id,
+                        main_core_id=main_core_id
+                    )
+                    if not success:
+                        errors.append(f"Заказ {order_id}: {msg}")
+            except Exception as e:
+                errors.append(f"Заказ {order_id}: исключение {e}")
+
+        if errors:
+            return False, "; ".join(errors)
+        return True, ""
 
 # ======================= Завершение заказа ===================
     def complete_main_order_in_core(
@@ -335,3 +501,36 @@ class OrderMapping:
         except Exception as e:
             logger.exception("complete_suborder_in_core failed")
             return False, str(e)
+
+# ======================Вспомогательные методы ================
+    def _get_order_addresses(self, session: Session, local_order_id: int) -> Tuple[str, str]:
+            """
+            Возвращает (start_address, dest_address) для заказа.
+            Адреса берутся из ячеек source_cell_id и dest_cell_id.
+            """
+            order = self.db.get_order(session, local_order_id)
+            if not order:
+                raise DbLayerError(f"Заказ {local_order_id} не найден")
+            
+            src_cell_id = order.get("source_cell_id")
+            dst_cell_id = order.get("dest_cell_id")
+            
+            if not src_cell_id or not dst_cell_id:
+                raise DbLayerError(f"У заказа {local_order_id} отсутствуют source_cell_id или dest_cell_id")
+            
+            start_address = self.db.get_locker_address_by_cell(session, src_cell_id)
+            dest_address = self.db.get_locker_address_by_cell(session, dst_cell_id)
+            
+            return start_address, dest_address
+
+    def _get_operator_tokens(self, session: Session, operator_local_user_id: int) -> Tuple[Optional[str], Optional[str]]:
+        # Проверим, что пользователь — оператор (или админ)
+        role = self.db.get_user_role(session, operator_local_user_id)
+        if role not in ("operator", "admin"):
+            logger.warning("Пользователь %s не является оператором (роль: %s)", operator_local_user_id, role)
+            return None, None
+
+        core_u_id = self.db.get_core_u_id_by_local_user_id(session, operator_local_user_id)
+        if not core_u_id:
+            return None, None
+        return self.db.get_user_core_tokens(session, core_u_id)

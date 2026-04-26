@@ -96,7 +96,7 @@ def get_db() -> Generator[DatabaseLayer, None, None]:
 # CORE ADAPTER
 # =====================
 core_adapter = CoreAdapter(
-    core_url=os.getenv("CORE_URL", "https://ibronevik.ru/taxi/c/0/"),
+    core_url=os.getenv("CORE_URL", "https://ibronevik.ru/taxi/c/postamat/"),
     core_api_key=os.getenv("CORE_API_KEY", ""),
     core_timeout=5
 )
@@ -1487,7 +1487,8 @@ async def create_user_car(
                 raise HTTPException(status_code=400, detail="User not mapped to Core")
 
             user_mapping = UserMapping(core_adapter=core_adapter, db=db)
-            core_car_id = user_mapping.create_car_for_core_user(
+            # Важно: метод возвращает кортеж (core_car_id, registration_plate)
+            core_car_id, registration_plate = user_mapping.create_car_for_core_user(
                 session=session,
                 core_u_id=core_u_id,
                 car_type=request.car_type.value,

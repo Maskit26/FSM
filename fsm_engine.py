@@ -59,137 +59,240 @@ def _handle_order_creation_pending(db, session, ctx, instance):
 
 
 # ==================== ASSIGN EXECUTOR ====================
-def _handle_assign_executor_pending(
+def _handle_assign_executor(
     db: DatabaseLayer,
     session: Session,
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
+    """
+    Универсальное назначение/переназначение исполнителя (курьера или водителя).
+    Для order обязателен metadata.leg ("pickup" → courier1, "delivery" → courier2).
+    Для trip назначается водитель на рейс и все его заказы.
+    """
     actions: AssignmentActions = ctx["assignment_actions"]
     order_mapping: OrderMapping = ctx["order_mapping"]
+
     entity_type = instance["entity_type"]
     entity_id = instance["entity_id"]
     target_user_id = instance.get("target_user_id", 0)
-    process_name = instance["process_name"]
+    metadata = instance.get("metadata", {})
 
-    if not target_user_id or target_user_id <= 0:
-        return FsmStepResult(new_state="FAILED", last_error="TARGET_USER_ID_NOT_SET", attempts_increment=1)
-
-    # Определяем роль
-    if "courier1" in process_name:
-        role = "courier1"
-    elif "courier2" in process_name:
-        role = "courier2"
-    elif "driver" in process_name:
-        role = "driver"
-    else:
-        return FsmStepResult(new_state="FAILED", last_error="UNKNOWN_PROCESS_TYPE", attempts_increment=1)
-
-    # Для курьеров вызываем Core set_performer
-    if role in ("courier1", "courier2"):
-        ok, err = order_mapping.assign_executor_in_core(session, entity_id, target_user_id, role)
-        if not ok:
-            logger.error("[FSM] assign_executor_in_core failed for order %s: %s", entity_id, err)
-            return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
-
-    # Локальное назначение
-    if entity_type == "order":
-        success = actions.assign_to_order(session, entity_id, target_user_id, role)
-    elif entity_type == "trip":
-        success = actions.assign_to_trip(session, entity_id, target_user_id, role)
-    else:
-        return FsmStepResult(new_state="FAILED", last_error=f"UNKNOWN_ENTITY_TYPE_{entity_type}", attempts_increment=1)
-
-    if not success:
-        return FsmStepResult(new_state="FAILED", last_error="ASSIGNMENT_FAILED", attempts_increment=1)
-
-    logger.info("[FSM] assign_executor COMPLETED: entity=%s:%s, executor=%s, role=%s",
-                entity_type, entity_id, target_user_id, role)
-    return FsmStepResult(new_state="COMPLETED", attempts_increment=1)
-
-# =========== снять курьера с заказа и водителя с рейса ======
-def _handle_remove_executor_pending(
-    db: DatabaseLayer,
-    session: Session,
-    ctx: Dict[str, Any],
-    instance: Dict[str, Any]
-) -> FsmStepResult:
-    """
-    Универсальный обработчик снятия исполнителя.
-    Работает для процессов:
-    - order_remove_courier1 (leg=pickup)
-    - order_remove_courier2 (leg=delivery)
-    - trip_remove_driver
-    """
-    actions: AssignmentActions = ctx["assignment_actions"]
-    entity_type = instance["entity_type"]
-    entity_id = instance["entity_id"]
-    target_user_id = instance.get("target_user_id", 0)
-    operator_id = instance["requested_by_user_id"]
-    process_name = instance["process_name"]
-    
     if not target_user_id or target_user_id <= 0:
         return FsmStepResult(
             new_state="FAILED",
             last_error="TARGET_USER_ID_NOT_SET",
             attempts_increment=1
         )
-    
-    if "courier1" in process_name:
-        leg = "pickup"
-    elif "courier2" in process_name:
-        leg = "delivery"
-    elif "driver" in process_name:
-        leg = None 
+
+    logger.info(
+        "[FSM] assign_executor: entity=%s:%s, target=%s, metadata=%s",
+        entity_type, entity_id, target_user_id, metadata
+    )
+
+    # ===== ЗАКАЗ (курьер) =====
+    if entity_type == "order":
+        leg = metadata.get("leg")
+        if leg not in ("pickup", "delivery"):
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="MISSING_OR_INVALID_LEG_IN_METADATA",
+                attempts_increment=1
+            )
+        # Определяем роль по плечу (leg)
+        role = "courier1" if leg == "pickup" else "courier2"
+
+        # 1. Назначение/переназначение в Core
+        ok, err = order_mapping.assign_executor_in_core(
+            session,
+            local_order_id=entity_id,
+            performer_local_user_id=target_user_id,
+            role=role
+        )
+        if not ok:
+            logger.error("[FSM] assign_executor(order): Core назначение не удалось: %s", err)
+            return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
+
+        # 2. Локальное назначение курьера
+        success = actions.assign_to_order(session, entity_id, target_user_id, role)
+        if not success:
+            logger.error("[FSM] assign_executor(order): локальное назначение не удалось")
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="ASSIGN_ORDER_FAILED",
+                attempts_increment=1
+            )
+
+    # ===== РЕЙС (водитель) =====
+    elif entity_type == "trip":
+        order_ids = db.get_orders_in_trip(session, entity_id)
+        if not order_ids:
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="NO_ORDERS_IN_TRIP",
+                attempts_increment=1
+            )
+
+        # 1. Массовое назначение/переназначение в Core для всех заказов рейса
+        ok, err = order_mapping.reassign_driver_for_trip(
+            session,
+            trip_id=entity_id,
+            order_ids=order_ids,
+            new_driver_local_id=target_user_id,
+            role="driver"
+        )
+        if not ok:
+            logger.error("[FSM] assign_executor(trip): Core назначение не удалось: %s", err)
+            return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
+
+        # 2. Локальное назначение водителя на рейс и обновление stage_orders
+        success = actions.reassign_driver_on_trip(
+            session,
+            trip_id=entity_id,
+            order_ids=order_ids,
+            new_driver_id=target_user_id,
+            role="driver"
+        )
+        if not success:
+            logger.error("[FSM] assign_executor(trip): локальное назначение не удалось")
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="TRIP_REASSIGN_FAILED",
+                attempts_increment=1
+            )
+
     else:
         return FsmStepResult(
             new_state="FAILED",
-            last_error="UNKNOWN_PROCESS_TYPE",
+            last_error=f"Неподдерживаемый entity_type: {entity_type}",
             attempts_increment=1
         )
-    
+
+    logger.info("[FSM] assign_executor COMPLETED: %s:%s", entity_type, entity_id)
+    return FsmStepResult(new_state="COMPLETED", attempts_increment=1)
+
+# =========== снять курьера с заказа и водителя с рейса ======
+def _handle_remove_executor(
+    db: DatabaseLayer,
+    session: Session,
+    ctx: Dict[str, Any],
+    instance: Dict[str, Any]
+) -> FsmStepResult:
+    """
+    Универсальное снятие исполнителя (курьера/водителя).
+    Для order обязателен metadata.leg ("pickup" / "delivery").
+    Для trip снимается водитель со всех заказов рейса.
+    """
+    actions: AssignmentActions = ctx["assignment_actions"]
+    order_mapping: OrderMapping = ctx["order_mapping"]
+
+    entity_type = instance["entity_type"]
+    entity_id = instance["entity_id"]
+    target_user_id = instance.get("target_user_id", 0)  
+    operator_id = instance["requested_by_user_id"]    
+    metadata = instance.get("metadata", {})
+
+    if not target_user_id or target_user_id <= 0:
+        return FsmStepResult(
+            new_state="FAILED",
+            last_error="TARGET_USER_ID_NOT_SET",
+            attempts_increment=1
+        )
+
     logger.info(
-        f"[FSM] remove_executor: entity={entity_type}:{entity_id}, "
-        f"executor={target_user_id}, leg={leg}"
+        "[FSM] remove_executor: entity=%s:%s, target=%s, initiator=%s, metadata=%s",
+        entity_type, entity_id, target_user_id, operator_id, metadata
     )
-    
+
+    # ===== ЗАКАЗ (курьер) =====
     if entity_type == "order":
-        if not leg:
+        leg = metadata.get("leg")
+        if leg not in ("pickup", "delivery"):
             return FsmStepResult(
                 new_state="FAILED",
-                last_error="LEG_REQUIRED_FOR_ORDER",
+                last_error="MISSING_OR_INVALID_LEG_IN_METADATA",
                 attempts_increment=1
             )
+
+        # 1. Снять подзаказ в Core
+        ok, err = order_mapping.remove_suborder_performer_in_core(
+            session,
+            local_order_id=entity_id,
+            performer_local_user_id=target_user_id,
+            user_id=operator_id
+        )
+        if not ok:
+            logger.error("[FSM] remove_executor(order): Core снятие не удалось: %s", err)
+            return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
+
+        # 2. Локальное снятие курьера 
         success = actions.remove_courier_from_order(
             session, entity_id, target_user_id, leg, operator_id
         )
+        if not success:
+            logger.error("[FSM] remove_executor(order): локальное снятие не удалось")
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="REMOVE_COURIER_FAILED",
+                attempts_increment=1
+            )
+
+    # ===== РЕЙС (водитель) =====
     elif entity_type == "trip":
-        success = actions.remove_driver_from_trip(
-            session, entity_id, target_user_id, operator_id
+        order_ids = db.get_orders_in_trip(session, entity_id)
+        if not order_ids:
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="NO_ORDERS_IN_TRIP",
+                attempts_increment=1
+            )
+
+        # 1. Снять подзаказы в Core для всех заказов рейса
+        errors = []
+        for oid in order_ids:
+            ok, err = order_mapping.remove_suborder_performer_in_core(
+                session,
+                local_order_id=oid,
+                performer_local_user_id=target_user_id,
+                user_id=operator_id
+            )
+            if not ok:
+                errors.append(f"Заказ {oid}: {err}")
+
+        if errors:
+            logger.error("[FSM] remove_executor(trip): ошибки Core снятия: %s", "; ".join(errors))
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="; ".join(errors),
+                attempts_increment=1
+            )
+
+        # 2. Локальное снятие водителя с рейса и очистка всех его stage_orders
+        success = actions.remove_driver_from_trip_with_orders(
+            session,
+            trip_id=entity_id,
+            order_ids=order_ids,
+            executor_id=target_user_id,
+            operator_id=operator_id
         )
+        if not success:
+            logger.error("[FSM] remove_executor(trip): локальное снятие не удалось")
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="REMOVE_DRIVER_FAILED",
+                attempts_increment=1
+            )
+
     else:
         return FsmStepResult(
             new_state="FAILED",
-            last_error=f"UNKNOWN_ENTITY_TYPE_{entity_type}",
+            last_error=f"Неподдерживаемый entity_type: {entity_type}",
             attempts_increment=1
         )
-    
-    if not success:
-        return FsmStepResult(
-            new_state="FAILED",
-            last_error="REMOVE_EXECUTOR_FAILED",
-            attempts_increment=1
-        )
-    
-    logger.info(
-        f"[FSM] remove_executor COMPLETED: entity={entity_type}:{entity_id}"
-    )
-    return FsmStepResult(
-        new_state="COMPLETED",
-        last_error=None,
-        attempts_increment=1
-    )
 
+    logger.info("[FSM] remove_executor COMPLETED: %s:%s", entity_type, entity_id)
+    return FsmStepResult(new_state="COMPLETED", attempts_increment=1)
+    
 # ==================== OPEN/CLOSE CELL ====================
 def _handle_open_cell(
     db: DatabaseLayer,
@@ -390,49 +493,62 @@ def _handle_cancel_order(
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    """
-    Универсальная отмена заказа.
-    Сначала отменяет заказ в Core (если есть mapping), затем выполняет локальную отмену.
-    Роли: client, courier, operator.
-    """
     user_role = instance["requested_user_role"]
     order_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
+    performer_user_id = instance.get("target_user_id")
     metadata = instance.get("metadata", {})
-    reason = metadata.get("reason") 
+    reason = metadata.get("reason")
 
-    logger.info("[FSM] cancel_order: role=%s, order_id=%s, user_id=%s, reason=%s", user_role, order_id, user_id, reason)
+    logger.info("[FSM] cancel_order: role=%s, order_id=%s, user_id=%s", user_role, order_id, user_id)
 
-    # 1. Отмена в Core (если доступен OrderMapping)
     order_mapping = ctx.get("order_mapping")
-    if order_mapping:
-        logger.debug("[FSM] cancel_order: calling Core cancellation for order_id=%s", order_id)
-        ok, err = order_mapping.cancel_order_in_core(session, order_id, user_id, reason=reason)
-        if not ok:
-            logger.error("[FSM] cancel_order: Core cancellation failed for order %s: %s", order_id, err)
-            return FsmStepResult(new_state="FAILED", last_error=f"CORE_CANCEL_FAILED: {err}")
-        logger.info("[FSM] cancel_order: Core cancellation succeeded for order_id=%s", order_id)
-    else:
-        logger.warning("[FSM] cancel_order: order_mapping not available, skipping Core cancellation")
+    if not order_mapping:
+        logger.warning("[FSM] cancel_order: order_mapping not available")
 
-    # 2. Локальная отмена через actions
+    # 1. Core‑отмена
     if user_role == "client":
+        if order_mapping:
+            ok, err = order_mapping.cancel_main_order_in_core(
+                session, local_order_id=order_id, user_id=user_id, reason=reason
+            )
+            if not ok:
+                return FsmStepResult(new_state="FAILED", last_error=f"CORE: {err}")
         success, error = ctx["client_actions"].cancel_order(session, order_id, user_id)
+
     elif user_role == "courier":
+        if order_mapping:
+            ok, err = order_mapping.remove_suborder_performer_in_core(
+                session, local_order_id=order_id,
+                performer_local_user_id=user_id, 
+                user_id=user_id
+            )
+            if not ok:
+                return FsmStepResult(new_state="FAILED", last_error=f"CORE: {err}")
         success, error = ctx["courier_actions"].cancel_order(session, order_id, user_id)
+
     elif user_role == "operator":
+        if not performer_user_id:
+            return FsmStepResult(new_state="FAILED", last_error="MISSING_TARGET_USER_ID")
+        if order_mapping:
+            ok, err = order_mapping.remove_suborder_performer_in_core(
+                session, local_order_id=order_id,
+                performer_local_user_id=performer_user_id,
+                user_id=user_id
+            )
+            if not ok:
+                return FsmStepResult(new_state="FAILED", last_error=f"CORE: {err}")
         success, error = ctx["operator_actions"].force_cancel_order(session, order_id, user_id)
+
     else:
-        logger.warning("[FSM] cancel_order: not allowed for role %s", user_role)
-        return FsmStepResult(new_state="FAILED", last_error=f"CANCEL_NOT_ALLOWED_FOR_{user_role}")
+        logger.warning("[FSM] cancel_order: role %s not allowed", user_role)
+        return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_{user_role}")
 
     if not success:
-        logger.error("[FSM] cancel_order: local cancellation failed for order_id=%s, error=%s", order_id, error)
         return FsmStepResult(new_state="FAILED", last_error=error)
 
     logger.info("[FSM] cancel_order: COMPLETED for order_id=%s", order_id)
     return FsmStepResult(new_state="COMPLETED")
-
 
 # ==================== LOCKER ERROR ====================
 def _handle_locker_error(
@@ -489,7 +605,7 @@ def _handle_start_trip(
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    # entity_type = "direction"
+    entity_type = "direction"
     direction_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
     user_role = instance["requested_user_role"]
@@ -507,21 +623,23 @@ def _handle_start_trip(
     if not can_start:
         return FsmStepResult(new_state="FAILED", last_error=error)
 
-    # 2. Создание подзаказов водителя в Core
-    order_mapping = ctx.get("order_mapping")
-    if order_mapping:
-        for order_id in order_ids:
-            ok, err = order_mapping.assign_executor_in_core(
-                session, order_id, user_id, role=user_role
-            )
-            if not ok:
-                logger.error("[FSM] assign_executor_in_core failed for order %s: %s", order_id, err)
-                return FsmStepResult(new_state="FAILED", last_error=f"DRIVER_SUBORDER_FAILED: {err}")
-
-    # 3. Создание рейса и FSM-переходы
-    success, error = ctx["driver_actions"].start_trip(session, direction_id, user_id, order_ids)
+    # 2. Создание рейса и FSM-переходы (получаем trip_id)
+    success, trip_id, error = ctx["driver_actions"].start_trip(session, direction_id, user_id, order_ids)
     if not success:
         return FsmStepResult(new_state="FAILED", last_error=error)
+
+    # 3. Массовое назначение водителя на все заказы рейса в Core
+    order_mapping = ctx.get("order_mapping")
+    if order_mapping:
+        ok, err = order_mapping.reassign_driver_for_trip(
+            session,
+            trip_id=trip_id,
+            order_ids=order_ids,
+            new_driver_local_id=user_id,
+            role="driver"
+        )
+        if not ok:
+            return FsmStepResult(new_state="FAILED", last_error=f"DRIVER_SUBORDER_FAILED: {err}")
 
     logger.info("[FSM] start_trip COMPLETED: direction_id=%s, orders=%d", direction_id, len(order_ids))
     return FsmStepResult(new_state="COMPLETED")
@@ -904,58 +1022,26 @@ def _handle_direction_complete_loading(
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    """
-    Обработчик завершения погрузки водителем.
-    """
     direction_id = instance["entity_id"]
     driver_user_id = instance["requested_by_user_id"]
     user_role = instance.get("requested_user_role", "")
-    
+
     logger.info(
         "[FSM] direction_complete_loading: direction_id=%s, driver_user_id=%s, role=%s",
         direction_id, driver_user_id, user_role
     )
-    
-    # 1. Проверка роли (только водитель)
+
     if user_role != "driver":
-        logger.error(
-            "[FSM] direction_complete_loading: доступ запрещён для роли %s",
-            user_role
-        )
-        return FsmStepResult(
-            new_state="FAILED",
-            last_error="ROLE_NOT_ALLOWED: только водитель может завершить погрузку",
-            attempts_increment=1
-        )
-    
+        return FsmStepResult(new_state="FAILED", last_error="ROLE_NOT_ALLOWED", attempts_increment=1)
+
     actions: TripActions = ctx["trip_actions"]
-    
-    # 2. Вызываем экшен
-    success, msg = actions.complete_loading(
-        session, direction_id, driver_user_id
-    )
-    
+    success, msg = actions.complete_loading(session, direction_id, driver_user_id)
+
     if not success:
-        logger.error(
-            "[FSM] direction_complete_loading FAILED: direction_id=%s, error=%s",
-            direction_id, msg
-        )
-        return FsmStepResult(
-            new_state="FAILED",
-            last_error=msg,
-            attempts_increment=1
-        )
-    
-    logger.info(
-        "[FSM] direction_complete_loading COMPLETED: direction_id=%s",
-        direction_id
-    )
-    
-    return FsmStepResult(
-        new_state="COMPLETED",
-        last_error=None,
-        attempts_increment=1
-    )
+        return FsmStepResult(new_state="FAILED", last_error=msg, attempts_increment=1)
+
+    logger.info("[FSM] direction_complete_loading COMPLETED: direction_id=%s", direction_id)
+    return FsmStepResult(new_state="COMPLETED")
 
 def _handle_driver_reservation_cancel(
     db: DatabaseLayer,
@@ -1090,12 +1176,8 @@ def _handle_locker_cleanup(
 # ==================== PROCESS REGISTRY ====================
 PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
     "order_creation": {"PENDING": _handle_order_creation_pending},
-    "order_assign_courier1": {"PENDING": _handle_assign_executor_pending},
-    "order_assign_courier2": {"PENDING": _handle_assign_executor_pending},
-    "trip_assign_driver": {"PENDING": _handle_assign_executor_pending},
-    "order_remove_courier1": { "PENDING": _handle_remove_executor_pending},
-    "order_remove_courier2": { "PENDING": _handle_remove_executor_pending},
-    "trip_remove_driver":    { "PENDING": _handle_remove_executor_pending},
+    "assign_executor": {"PENDING": _handle_assign_executor},
+    "remove_executor": { "PENDING": _handle_remove_executor},
     "start_trip": {"PENDING": _handle_start_trip},
     "arrive_at_destination": {"PENDING": _handle_arrive_at_destination},
     "cancel_trip": {"PENDING": _handle_cancel_trip},

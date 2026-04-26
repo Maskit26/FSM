@@ -202,10 +202,11 @@ class CoreAdapter:
             logger.exception("perform_drive_order failed")
             raise CoreAdapterError(f"perform_drive_order failed: {e}")
 
-    def get_drive_order(self, b_id: int, token: str, u_hash: str) -> Dict[str, Any]:
-        """Получить данные заказа из Core (GET /api/v1/drive/get/{b_id})."""
+    def get_drive_order(self, b_id: int, token: str, u_hash: str, kind: Optional[int] = None) -> Dict[str, Any]:
         endpoint = f"/api/v1/drive/get/{b_id}"
         params = {"token": token, "u_hash": u_hash}
+        if kind is not None:
+            params["kind"] = str(kind)
         try:
             logger.info("get_drive_order request: endpoint=%s, params=%s", endpoint, {**params, "token": "***", "u_hash": "***"})
             response = self.client.get_with_params(endpoint, params)

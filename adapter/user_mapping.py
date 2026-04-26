@@ -210,7 +210,7 @@ class UserMapping:
         custom_model_en: Optional[str] = None,
         custom_model_year: Optional[int] = None,
         custom_model_doors: Optional[int] = None,
-    ) -> int:
+    ) -> Tuple[int, str]:
         # 1. Найти local_user_id
         local_user_id = self.db.get_local_user_id_by_core_u_id(session, core_u_id)
         if not local_user_id:
