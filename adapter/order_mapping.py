@@ -28,6 +28,15 @@ class OrderMapping:
                 return False, None, None, None, None, "REQ_NOT_FOUND"
 
             client_user_id = req["client_user_id"]
+            recipient_user_id = req.get("recipient_user_id")
+            parcel_type = req["parcel_type"]
+            cell_size = req["cell_size"]
+            sender_delivery = req["sender_delivery"]
+            recipient_delivery = req["recipient_delivery"]
+            description = f"{parcel_type} ({cell_size})"
+            pickup_type = "self" if sender_delivery == "self" else "courier"
+            delivery_type = "self" if recipient_delivery == "self" else "courier"
+
             core_u_id = self.db.get_core_u_id_by_local_user_id(session, client_user_id)
             if not core_u_id:
                 return False, None, None, None, None, "CLIENT_NOT_MAPPED_TO_CORE"
@@ -37,27 +46,51 @@ class OrderMapping:
                 return False, None, None, None, None, "MISSING_CORE_TOKENS"
 
             client_city = self.db.get_user_city(session, client_user_id)
-            recipient_city = self.db.get_user_city(session, req["recipient_user_id"]) if req["recipient_user_id"] else client_city
+            if recipient_user_id:
+                recipient_city = self.db.get_user_city(session, recipient_user_id)
+            else:
+                recipient_city = client_city
+
             start_address = self.db.get_locker_address_by_cell(session, src_cell_id)
             dest_address = self.db.get_locker_address_by_cell(session, dst_cell_id)
 
+            b_options = {
+                "parcel_type": parcel_type,
+                "cell_size": cell_size,
+                "sender_delivery": sender_delivery,
+                "recipient_delivery": recipient_delivery,
+                "client_user_id": client_user_id,
+                "recipient_user_id": recipient_user_id,
+                "description": description,
+                "pickup_type": pickup_type,
+                "delivery_type": delivery_type,
+            }
+            kind = 1
             payload = to_core_drive_payload(
-                start_address, dest_address, client_city, recipient_city,
-                kind=1,
+                start_address=start_address,
+                dest_address=dest_address,
+                start_city=client_city,
+                dest_city=recipient_city,
+                b_options=b_options,
+                kind=kind,
+                upper=None,
             )
+
             response = self.core_adapter.create_drive_order(payload, token, u_hash)
             core_order_id = response["data"]["b_id"]
-
-            # Извлекаем данные из ответа Core
-            core_data = from_core_order_response(response, core_order_id)
-            b_state = core_data["b_state"]
-            kind = 1
-            upper = core_data["upper"]
+            try:
+                core_data = from_core_order_response(response, core_order_id)
+                b_state = core_data["b_state"]
+                upper = core_data.get("upper")
+            except:
+                b_state = None
+                upper = None
 
             return True, core_order_id, b_state, kind, upper, ""
+
         except Exception as e:
             logger.exception("create_order_in_core failed")
-            return False, None, None, None, None, str(e)     
+            return False, None, None, None, None, str(e) 
 
     def create_suborder_in_core(
         self,
