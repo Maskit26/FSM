@@ -30,7 +30,7 @@ from models import (
     CellCreateRequest, CellResponse, ButtonResponse,
     ClientCreateOrderRequest, FsmEnqueueRequest,
     UserRegisterRequest, UserLoginRequest, LogoutRequest, 
-    CarType, CarCreateRequest,
+    CarType, CarCreateRequest, UserVerifyStateRequest,
 )
 
 # ======================
@@ -1528,4 +1528,46 @@ async def create_user_car(
         except Exception as e:
             session.rollback()
             logger.exception("Unexpected error")
+            raise HTTPException(status_code=500, detail="Internal server error")
+
+# =============== верификация пользователя =============
+@app.post("/api/users/verify-state", response_model=ApiResponse)
+async def verify_user_endpoint(
+    request: UserVerifyStateRequest,
+    db: DatabaseLayer = Depends(get_db),
+):
+    """Изменить u_check_state пользователя через Core API."""
+    with get_db_session(read_only=False) as session:
+        try:
+            user_mapping = UserMapping(core_adapter=core_adapter, db=db)
+            
+            result = user_mapping.verify_user(
+                session=session,
+                target_local_user_id=request.local_user_id,
+                new_check_state=request.u_check_state,
+                admin_local_user_id=request.admin_local_user_id,
+            )
+            session.commit()
+            
+            return ApiResponse(
+                success=True,
+                message=f"User verification updated to {request.u_check_state}",
+                data={"affected_fields": result.get("affected_fields")}
+            )
+            
+        except CoreValidationError as e:
+            session.rollback()
+            logger.warning("verify-state validation error: %s", e)
+            raise HTTPException(status_code=400, detail=str(e))
+        except (CoreAuthError, CoreMappingError) as e:
+            session.rollback()
+            logger.warning("verify-state auth/mapping error: %s", e)
+            raise HTTPException(status_code=401, detail=str(e))
+        except CoreAdapterError as e:
+            session.rollback()
+            logger.error("verify-state adapter error: %s", e)
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:
+            session.rollback()
+            logger.exception("verify-state unexpected error")
             raise HTTPException(status_code=500, detail="Internal server error")

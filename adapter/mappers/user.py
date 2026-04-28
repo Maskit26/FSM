@@ -109,7 +109,7 @@ def to_core_car_payload(
     custom_model_year: Optional[int] = None,
     custom_model_doors: Optional[int] = None,
 ) -> Dict[str, Any]:
-    cc_id = 5 if car_type == 'courier' else 6
+    cc_id = 4 if car_type == 'courier' else 5
     car_data = {
         "registration_plate": registration_plate,
         "seats": seats,
@@ -141,3 +141,20 @@ def to_core_car_payload(
     if details:
         car_data["details"] = details
     return car_data
+
+# =============== верификация пользователя =============
+def to_core_user_update_payload(u_check_state: int) -> Dict[str, Any]:
+    """Создать payload только с u_check_state."""
+    return {"u_check_state": u_check_state}
+
+def from_core_user_update_response(core_response: Dict[str, Any]) -> Dict[str, Any]:
+    """Распарсить ответ Core после обновления пользователя."""
+    if not isinstance(core_response, dict):
+        raise CoreMappingError(f"Unexpected response type: {type(core_response)}")
+    if core_response.get("status") != "success":
+        raise CoreValidationError(f"Core error: {core_response.get('message', 'Unknown')}")
+    data = core_response.get("data", {})
+    return {
+        "affected_fields": data.get("affected_fields", []),
+        "forbidden_fields": data.get("forbidden_fields", []),
+    }

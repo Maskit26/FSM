@@ -262,3 +262,44 @@ class CoreClient:
         except Exception as e:
             logger.error("Core create_car error: %s", e)
             raise CoreUnavailableError(str(e)) from e
+
+# =============== верификация пользователя =============
+    def update_user(
+        self,
+        core_u_id: int,
+        token: str,
+        u_hash: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """POST /api/v1/user/{u_id}/ с data=JSON.stringify(obj)."""
+        logger.debug("CoreClient.update_user: core_u_id=%s, payload_keys=%s", core_u_id, list(payload.keys()))
+        
+        endpoint = f"api/v1/user/{core_u_id}/"
+        form_payload = {
+            "token": token,
+            "u_hash": u_hash,
+            "data": json.dumps(payload, ensure_ascii=False),
+        }
+        
+        try:
+            resp = requests.post(
+                f"{self.base_url}{endpoint}",
+                data=form_payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=self.timeout
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info("Core update_user response: %s", json.dumps(result, indent=2))
+            return result
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                raise CoreAuthError("Invalid or expired token")
+            if e.response is not None and e.response.status_code == 400:
+                raise CoreValidationError(f"Bad request: {e.response.text}")
+            if e.response is not None and e.response.status_code >= 500:
+                raise CoreUnavailableError(f"Core server error: {e.response.status_code}")
+            raise
+        except Exception as e:
+            logger.error("Core update_user error: %s", e)
+            raise CoreUnavailableError(str(e)) from e

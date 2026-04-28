@@ -6,7 +6,11 @@ import logging
 import json
 from typing import Dict, Any, Tuple, Optional, List
 from .core_client import CoreClient
-from .mappers.user import to_core_register, from_core_register, to_core_login, from_core_login
+from .mappers.user import (
+    to_core_register, from_core_register, 
+    to_core_login, from_core_login, 
+    to_core_user_update_payload, from_core_user_update_response,
+)
 from .exceptions import CoreAdapterError, CoreMappingError, CoreAuthError, CoreValidationError, CoreUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -251,3 +255,30 @@ class CoreAdapter:
                 logger.info("create_car: extracted core_car_id=%s", core_car_id)
                 return int(core_car_id)
         raise CoreAdapterError("Core did not return car id")
+
+# =============== верификация пользователя =============
+    def update_user_verification(
+        self,
+        target_core_u_id: int,
+        admin_token: str,
+        admin_u_hash: str,
+        new_check_state: int,
+    ) -> Dict[str, Any]:
+        """Обновить u_check_state пользователя в Core. Запрос идёт от имени админа."""
+        logger.info("CoreAdapter.update_user_verification: target=%s, new_state=%s", target_core_u_id, new_check_state)
+        
+        payload = to_core_user_update_payload(new_check_state)
+        
+        try:
+            response = self.client.update_user(
+                core_u_id=target_core_u_id,
+                token=admin_token,
+                u_hash=admin_u_hash,
+                payload=payload,
+            )
+            return from_core_user_update_response(response)
+        except (CoreValidationError, CoreAuthError, CoreUnavailableError):
+            raise
+        except Exception as e:
+            logger.exception("update_user_verification failed")
+            raise CoreAdapterError(f"Core update_user_verification error: {e}") from e

@@ -243,3 +243,43 @@ class UserMapping:
         # 6. Обновить car_core_id
         self.db.update_car_core_id(session, local_user_id, core_car_id)
         return core_car_id, registration_plate
+
+# =============== верификация пользователя =============
+    def verify_user(
+        self,
+        session: Session,
+        target_local_user_id: int,
+        new_check_state: int,
+        admin_local_user_id: int,
+    ) -> Dict[str, Any]:
+        """Верификация пользователя: меняет u_check_state через Core API от имени админа."""
+        logger.info(
+            "UserMapping.verify_user: admin=%s, target=%s, new_state=%s",
+            admin_local_user_id, target_local_user_id, new_check_state
+        )
+        
+        # 1. Core ID целевого пользователя (кого меняем)
+        target_core_u_id = self.db.get_core_u_id_by_local_user_id(session, target_local_user_id)
+        if not target_core_u_id:
+            raise CoreMappingError(f"Target user {target_local_user_id} not mapped to Core")
+        
+        # 2. Core ID администратора (от чьего имени запрос)
+        admin_core_u_id = self.db.get_core_u_id_by_local_user_id(session, admin_local_user_id)
+        if not admin_core_u_id:
+            raise CoreAuthError(f"Admin user {admin_local_user_id} not mapped to Core")
+        
+        # 3. Токены АДМИНИСТРАТОРА
+        admin_token, admin_u_hash = self.db.get_user_core_tokens(session, admin_core_u_id)
+        if not admin_token or not admin_u_hash:
+            raise CoreAuthError(f"Missing tokens for admin core_u_id {admin_core_u_id}")
+        
+        # 4. Вызов Core
+        result = self.core_adapter.update_user_verification(
+            target_core_u_id=target_core_u_id,
+            admin_token=admin_token,
+            admin_u_hash=admin_u_hash,
+            new_check_state=new_check_state,
+        )
+        
+        logger.info("verify_user success: target_core_u_id=%s, affected=%s", target_core_u_id, result.get("affected_fields"))
+        return result

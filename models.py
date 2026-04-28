@@ -1,5 +1,5 @@
 from enum import Enum
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Any, Dict, Literal
 
 # ========== REQUEST MODELS ==========
@@ -206,3 +206,10 @@ class CarCreateRequest(BaseModel):
     custom_model_en: Optional[str] = None
     custom_model_year: Optional[int] = None
     custom_model_doors: Optional[int] = None
+
+# =============== верификация пользователя =============
+class UserVerifyStateRequest(BaseModel):
+    """Запрос на изменение статуса верификации."""
+    local_user_id: int = Field(..., description="ID пользователя, которому меняем статус")
+    admin_local_user_id: int = Field(..., description="ID администратора, от чьего имени запрос")
+    u_check_state: int = Field(..., ge=0, le=4, description="Новый статус (0-4)")
