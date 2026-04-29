@@ -213,7 +213,7 @@ class CoreAdapter:
             params["kind"] = str(kind)
         try:
             logger.info("get_drive_order request: endpoint=%s, params=%s", endpoint, {**params, "token": "***", "u_hash": "***"})
-            response = self.client.get_with_params(endpoint, params)
+            response = self.client.post_form_without_auth(endpoint, params)
             logger.info("get_drive_order response: status_code=%s, body=%s", response.get('code'), response)
             return response
         except CoreAdapterError:

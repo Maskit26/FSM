@@ -165,7 +165,7 @@ class OrderMapping:
     ) -> Tuple[bool, str]:
         logger.info("Отмена главного заказа в Core: local=%s, user=%s", local_order_id, user_id)
         try:
-            core_order_id = self.db.get_core_order_id_by_local_order_id(session, local_order_id)
+            core_order_id = self.db.get_main_core_order_id(session, local_order_id)
             if not core_order_id:
                 return False, "MAIN_ORDER_NOT_FOUND"
 
