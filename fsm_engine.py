@@ -101,6 +101,41 @@ def _handle_assign_executor(
             )
         # Определяем роль по плечу (leg)
         role = "courier1" if leg == "pickup" else "courier2"
+        order = db.get_order(session, entity_id)
+        if not order:
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error="ORDER_NOT_FOUND",
+                attempts_increment=1
+            )
+
+        cell_id = order.get("source_cell_id") if leg == "pickup" else order.get("dest_cell_id")
+        if not cell_id:
+            return FsmStepResult(
+                new_state="FAILED",
+                last_error=f"CELL_NOT_FOUND_FOR_LEG_{leg}",
+                attempts_increment=1
+            )
+
+        # Проверка города исполнителя и заказа
+        try:
+            courier_city = db.get_user_city(session, target_user_id)
+            order_city = db.get_locker_city_by_cell(session, cell_id)
+
+            if courier_city != order_city:
+                error_msg = (
+                    f"Курьер из города '{courier_city}' не может взять заказ "
+                    f"в городе '{order_city}' (плечо {leg})"
+                )
+                logger.error("[FSM] assign_executor(order): %s", error_msg)
+                return FsmStepResult(
+                    new_state="FAILED",
+                    last_error=f"Курьер из города '{courier_city}' не может взять заказ в городе '{order_city}' (плечо {leg})",
+                    attempts_increment=1
+                )
+        except DbLayerError as e:
+            logger.error("[FSM] assign_executor: ошибка получения городов: %s", e)
+            return FsmStepResult(new_state="FAILED", last_error=str(e), attempts_increment=1)
 
         # 1. Назначение/переназначение в Core
         ok, err = order_mapping.assign_executor_in_core(

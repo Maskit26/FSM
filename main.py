@@ -29,8 +29,8 @@ from models import (
     UserCreateRequest, LockerCreateRequest,
     CellCreateRequest, CellResponse, ButtonResponse,
     ClientCreateOrderRequest, FsmEnqueueRequest,
-    UserRegisterRequest, UserLoginRequest, LogoutRequest, 
-    CarType, CarCreateRequest, UserVerifyStateRequest,
+    UserRegisterRequest, UserLoginRequest, LogoutRequest,
+    CarCreateRequest, UserVerifyStateRequest,
 )
 
 # ======================
@@ -662,7 +662,9 @@ async def view_access_code(
                     elif user_role == "operator":
                         authorized_id = user_id
             else:  # delivery
-                if order["delivery_type"] == "self":
+                if user_role == "recipient":
+                    authorized_id = order.get("recipient_user_id")
+                elif order["delivery_type"] == "self":
                     # Получатель сам забирает
                     if user_role == "recipient":
                         authorized_id = order.get("recipient_user_id")
@@ -1482,16 +1484,29 @@ async def create_user_car(
 ):
     with get_db_session(read_only=False) as session:
         try:
+            # 1. Проверяем роль пользователя
+            role_name = db.get_user_role(session, local_user_id)
+            if not role_name:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            # 2. Маппим роль → car_type
+            if role_name == "driver":
+                car_type = "car"
+            elif role_name == "courier":
+                car_type = "courier"
+            else:
+                raise HTTPException(status_code=400, detail=f"Cannot create car for role '{role_name}'")
+
+            # 3. Ищем core_u_id
             core_u_id = db.get_core_u_id_by_local_user_id(session, local_user_id)
             if not core_u_id:
                 raise HTTPException(status_code=400, detail="User not mapped to Core")
 
             user_mapping = UserMapping(core_adapter=core_adapter, db=db)
-            # Важно: метод возвращает кортеж (core_car_id, registration_plate)
             core_car_id, registration_plate = user_mapping.create_car_for_core_user(
                 session=session,
                 core_u_id=core_u_id,
-                car_type=request.car_type.value,
+                car_type=car_type, 
                 seats=request.seats,
                 custom_body_ru=request.custom_body_ru,
                 custom_body_en=request.custom_body_en,
@@ -1506,7 +1521,7 @@ async def create_user_car(
             return {
                 "success": True,
                 "core_car_id": core_car_id,
-                "car_type": request.car_type.value,
+                "car_type": car_type,      
                 "registration_plate": registration_plate,
                 "message": "Car created successfully"
             }

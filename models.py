@@ -1,4 +1,3 @@
-from enum import Enum
 from pydantic import BaseModel, Field
 from typing import Optional, List, Any, Dict, Literal
 
@@ -191,12 +190,8 @@ class CoreOrderCreateResponse(BaseModel):
     data: Dict[str, Any]
 
 # ==================== Создание авто ================
-class CarType(str, Enum):
-    COURIER = "courier"
-    DRIVER = "driver"
 
 class CarCreateRequest(BaseModel):
-    car_type: CarType
     seats: int = 1
     custom_body_ru: Optional[str] = None
     custom_body_en: Optional[str] = None
