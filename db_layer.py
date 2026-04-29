@@ -3222,94 +3222,54 @@ class DatabaseLayer:
             return False, f"VALIDATION_ERROR: {e}"
 
 
-    # ==================== НОВЫЕ МЕТОДЫ: РАЗВИЛКИ FSM ====================
-
-    def start_order_flow(
-        self,
-        session: Session,
-        order_id: int,
-        user_id: int = 0,
-    ) -> None:
+    # ==================== Сервисные методы ====================
+    def get_leg_for_order(self, order: Dict[str, Any]) -> Optional[str]:
         """
-        Запустить FSM flow заказа на основе pickup_type (первая развилка).
-        
-        Проверяет pickup_type и делает первый FSM переход:
-        - pickup_type='self' → order_reserve_for_client_A_to_B
-        - pickup_type='courier' → order_reserve_for_courier_A_to_B
-        
-        Args:
-            session: активная сессия SQLAlchemy
-            order_id: ID заказа
-            user_id: ID курьера (если pickup_type='courier'), иначе 0
+        Возвращает плечо ('pickup' или 'delivery') на основе статуса заказа.
+        Опирается на полный список статусов из всех 4 сценариев.
+        Возвращает None, если статус не удалось однозначно определить.
         """
-        logger.debug("start_order_flow вызван: order_id=%s, user_id=%s", order_id, user_id)
-
-        order = self.get_order(session, order_id)
-        if not order:
-            logger.error("start_order_flow: заказ %s не найден", order_id)
-            raise DbLayerError(f"Заказ {order_id} не найден")
-
+        status = order.get("status", "")
+        
+        # Статусы, в которых работа идёт с ячейкой отправления (Постамат1)
+        pickup_statuses = {
+            "order_created",
+            "order_client_post1",
+            "order_courier1_assigned",
+            "order_courier_has_parcel",
+            "order_parcel_confirmed",
+            "order_parcel_submitted",
+            "order_picked_up_from_post1",
+        }
+        
+        # Статусы, в которых работа идёт с ячейкой назначения (Постамат2)
+        delivery_statuses = {
+            "order_in_transit_to_post2",
+            "order_arrived_at_post2",
+            "order_parcel_confirmed_post2",
+            "order_courier2_assigned",
+            "order_courier2_has_parcel",
+            "order_courier2_parcel_delivered",
+            "order_delivered_to_client",
+            "order_completed",
+        }
+        
+        if status in pickup_statuses:
+            return "pickup"
+        if status in delivery_statuses:
+            return "delivery"
+        
+        # Неизвестный статус – fallback на основе типа доставки
         pickup_type = order.get("pickup_type", "courier")
-
-        if pickup_type == "self":
-            action = "order_reserve_for_client_A_to_B"
-            logger.debug("Заказ %s: клиент сам несёт (pickup_type='self')", order_id)
-
-        elif pickup_type == "courier":
-            action = "order_reserve_for_courier_A_to_B"
-            logger.debug("Заказ %s: назначен курьер1 для забора (pickup_type='courier')", order_id)
-
-        else:
-            logger.error("start_order_flow: неизвестный pickup_type='%s' для заказа %s", pickup_type, order_id)
-            raise DbLayerError(f"Неизвестный pickup_type: {pickup_type}")
-
-        # Выполняем FSM переход
-        self.call_fsm_action(session, "order", order_id, action, user_id)
-        logger.info("FSM-действие '%s' выполнено для заказа %s", action, order_id)
-
-    def handle_parcel_confirmed(
-        self,
-        session: Session,
-        order_id: int,
-    ) -> None:
-        """
-        Обработка после попадания посылки в постамат2 (вторая развилка).
-
-        Ожидается, что заказ уже в состоянии order_parcel_confirmed_post2.
-        НЕ делает FSM-переходов, только логирует ветку по delivery_type.
-        """
-        logger.debug("handle_parcel_confirmed вызван: order_id=%s", order_id)
-
-        order = self.get_order(session, order_id)
-        if not order:
-            logger.error("handle_parcel_confirmed: заказ %s не найден", order_id)
-            raise DbLayerError(f"Заказ {order_id} не найден")
-
-        status = order.get("status")
-        if status != "order_parcel_confirmed_post2":
-            logger.error(
-                "handle_parcel_confirmed: некорректный статус '%s' для заказа %s, ожидается 'order_parcel_confirmed_post2'",
-                status, order_id
-            )
-            raise DbLayerError(
-                f"handle_parcel_confirmed: некорректный статус '{status}', "
-                "ожидается 'order_parcel_confirmed_post2'"
-            )
-
-        delivery_type = order.get("delivery_type", "self")
-
-        if delivery_type == "self":
-            logger.debug("Заказ %s: в постамате2, ожидает самовывоз получателем", order_id)
-            logger.debug("Доступное действие: order_pickup_poluchatel")
-
-        elif delivery_type == "courier":
-            logger.debug("Заказ %s: в постамате2, доступен на бирже для курьера2", order_id)
-            logger.debug("Доступное действие: order_assign_courier2_to_order")
-
-        else:
-            logger.error("handle_parcel_confirmed: неизвестный delivery_type='%s' для заказа %s", delivery_type, order_id)
-            raise DbLayerError(f"Неизвестный delivery_type: {delivery_type}")
-
+        delivery_type = order.get("delivery_type", "courier")
+        
+        # Если pickup_type=self и ещё не дошли до транзита – вероятно pickup
+        if pickup_type == "self" and status.startswith("order_client"):
+            return "pickup"
+        # Для остальных непонятных статусов возвращаем None
+        logger.warning("get_leg_for_order: неизвестный статус '%s', не удалось определить плечо", status)
+        return None
+    
     def get_all_cities(self, session: Session) -> List[str]:
         """
         Получить список уникальных городов из таблицы users (не пустые).
@@ -3326,7 +3286,7 @@ class DatabaseLayer:
             logger.error("get_all_cities завершился с ошибкой: %s", e)
             raise DbLayerError(f"Failed to fetch cities: {e}") from e
 
-    # ==================== НОВЫЕ МЕТОДЫ: БИРЖИ ====================
+    # ==================== БИРЖИ ====================
 
     def get_available_orders_for_pickup(
         self,

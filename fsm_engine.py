@@ -914,18 +914,53 @@ def _handle_report_error(
     metadata = instance.get("metadata", {})
     
     error_type = metadata.get("error_type")
-    order_id = metadata.get("order_id")
     trip_id = metadata.get("trip_id")
     
-    logger.info(f"[FSM] report_error: role={user_role}, type={error_type}, entity={entity_type}:{entity_id}")
+    logger.info("[FSM] report_error: role=%s, type=%s, entity=%s:%s", user_role, error_type, entity_type, entity_id)
 
     if not error_type:
-        return FsmStepResult(new_state="FAILED", last_error="MISSING_ERROR_TYPE_IN_METADATA")   
-   
-    if entity_type != "trip" and not order_id:
-        return FsmStepResult(new_state="FAILED", last_error="MISSING_ORDER_ID_IN_METADATA")
+        return FsmStepResult(new_state="FAILED", last_error="MISSING_ERROR_TYPE_IN_METADATA")
 
-    # Выбираем actions по роли
+    # Определяем order_id и cell_id в зависимости от типа сущности
+    order_id = metadata.get("order_id")
+    cell_id = metadata.get("cell_id")
+
+    # 1. Обработка по типу сущности
+    if entity_type == "trip":
+        # Для рейса trip_id обязателен, если не передан явно, берём из entity_id
+        if not trip_id:
+            trip_id = entity_id
+        # Для рейсов order_id и cell_id не требуются (может быть связано с рейсом в целом)
+        order_id = None
+        cell_id = None
+
+    elif entity_type == "locker":
+        # Для ячейки cell_id = entity_id, order_id опционален (ошибка может быть связана только с ячейкой)
+        if not cell_id:
+            cell_id = entity_id
+
+    elif entity_type == "order":
+        # order_id по умолчанию = entity_id
+        if not order_id:
+            order_id = entity_id
+        
+        # Если cell_id не передан, вычисляем его через get_leg_for_order
+        if not cell_id:
+            order = db.get_order(session, order_id)
+            if not order:
+                return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
+            
+            leg = db.get_leg_for_order(order)
+            if not leg:
+                return FsmStepResult(new_state="FAILED", last_error="UNKNOWN_LEG_FOR_STATUS")
+            
+            cell_id = order["source_cell_id"] if leg == "pickup" else order["dest_cell_id"]
+            if not cell_id:
+                return FsmStepResult(new_state="FAILED", last_error="CELL_NOT_FOUND_FOR_ORDER")
+    else:
+        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ENTITY_TYPE: {entity_type}")
+
+    # 2. Выбор actions по роли
     if user_role == "driver":
         actions = ctx["driver_actions"]
     elif user_role == "courier":
@@ -937,9 +972,11 @@ def _handle_report_error(
     elif user_role == "operator":
         actions = ctx["operator_actions"]
     else:
-        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ROLE_{user_role}")    
+        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ROLE_{user_role}")
+
+    # 3. Вызов конкретного обработчика ошибок
     success, error = actions.report_error(
-        session, entity_id, order_id, instance["requested_by_user_id"], error_type, trip_id
+        session, cell_id, order_id, instance["requested_by_user_id"], error_type, trip_id
     )
     
     if not success:
