@@ -55,6 +55,31 @@ def _handle_order_creation_pending(db, session, ctx, instance):
     if not ok:
         return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
 
+    # === Создаём начальные подзаказы для курьеров ===
+    try:
+        req = db.get_order_request(session, request_id)
+        if req:
+            sender_delivery = req.get("sender_delivery", "self")
+            recipient_delivery = req.get("recipient_delivery", "self")
+            pickup_type = "self" if sender_delivery == "self" else "courier"
+            delivery_type = "self" if recipient_delivery == "self" else "courier"
+
+            if pickup_type == "courier":
+                ok_sub, _, err_sub = order_mapping.create_suborder_in_core(
+                    session, local_order_id, role="courier1", main_core_id=core_order_id
+                )
+                if not ok_sub:
+                    logger.warning("Ошибка создания подзаказа курьера1: %s", err_sub)
+
+            if delivery_type == "courier":
+                ok_sub, _, err_sub = order_mapping.create_suborder_in_core(
+                    session, local_order_id, role="courier2", main_core_id=core_order_id
+                )
+                if not ok_sub:
+                    logger.warning("Ошибка создания подзаказа курьера2: %s", err_sub)
+    except Exception as e:
+        logger.exception("Ошибка создания начальных подзаказов: %s", e)
+
     return FsmStepResult(new_state="COMPLETED", payload={"order_id": local_order_id})
 
 
@@ -640,7 +665,6 @@ def _handle_start_trip(
     ctx: Dict[str, Any],
     instance: Dict[str, Any]
 ) -> FsmStepResult:
-    entity_type = "direction"
     direction_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
     user_role = instance["requested_user_role"]
@@ -651,32 +675,44 @@ def _handle_start_trip(
     if user_role != "driver":
         return FsmStepResult(new_state="FAILED", last_error=f"NOT_ALLOWED_FOR_{user_role}")
 
-    # 1. Валидация готовности заказов
-    can_start, blocked_ids, order_ids, error = db.validate_and_get_orders_for_direction_start(
-        session, direction_id, user_id
-    )
-    if not can_start:
-        return FsmStepResult(new_state="FAILED", last_error=error)
+    # 1. Получаем города этого направления
+    from_city, to_city = db.get_direction_cities(session, direction_id)
 
-    # 2. Создание рейса и FSM-переходы (получаем trip_id)
-    success, trip_id, error = ctx["driver_actions"].start_trip(session, direction_id, user_id, order_ids)
+    # 2. Все направления с таким же маршрутом
+    all_direction_ids = db.get_directions_by_cities(session, from_city, to_city)
+
+    # 3. Собираем фактически забранные заказы из каждого направления
+    all_order_ids = set()
+    for did in all_direction_ids:
+        picked = db.get_picked_orders_by_driver_and_direction(session, did, user_id)
+        all_order_ids.update(picked)
+
+    order_ids = list(all_order_ids)
+    if not order_ids:
+        return FsmStepResult(new_state="FAILED", last_error="NO_PICKED_ORDERS_FOR_ROUTE")
+
+    # 4. Создание рейса и FSM-переходы
+    success, trip_id, error = ctx["driver_actions"].start_trip(
+        session, direction_id, user_id, order_ids
+    )
     if not success:
         return FsmStepResult(new_state="FAILED", last_error=error)
 
-    # 3. Массовое назначение водителя на все заказы рейса в Core
+    # 5. Назначение водителя на все подзаказы в Core
     order_mapping = ctx.get("order_mapping")
     if order_mapping:
-        ok, err = order_mapping.reassign_driver_for_trip(
-            session,
-            trip_id=trip_id,
-            order_ids=order_ids,
-            new_driver_local_id=user_id,
-            role="driver"
-        )
-        if not ok:
-            return FsmStepResult(new_state="FAILED", last_error=f"DRIVER_SUBORDER_FAILED: {err}")
+        for order_id in order_ids:
+            ok, err = order_mapping.assign_executor_in_core(
+                session,
+                local_order_id=order_id,
+                performer_local_user_id=user_id,
+                role="driver"
+            )
+            if not ok:
+                logger.error("[FSM] assign_executor_in_core failed for order %s: %s", order_id, err)
+                return FsmStepResult(new_state="FAILED", last_error=f"DRIVER_SUBORDER_FAILED: {err}")
 
-    logger.info("[FSM] start_trip COMPLETED: direction_id=%s, orders=%d", direction_id, len(order_ids))
+    logger.info("[FSM] start_trip COMPLETED: trip_id=%s, orders=%d", trip_id, len(order_ids))
     return FsmStepResult(new_state="COMPLETED")
 
 def _handle_arrive_at_destination(
@@ -1161,6 +1197,21 @@ def _handle_direction_complete_loading(
     if not success:
         return FsmStepResult(new_state="FAILED", last_error=msg, attempts_increment=1)
 
+    # === создаём подзаказы для водителя для всех заказов, попавших в погрузку ===
+    try:
+        order_ids = db.get_picked_orders_by_driver_and_direction(
+            session, direction_id, driver_user_id
+        )
+        order_mapping = ctx["order_mapping"]
+        for order_id in order_ids:
+            main_core_id = db.get_main_core_order_id(session, order_id)
+            if not main_core_id:
+                continue
+            order_mapping.create_suborder_in_core(
+                session, order_id, role="driver", main_core_id=main_core_id
+            )
+    except Exception as e:
+        logger.exception("Error creating driver suborders")
     logger.info("[FSM] direction_complete_loading COMPLETED: direction_id=%s", direction_id)
     return FsmStepResult(new_state="COMPLETED")
 

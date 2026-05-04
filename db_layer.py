@@ -3897,6 +3897,39 @@ class DatabaseLayer:
             logger.error("get_driver_active_reservations завершился с ошибкой: %s", e)
             raise DbLayerError("get_driver_active_reservations failed: %s" % e) from e
 
+    def get_direction_cities(self, session: Session, direction_id: int) -> Tuple[str, str]:
+        """Возвращает from_city, to_city для направления."""
+        logger.debug("get_direction_cities: direction_id=%s", direction_id)
+        try:
+            row = session.execute(
+                text("SELECT from_city, to_city FROM directions WHERE id = :did"),
+                {"did": direction_id}
+            ).fetchone()
+            if not row:
+                raise DbLayerError(f"Direction {direction_id} not found")
+            logger.debug("get_direction_cities: direction_id=%s → (%s, %s)", direction_id, row[0], row[1])
+            return row[0], row[1]
+        except DbLayerError:
+            raise
+        except Exception as e:
+            logger.error("get_direction_cities failed for direction_id=%s: %s", direction_id, e)
+            raise DbLayerError(f"get_direction_cities failed: {e}") from e
+
+    def get_directions_by_cities(self, session: Session, from_city: str, to_city: str) -> List[int]:
+        """Возвращает ID всех направлений с указанными городами."""
+        logger.debug("get_directions_by_cities: from=%s, to=%s", from_city, to_city)
+        try:
+            rows = session.execute(
+                text("SELECT id FROM directions WHERE from_city = :fc AND to_city = :tc"),
+                {"fc": from_city, "tc": to_city}
+            ).fetchall()
+            ids = [row[0] for row in rows]
+            logger.debug("get_directions_by_cities: found %d directions", len(ids))
+            return ids
+        except Exception as e:
+            logger.error("get_directions_by_cities failed: %s", e)
+            raise DbLayerError(f"get_directions_by_cities failed: {e}") from e
+
     def get_picked_orders_by_driver_and_direction(
         self,
         session: Session,

@@ -97,15 +97,9 @@ class OrderMapping:
         session: Session,
         local_order_id: int,
         role: str,
-        performer_local_user_id: int,
         main_core_id: int,
     ) -> Tuple[bool, Optional[int], str]:
-        logger.info(
-            "Создание подзаказа в Core: local=%s, role=%s, main=%s",
-            local_order_id,
-            role,
-            main_core_id,
-        )
+        logger.info("Создание подзаказа в Core: local=%s, role=%s, main=%s", local_order_id, role, main_core_id)
         try:
             order = self.db.get_order(session, local_order_id)
             if not order:
@@ -130,25 +124,24 @@ class OrderMapping:
 
             core_sub_id = response["data"]["b_id"]
 
-            car_core_id = self.db.get_car_core_id(session, performer_local_user_id)
-            if not car_core_id:
-                return False, None, "У_ИСПОЛНИТЕЛЯ_НЕТ_МАШИНЫ"
+            try:
+                parsed = from_core_order_response(response, core_sub_id)
+                b_state = parsed["b_state"]
+            except Exception:
+                b_state = 1
 
-            # Назначение и маппинг
-            success, msg = self.assign_performer_to_suborder(
-                session,
-                core_order_id=core_sub_id,
-                performer_local_user_id=performer_local_user_id,
-                car_core_id=car_core_id,
+            self.db.save_core_order_mapping(
+                session=session,
                 local_order_id=local_order_id,
-                main_core_id=main_core_id,
+                core_order_id=core_sub_id,
                 role=role,
                 kind=kind,
+                upper=main_core_id,
+                b_state=b_state,
+                client_local_user_id=None,
+                performer_local_user_id=None,
             )
-            if not success:
-                return False, None, msg
-
-            logger.info("Подзаказ успешно создан: core_sub_id=%s", core_sub_id)
+            logger.info("Подзаказ создан и замаплен: core_sub_id=%s", core_sub_id)
             return True, core_sub_id, ""
 
         except Exception as e:
@@ -267,11 +260,10 @@ class OrderMapping:
                 session, local_order_id, role, main_core_id
             )
 
-            # Проверяем состояние существующего подзаказа
             can_reuse = False
             if existing_core_id:
                 current_state = self.db.get_core_order_b_state(session, existing_core_id)
-                if current_state == 1: 
+                if current_state == 1:
                     can_reuse = True
                     logger.info("Найден подзаказ core_id=%s в b_state=1, будет переназначен", existing_core_id)
                 else:
@@ -281,29 +273,31 @@ class OrderMapping:
 
             if can_reuse:
                 core_order_id = existing_core_id
-                car_core_id = self.db.get_car_core_id(session, performer_local_user_id)
-                if not car_core_id:
-                    return False, "У_ИСПОЛНИТЕЛЯ_НЕТ_МАШИНЫ"
-
-                success, msg = self.assign_performer_to_suborder(
-                    session,
-                    core_order_id=core_order_id,
-                    performer_local_user_id=performer_local_user_id,
-                    car_core_id=car_core_id,
-                    local_order_id=local_order_id,
-                    main_core_id=main_core_id,
-                    role=role,
-                    kind=kind,
-                )
-                if not success:
-                    return False, msg
             else:
-                # Создаём новый подзаказ (назначение произойдёт внутри)
+                # Создаём новый подзаказ (без исполнителя)
                 success, core_order_id, err = self.create_suborder_in_core(
-                    session, local_order_id, role, performer_local_user_id, main_core_id
+                    session, local_order_id, role, main_core_id
                 )
                 if not success:
                     return False, f"ОШИБКА_СОЗДАНИЯ_ПОДЗАКАЗА: {err}"
+
+            # Назначаем исполнителя на подзаказ (новый или переиспользуемый)
+            car_core_id = self.db.get_car_core_id(session, performer_local_user_id)
+            if not car_core_id:
+                return False, "У_ИСПОЛНИТЕЛЯ_НЕТ_МАШИНЫ"
+
+            success, msg = self.assign_performer_to_suborder(
+                session,
+                core_order_id=core_order_id,
+                performer_local_user_id=performer_local_user_id,
+                car_core_id=car_core_id,
+                local_order_id=local_order_id,
+                main_core_id=main_core_id,
+                role=role,
+                kind=kind,
+            )
+            if not success:
+                return False, msg
 
             logger.info("Назначение исполнителя выполнено, core_order_id=%s", core_order_id)
             return True, ""
