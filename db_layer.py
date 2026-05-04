@@ -3269,6 +3269,110 @@ class DatabaseLayer:
         # Для остальных непонятных статусов возвращаем None
         logger.warning("get_leg_for_order: неизвестный статус '%s', не удалось определить плечо", status)
         return None
+
+    def check_user_access(
+        self,
+        session: Session,
+        user_id: int,
+        user_role: str,
+        entity_type: str,
+        entity_id: int,
+        leg: Optional[str] = None,
+        skip_geo_check: bool = False
+    ) -> Tuple[bool, str]:
+        """
+        Централизованная проверка:
+        - Авторизации (владелец, исполнитель, динамический получатель)
+        - Гео-привязки (город пользователя == город ячейки/направления)
+        - Блокировка кросс-города для обычных ролей
+        """
+        # 1. Базовые данные
+        user = self.get_user_by_id(session, user_id)
+        if not user:
+            return False, "USER_NOT_FOUND"
+
+        user_city = (user.get("city") or "").strip()
+        is_operator = user_role in ("operator", "administrator")
+        is_system = user_role == "system"
+
+        # 2. Определяем целевой город (только для гео-проверки)
+        target_city = ""
+        if entity_type == "order":
+            order = self.get_order(session, entity_id)
+            if not order:
+                return False, "ORDER_NOT_FOUND"
+            if not leg:
+                return False, "LEG_REQUIRED_FOR_ORDER"
+            cell_id = order.get("source_cell_id") if leg == "pickup" else order.get("dest_cell_id")
+            if not cell_id:
+                return False, "CELL_ID_MISSING"
+            target_city = self.get_locker_city_by_cell(session, cell_id)  # используем готовый метод
+        elif entity_type == "trip":
+            trip = self.get_trip(session, entity_id)
+            if not trip:
+                return False, "TRIP_NOT_FOUND"
+            target_city = trip.get("from_city", "").strip()
+        elif entity_type == "locker":
+            target_city = self.get_locker_city_by_cell(session, entity_id)
+        else:
+            return False, "UNSUPPORTED_ENTITY_TYPE"
+
+        # 3. Гео-проверка (пропускаем только если явно skip_geo_check или system)
+        if not is_system and not skip_geo_check:
+            if user_city and target_city and user_city != target_city:
+                return False, f"CITY_MISMATCH: user_city='{user_city}', entity_city='{target_city}'"
+
+        # 4. Проверка прав на сущность (авторизация)
+        # Оператор/система проходят всегда
+        if is_operator or is_system:
+            return True, ""
+
+        if entity_type == "order":
+            order = self.get_order(session, entity_id)  # уже есть, но для ясности
+            stage = self.get_stage_order(session, entity_id, leg)
+
+            # === ДИНАМИЧЕСКИЙ ПОЛУЧАТЕЛЬ ===
+            # Если пользователь является recipient_user_id этого заказа, для leg=='delivery' даём доступ
+            if leg == "delivery" and order.get("recipient_user_id") == user_id:
+                return True, ""  # теперь пользователь временно действует как получатель
+
+            # Обычные проверки
+            if leg == "pickup":
+                if order.get("pickup_type") == "self":
+                    if user_role == "client" and order.get("client_user_id") == user_id:
+                        return True, ""
+                else:  # courier
+                    if user_role == "courier" and stage and stage.get("courier_user_id") == user_id:
+                        return True, ""
+                    if user_role == "driver" and stage and stage.get("reserved_by_driver_id") == user_id:
+                        return True, ""
+
+            elif leg == "delivery":
+                if order.get("delivery_type") == "self":
+                    # Уже обработано выше динамическим получателем, но если роль не прошла – отказ
+                    pass  # все нужные проверки уже сделаны
+                else:  # courier
+                    if user_role == "courier" and stage and stage.get("courier_user_id") == user_id:
+                        return True, ""
+                    if user_role == "driver":
+                        if stage and stage.get("trip_id"):
+                            trip = self.get_trip(session, stage["trip_id"])
+                            if trip and trip.get("driver_user_id") == user_id:
+                                return True, ""
+
+            return False, "USER_NOT_AUTHORIZED"
+
+        elif entity_type == "trip":
+            trip = self.get_trip(session, entity_id)
+            if user_role == "driver" and trip.get("driver_user_id") == user_id:
+                return True, ""
+            return False, "USER_NOT_AUTHORIZED"
+
+        elif entity_type == "locker":
+            # Прямой доступ к ячейке не разрешён – только через заказ/рейс
+            return False, "DIRECT_LOCKER_ACCESS_DENIED"
+
+        return False, "UNKNOWN_AUTH_FAILURE"
     
     def get_all_cities(self, session: Session) -> List[str]:
         """
@@ -6107,6 +6211,34 @@ class DatabaseLayer:
             text("UPDATE core_order_mapping SET performer_local_user_id = NULL WHERE core_order_id = :cid"),
             {"cid": core_order_id}
         )
+
+    def get_executor_id_for_order(self, session: Session, order_id: int, leg: str) -> Optional[int]:
+        """Возвращает performer_local_user_id для заказа по плечу."""
+        row = session.execute(
+            text("""
+                SELECT courier_user_id, reserved_by_driver_id
+                FROM stage_orders
+                WHERE order_id = :oid AND leg = :leg
+            """),
+            {"oid": order_id, "leg": leg}
+        ).fetchone()
+        if row:
+            if leg in ("pickup", "delivery") and row[1]:   # водитель
+                return row[1]
+            if row[0]:   # курьер
+                return row[0]
+
+        # Fallback: поиск в маппинге
+        role_pattern = "courier%" if leg in ("pickup", "delivery") else "driver"
+        row = session.execute(
+            text("""
+                SELECT performer_local_user_id FROM core_order_mapping
+                WHERE local_order_id = :oid AND role LIKE :role
+                LIMIT 1
+            """),
+            {"oid": order_id, "role": role_pattern}
+        ).scalar()
+        return row
 
 # ===================== Создание авто ========================
     def get_car_core_id(self, session: Session, local_user_id: int) -> Optional[int]:

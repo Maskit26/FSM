@@ -915,68 +915,117 @@ def _handle_report_error(
     
     error_type = metadata.get("error_type")
     trip_id = metadata.get("trip_id")
+    order_mapping = ctx.get("order_mapping")
     
     logger.info("[FSM] report_error: role=%s, type=%s, entity=%s:%s", user_role, error_type, entity_type, entity_id)
 
     if not error_type:
         return FsmStepResult(new_state="FAILED", last_error="MISSING_ERROR_TYPE_IN_METADATA")
 
-    # Определяем order_id и cell_id в зависимости от типа сущности
+    # === Шаг 1. Определяем order_id, cell_id, leg ===
     order_id = metadata.get("order_id")
     cell_id = metadata.get("cell_id")
+    leg = None 
 
-    # 1. Обработка по типу сущности
     if entity_type == "trip":
-        # Для рейса trip_id обязателен, если не передан явно, берём из entity_id
         if not trip_id:
             trip_id = entity_id
-        # Для рейсов order_id и cell_id не требуются (может быть связано с рейсом в целом)
         order_id = None
         cell_id = None
 
     elif entity_type == "locker":
-        # Для ячейки cell_id = entity_id, order_id опционален (ошибка может быть связана только с ячейкой)
         if not cell_id:
-            cell_id = entity_id
+            cell_id = entity_id        
+        if not order_id:
+            order_id = db.get_order_id_by_cell_id(session, cell_id)        
+        if order_id and not leg:
+            order = db.get_order(session, order_id)
+            if order:
+                if cell_id == order.get("source_cell_id"):
+                    leg = "pickup"
+                elif cell_id == order.get("dest_cell_id"):
+                    leg = "delivery"
+                else:
+                    leg = None
 
     elif entity_type == "order":
-        # order_id по умолчанию = entity_id
         if not order_id:
             order_id = entity_id
+        order = db.get_order(session, order_id)
+        if not order:
+            return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
         
-        # Если cell_id не передан, вычисляем его через get_leg_for_order
-        if not cell_id:
-            order = db.get_order(session, order_id)
-            if not order:
-                return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
-            
+        if not leg:
             leg = db.get_leg_for_order(order)
             if not leg:
                 return FsmStepResult(new_state="FAILED", last_error="UNKNOWN_LEG_FOR_STATUS")
-            
+        
+        if not cell_id:
             cell_id = order["source_cell_id"] if leg == "pickup" else order["dest_cell_id"]
             if not cell_id:
                 return FsmStepResult(new_state="FAILED", last_error="CELL_NOT_FOUND_FOR_ORDER")
     else:
         return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ENTITY_TYPE: {entity_type}")
 
-    # 2. Выбор actions по роли
-    if user_role == "driver":
+    # === Шаг 2. Централизованная проверка доступа ===
+    user_id = instance["requested_by_user_id"]
+
+    # Водителю для своих заказов/ячеек отключаем гео-контроль
+    skip_geo = (user_role == "driver" and entity_type in ("order", "locker", "trip"))
+    if order_id:
+        # Проверяем доступ к заказу
+        ok, auth_err = db.check_user_access(
+            session,
+            user_id=user_id,
+            user_role=user_role,
+            entity_type="order",
+            entity_id=order_id,
+            leg=leg,
+            skip_geo_check=skip_geo
+        )
+    elif entity_type == "trip":
+        ok, auth_err = db.check_user_access(
+            session,
+            user_id=user_id,
+            user_role=user_role,
+            entity_type="trip",
+            entity_id=entity_id,
+            leg=None,
+            skip_geo_check=skip_geo
+        )
+    else:
+        if user_role in ("operator", "administrator", "system"):
+            ok, auth_err = True, ""
+        else:
+            ok, auth_err = False, "DIRECT_LOCKER_ACCESS_DENIED"
+
+    if not ok:
+        return FsmStepResult(new_state="FAILED", last_error=f"AUTH_FAILED: {auth_err}")
+
+    # === Шаг 3. Определяем эффективную роль (динамический получатель) ===
+    effective_role = user_role
+    if entity_type == "order" and leg == "delivery":
+        order = db.get_order(session, order_id)
+        if order and order.get("recipient_user_id") == user_id:
+            effective_role = "recipient"
+
+    # === Шаг 4. Выбираем actions по эффективной роли ===
+    if effective_role == "driver":
         actions = ctx["driver_actions"]
-    elif user_role == "courier":
+    elif effective_role == "courier":
         actions = ctx["courier_actions"]
-    elif user_role == "client":
+    elif effective_role == "client":
         actions = ctx["client_actions"]
-    elif user_role == "recipient":
+    elif effective_role == "recipient":
         actions = ctx["recipient_actions"]
-    elif user_role == "operator":
+    elif effective_role == "operator":
         actions = ctx["operator_actions"]
     else:
-        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ROLE_{user_role}")
+        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ROLE_{effective_role}")
 
-    # 3. Вызов конкретного обработчика ошибок
+    # === Шаг 5. Вызов конкретного обработчика ошибок ===
     success, error = actions.report_error(
-        session, cell_id, order_id, instance["requested_by_user_id"], error_type, trip_id
+        session, cell_id, order_id, user_id, error_type, trip_id
     )
     
     if not success:

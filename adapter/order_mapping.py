@@ -202,6 +202,7 @@ class OrderMapping:
         local_order_id: int,
         performer_local_user_id: int,
         user_id: int,  
+        reason: Optional[str] = None
     ) -> Tuple[bool, str]:
         logger.info(
             "Снятие исполнителя с подзаказа: local=%s, performer=%s, initiator=%s",
@@ -231,7 +232,7 @@ class OrderMapping:
                 return False, "MISSING_PERFORMER_TOKENS"
 
             # 4. Отменить используем токены исполнителя
-            self.core_adapter.cancel_drive_order(core_order_id, token, u_hash)
+            self.core_adapter.cancel_drive_order(core_order_id, token, u_hash, reason=reason)
 
             # 5. Обновить маппинг
             self.db.update_core_order_b_state(session, core_order_id, 1)
