@@ -238,7 +238,7 @@ class OrderMapping:
             logger.exception("Ошибка при снятии исполнителя с подзаказа в Core")
             return False, f"EXCEPTION: {e}"
 
-# ======================= Назначение курьера ==================
+# ======================= Назначение исполнителя ==================
     def assign_executor_in_core(
         self,
         session: Session,
@@ -378,72 +378,6 @@ class OrderMapping:
             return False, f"ОШИБКА_СОХРАНЕНИЯ_МАППИНГА: {e}"
 
         logger.info("Исполнитель успешно назначен, b_state=%s", new_b_state)
-        return True, ""
-
-# ===================== Переназначение водителя =================        
-    def reassign_driver_for_trip(
-        self,
-        session: Session,
-        trip_id: int,
-        order_ids: List[int],
-        new_driver_local_id: int,
-        role: str
-    ) -> Tuple[bool, str]:
-        logger.info(
-            "Массовое назначение/переназначение для рейса %s, заказов: %s, новый исполнитель: %s, роль: %s",
-            trip_id, order_ids, new_driver_local_id, role
-        )
-        if not order_ids:
-            return False, "Нет заказов в рейсе"
-
-        car_core_id = self.db.get_car_core_id(session, new_driver_local_id)
-        if not car_core_id:
-            return False, "У нового водителя нет машины в Core"
-
-        errors = []
-        kind = 2 if role == "driver" else 3
-
-        for order_id in order_ids:
-            try:
-                main_core_id = self.db.get_main_core_order_id(session, order_id)
-                if not main_core_id:
-                    errors.append(f"Заказ {order_id}: не найден главный Core-заказ")
-                    continue
-
-                existing_core_id = self.db.get_suborder_core_id(
-                    session, order_id, role, main_core_id
-                )
-
-                if existing_core_id:
-                    # Переназначение в существующем подзаказе
-                    ok, msg = self.assign_performer_to_suborder(
-                        session,
-                        core_order_id=existing_core_id,
-                        performer_local_user_id=new_driver_local_id,
-                        car_core_id=car_core_id,
-                        local_order_id=order_id,
-                        main_core_id=main_core_id,
-                        role=role,
-                        kind=kind,
-                    )
-                    if not ok:
-                        errors.append(f"Заказ {order_id}: {msg}")
-                else:
-                    # Создание нового подзаказа + назначение
-                    success, _, msg = self.create_suborder_in_core(
-                        session,
-                        local_order_id=order_id,
-                        role=role,
-                        performer_local_user_id=new_driver_local_id,
-                        main_core_id=main_core_id
-                    )
-                    if not success:
-                        errors.append(f"Заказ {order_id}: {msg}")
-            except Exception as e:
-                errors.append(f"Заказ {order_id}: исключение {e}")
-
-        if errors:
-            return False, "; ".join(errors)
         return True, ""
 
 # ======================= Завершение заказа ===================

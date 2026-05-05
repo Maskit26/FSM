@@ -193,17 +193,17 @@ def _handle_assign_executor(
                 attempts_increment=1
             )
 
-        # 1. Массовое назначение/переназначение в Core для всех заказов рейса
-        ok, err = order_mapping.reassign_driver_for_trip(
-            session,
-            trip_id=entity_id,
-            order_ids=order_ids,
-            new_driver_local_id=target_user_id,
-            role="driver"
-        )
-        if not ok:
-            logger.error("[FSM] assign_executor(trip): Core назначение не удалось: %s", err)
-            return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
+        # 1. Назначение/переназначение в Core для каждого заказа рейса
+        for order_id in order_ids:
+            ok, err = order_mapping.assign_executor_in_core(
+                session,
+                local_order_id=order_id,
+                performer_local_user_id=target_user_id,
+                role="driver"
+            )
+            if not ok:
+                logger.error("[FSM] assign_executor(trip): не удалось назначить на заказ %s: %s", order_id, err)
+                return FsmStepResult(new_state="FAILED", last_error=err, attempts_increment=1)
 
         # 2. Локальное назначение водителя на рейс и обновление stage_orders
         success = actions.reassign_driver_on_trip(
