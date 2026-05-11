@@ -36,7 +36,6 @@ from models import (
 # ======================
 # ЛОГГЕР
 # ======================
-import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -551,89 +550,37 @@ async def view_access_code(
     user_id: int = Query(...),
     db: DatabaseLayer = Depends(get_db)
 ):
-    """
-    Получить PIN-код для доступа к ячейке (кнопка 'Посмотреть код').
-    Для теста. Удалить на продакшене
-    """
     with get_db_session(read_only=True) as session:
         try:
-            # Проверка авторизации
             order = db.get_order(session, order_id)
             if not order:
                 raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND")
-            
-            # Получаем роль пользователя
+
             user_role = db.get_user_role(session, user_id)
-            
-            # Получаем stage_order
-            stage = db.get_stage_order(session, order_id, leg)
-            
-            authorized_id = None
-            
-            if leg == "pickup":
-                if order["pickup_type"] == "self":
-                    # Клиент сам несёт
-                    if user_role == "client":
-                        authorized_id = order["client_user_id"]
-                    # ✅ ПРОВЕРКА ВОДИТЕЛЯ
-                    elif user_role == "driver":
-                        if stage and stage.get("reserved_by_driver_id") == user_id:
-                            authorized_id = user_id
-                    elif user_role == "operator":
-                        authorized_id = user_id
-                else:
-                    # Курьер забирает
-                    if user_role == "courier":
-                        authorized_id = stage["courier_user_id"] if stage else None
-                    # ✅ ПРОВЕРКА ВОДИТЕЛЯ
-                    elif user_role == "driver":
-                        if stage and stage.get("reserved_by_driver_id") == user_id:
-                            authorized_id = user_id
-                    elif user_role == "operator":
-                        authorized_id = user_id
-            else:  # delivery
-                if user_role == "recipient":
-                    authorized_id = order.get("recipient_user_id")
-                elif order["delivery_type"] == "self":
-                    # Получатель сам забирает
-                    if user_role == "recipient":
-                        authorized_id = order.get("recipient_user_id")
-                    # ✅ ПРОВЕРКА ВОДИТЕЛЯ
-                    elif user_role == "driver":
-                        if stage and stage.get("trip_id"):
-                            trip = db.get_trip(session, stage["trip_id"])
-                            if trip and trip["driver_user_id"] == user_id:
-                                authorized_id = user_id
-                    elif user_role == "operator":
-                        authorized_id = user_id
-                else:
-                    # Курьер доставляет
-                    if user_role == "courier":
-                        authorized_id = stage["courier_user_id"] if stage else None
-                    # ✅ ПРОВЕРКА ВОДИТЕЛЯ
-                    elif user_role == "driver":
-                        if stage and stage.get("trip_id"):
-                            trip = db.get_trip(session, stage["trip_id"])
-                            if trip and trip["driver_user_id"] == user_id:
-                                authorized_id = user_id    
-                    elif user_role == "operator":
-                        authorized_id = user_id                
-            
-            if authorized_id != user_id:
-                raise HTTPException(status_code=403, detail="USER_NOT_AUTHORIZED")
-            
+            skip_geo = (user_role == "driver")
+
+            ok, auth_err = db.check_user_access(
+                session,
+                user_id=user_id,
+                entity_type="order",
+                entity_id=order_id,
+                leg=leg,
+                skip_geo_check=skip_geo
+            )
+            if not ok:
+                raise HTTPException(status_code=403, detail=auth_err)
+
             pin = db.get_access_token_pin(session, order_id, leg, user_id)
-            
             if not pin:
                 raise HTTPException(status_code=404, detail="CODE_NOT_FOUND_OR_EXPIRED")
-            
+
             return {
                 "success": True,
                 "pin": pin,
                 "order_id": order_id,
                 "leg": leg
             }
-            
+
         except DbLayerError as e:
             raise HTTPException(status_code=400, detail=str(e))
 

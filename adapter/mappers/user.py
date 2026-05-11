@@ -93,6 +93,7 @@ def from_core_login(core_response: Any) -> Dict[str, Any]:
         "auth_hash": core_response.get("auth_hash"),
         "core_role": auth_user.get("u_role"),
         "user_name": auth_user.get("u_name"),
+        "phone": auth_user.get("u_phone"),
     }
 
 # =================== Создание авто ===================

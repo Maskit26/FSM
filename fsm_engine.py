@@ -20,6 +20,7 @@ from fsm_actions import (
     AccessCodeActions,
     TripActions,
     LockerActions,
+    ReportErrorActions,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FsmStepResult:
     """Результат одного шага FSM-процесса."""
-    new_state: str  # всегда "COMPLETED" или "FAILED"
+    new_state: str  
     last_error: Optional[str] = None
     next_timer_at: Optional[datetime] = None
     attempts_increment: int = 1
@@ -365,84 +366,78 @@ def _handle_open_cell(
     entity_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
     metadata = instance.get("metadata", {})
-    
-    logger.info(f"[FSM] open_cell: role={user_role}, entity={entity_type}:{entity_id}, user={user_id}")
-
-    # Проверка PIN
     pin = metadata.get("pin")
+
+    logger.info(
+        "[FSM] open_cell: роль=%s, сущность=%s:%s, пользователь=%s",
+        user_role, entity_type, entity_id, user_id
+    )
+
     if not pin:
         return FsmStepResult(new_state="FAILED", last_error="MISSING_PIN_IN_METADATA")
-    
-    # ОПРЕДЕЛЕНИЕ leg И cell_id
-    if entity_type == "order":
-        leg = metadata.get("leg")
-        if not leg or leg not in ["pickup", "delivery"]:
-            return FsmStepResult(new_state="FAILED", last_error="INVALID_LEG_IN_METADATA")
-        
-        order = db.get_order(session, entity_id)
-        if not order:
-            return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
-        
-        cell_id = order["source_cell_id"] if leg == "pickup" else order["dest_cell_id"]
-        
-    elif entity_type == "locker":
-        cell_id = entity_id
-        
-        order_id = db.get_order_id_by_cell_id(session, cell_id)
-        if not order_id:
-            return FsmStepResult(new_state="FAILED", last_error="CELL_NOT_LINKED_TO_ORDER")
-        
-        order = db.get_order(session, order_id)
-        if not order:
-            return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
-        
-        # Определяем leg: source=pickup, dest=delivery
-        if cell_id == order["source_cell_id"]:
-            leg = "pickup"
-        elif cell_id == order["dest_cell_id"]:
-            leg = "delivery"
-        else:
-            return FsmStepResult(new_state="FAILED", last_error="CELL_NOT_IN_ORDER")
-    else:
-        return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
-    
-    # Валидация PIN
-    valid, error = db.validate_access_code(
-        session, order_id if entity_type == "locker" else entity_id,
-        leg, user_id, pin, cell_id
+
+    # 1. Получаем контекст (order_id, leg, cell_id) через единый метод
+    ctx_entity = db.get_context_for_entity(session, entity_type, entity_id)
+    order_id = ctx_entity.get("order_id")
+    leg = ctx_entity.get("leg")
+    cell_id = ctx_entity.get("cell_id")
+
+    if not order_id or not leg or not cell_id:
+        logger.warning(
+            "[FSM] open_cell: неполный контекст сущности %s:%s (order_id=%s, leg=%s, cell_id=%s)",
+            entity_type, entity_id, order_id, leg, cell_id
+        )
+        return FsmStepResult(new_state="FAILED", last_error="INCOMPLETE_ENTITY_CONTEXT")
+
+    # 2. Централизованная авторизация (роль из БД, гео, права)
+    ok, auth_err = db.check_user_access(
+        session,
+        user_id=user_id,
+        entity_type=entity_type,   
+        entity_id=entity_id,
+        leg=leg,
+        skip_geo_check=(user_role == "driver") 
     )
-    
+    if not ok:
+        logger.warning("[FSM] open_cell: отказ в доступе — %s", auth_err)
+        return FsmStepResult(new_state="FAILED", last_error=f"AUTH_FAILED: {auth_err}")
+
+    # 3. Проверка PIN-кода
+    valid, error = db.validate_access_code(session, order_id, leg, user_id, pin, cell_id)
     if not valid:
+        logger.warning("[FSM] open_cell: неверный код доступа — %s", error)
         return FsmStepResult(new_state="FAILED", last_error=f"INVALID_ACCESS_CODE: {error}")
 
-    # ОТКРЫТИЕ ЯЧЕЙКИ
-    if entity_type == "order":
-        if user_role == "client":
-            success, error = ctx["client_actions"].open_cell_for_client(session, entity_id, user_id)
-        elif user_role == "recipient":
-            success, error = ctx["recipient_actions"].open_cell_for_recipient(session, entity_id, user_id)
-        elif user_role == "courier":
-            success, error = ctx["courier_actions"].open_cell(session, entity_id, user_id)
-        elif user_role == "operator":
-            success, error = ctx["operator_actions"].open_cell_for_operator(session, entity_id, user_id)
-        else:
-            logger.warning(f"[FSM] open_cell: unsupported role {user_role} for order")
-            return FsmStepResult(new_state="FAILED", last_error=f"ROLE_NOT_SUPPORTED_{user_role}")
-    elif entity_type == "locker":
-        if user_role == "driver":
-            success, error = ctx["driver_actions"].open_cell_for_driver(session, entity_id, user_id)
-        else:
-            logger.warning(f"[FSM] open_cell: locker access denied for role {user_role}")
-            return FsmStepResult(new_state="FAILED", last_error=f"LOCKER_ACCESS_DENIED_FOR_{user_role}")
+    # 4. Открытие ячейки через соответствующий actions-класс
+    actions_map = {
+        ("order", "client"):    ("client_actions",    "open_cell_for_client"),
+        ("order", "recipient"): ("recipient_actions", "open_cell_for_recipient"),
+        ("order", "courier"):   ("courier_actions",   "open_cell"),
+        ("order", "operator"):  ("operator_actions",  "open_cell_for_operator"),
+        ("locker", "driver"):   ("driver_actions",    "open_cell_for_driver"),
+    }
+
+    action_key = (entity_type, user_role)
+    if action_key in actions_map:
+        actions_name, method_name = actions_map[action_key]
+        actions_obj = ctx.get(actions_name)
+        if not actions_obj:
+            logger.error("[FSM] open_cell: %s не найден в контексте", actions_name)
+            return FsmStepResult(new_state="FAILED", last_error=f"ACTIONS_NOT_FOUND: {actions_name}")
+        open_method = getattr(actions_obj, method_name, None)
+        if not open_method:
+            logger.error("[FSM] open_cell: метод %s не найден в %s", method_name, actions_name)
+            return FsmStepResult(new_state="FAILED", last_error=f"METHOD_NOT_FOUND: {method_name}")
+        success, error = open_method(session, entity_id, user_id)
     else:
-        logger.error(f"[FSM] open_cell: unsupported entity_type {entity_type}")
-        return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
+        logger.warning("[FSM] open_cell: неподдерживаемая комбинация %s/%s", entity_type, user_role)
+        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_COMBINATION: {entity_type}/{user_role}")
 
     if not success:
-        logger.error(f"[FSM] open_cell FAILED: entity={entity_type}:{entity_id}, error={error or 'OPEN_FAILED'}")
+        logger.error("[FSM] open_cell: ошибка открытия ячейки — %s", error)
         return FsmStepResult(new_state="FAILED", last_error=error or "OPEN_FAILED")
 
-    logger.info(f"[FSM] open_cell COMPLETED: entity={entity_type}:{entity_id}")
+    logger.info("[FSM] open_cell: успешно для %s:%s", entity_type, entity_id)
     return FsmStepResult(new_state="COMPLETED")
 
 def _handle_close_cell(
@@ -463,53 +458,61 @@ def _handle_close_cell(
     target_user_id = instance.get("target_user_id")
     target_role = instance.get("target_role")
 
-    logger.info(f"[FSM] close_cell: role={user_role}, entity={entity_type}:{entity_id}, user={user_id}")
+    logger.info(
+        "[FSM] close_cell: роль=%s, сущность=%s:%s, пользователь=%s",
+        user_role, entity_type, entity_id, user_id
+    )
 
+    # 1. Получаем контекст (order_id, leg, cell_id)
+    ctx_entity = db.get_context_for_entity(session, entity_type, entity_id)
+    order_id = ctx_entity.get("order_id")
+    leg = ctx_entity.get("leg")
+    cell_id = ctx_entity.get("cell_id")
+
+    if not order_id or not leg or not cell_id:
+        logger.warning(
+            "[FSM] close_cell: неполный контекст сущности %s:%s (order_id=%s, leg=%s, cell_id=%s)",
+            entity_type, entity_id, order_id, leg, cell_id
+        )
+        return FsmStepResult(new_state="FAILED", last_error="INCOMPLETE_ENTITY_CONTEXT")
+
+    # 2. Централизованная проверка доступа
+    ok, auth_err = db.check_user_access(
+        session,
+        user_id=user_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        leg=leg,
+        skip_geo_check=(user_role == "driver")
+    )
+    if not ok:
+        logger.warning("[FSM] close_cell: отказ в доступе — %s", auth_err)
+        return FsmStepResult(new_state="FAILED", last_error=f"AUTH_FAILED: {auth_err}")
+
+    # 3. Подготовка Core-адаптера (если есть)
     order_mapping = ctx.get("order_mapping")
 
+    # 4. Закрытие ячейки в зависимости от типа сущности и роли
     if entity_type == "order":
-        # ----- CLIENT -----
         if user_role == "client":
             success, error = ctx["client_actions"].close_cell_for_client(session, entity_id, user_id)
 
-        # ----- RECIPIENT -----
         elif user_role == "recipient":
             if order_mapping:
                 ok, err = order_mapping.complete_main_order_in_core(session, entity_id, user_id)
                 if not ok:
-                    logger.error("Core main completion failed for recipient: %s", err)
+                    logger.error("[FSM] close_cell: ошибка завершения главного заказа в Core (получатель): %s", err)
                     return FsmStepResult(new_state="FAILED", last_error=f"CORE_MAIN_COMPLETION_FAILED: {err}")
             success, error = ctx["recipient_actions"].close_cell_for_recipient(session, entity_id, user_id)
 
-        # ----- COURIER -----
         elif user_role == "courier":
-            # Определяем leg по статусу заказа
-            order = db.get_order(session, entity_id)
-            if not order:
-                return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
-            
-            status = order["status"]
-            if status in ("order_courier1_assigned", "order_courier_has_parcel"):
-                leg = "pickup"
-            elif status in ("order_courier2_assigned", "order_courier2_has_parcel"):
-                leg = "delivery"
-            else:
-                return FsmStepResult(new_state="FAILED", last_error=f"UNKNOWN_COURIER_STATUS_{status}")
-
-            # Для pickup завершаем подзаказ в Core
             if leg == "pickup" and order_mapping:
                 ok, err = order_mapping.complete_suborder_in_core(session, entity_id, user_id)
                 if not ok:
-                    logger.error("Core suborder completion failed for courier (pickup): %s", err)
+                    logger.error("[FSM] close_cell: ошибка завершения подзаказа в Core (курьер pickup): %s", err)
                     return FsmStepResult(new_state="FAILED", last_error=f"CORE_SUBORDER_COMPLETION_FAILED: {err}")
-            else:
-                logger.info("Courier delivery close_cell: skipping Core completion")
-
             success, error = ctx["courier_actions"].close_cell(session, entity_id, user_id)
-            if not success:
-                return FsmStepResult(new_state="FAILED", last_error=error)
 
-        # ----- OPERATOR -----
         elif user_role == "operator":
             actual_user = target_user_id or user_id
             if order_mapping:
@@ -520,29 +523,29 @@ def _handle_close_cell(
                 else:
                     ok, err = True, ""
                 if not ok:
-                    logger.error("Core completion by operator failed: %s", err)
+                    logger.error("[FSM] close_cell: ошибка завершения заказа в Core (оператор): %s", err)
                     return FsmStepResult(new_state="FAILED", last_error=f"CORE_OPERATOR_COMPLETION_FAILED: {err}")
             success, error = ctx["operator_actions"].close_cell_for_operator(session, entity_id, user_id)
 
         else:
-            logger.warning(f"[FSM] close_cell: unsupported role {user_role} for order")
+            logger.warning("[FSM] close_cell: неподдерживаемая роль %s для order", user_role)
             return FsmStepResult(new_state="FAILED", last_error=f"ROLE_NOT_SUPPORTED_{user_role}")
 
     elif entity_type == "locker":
         if user_role == "driver":
             success, error = ctx["driver_actions"].close_cell_for_driver(session, entity_id, user_id)
         else:
-            logger.warning(f"[FSM] close_cell: locker access denied for role {user_role}")
+            logger.warning("[FSM] close_cell: доступ к ячейке запрещён для роли %s", user_role)
             return FsmStepResult(new_state="FAILED", last_error=f"LOCKER_ACCESS_DENIED_FOR_{user_role}")
     else:
-        logger.error(f"[FSM] close_cell: unsupported entity_type {entity_type}")
+        logger.warning("[FSM] close_cell: неподдерживаемый тип сущности %s", entity_type)
         return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
 
     if not success:
-        logger.error(f"[FSM] close_cell FAILED: entity={entity_type}:{entity_id}, error={error or 'CLOSE_FAILED'}")
+        logger.error("[FSM] close_cell: ошибка закрытия ячейки — %s", error)
         return FsmStepResult(new_state="FAILED", last_error=error or "CLOSE_FAILED")
 
-    logger.info(f"[FSM] close_cell COMPLETED: entity={entity_type}:{entity_id}")
+    logger.info("[FSM] close_cell: успешно для %s:%s", entity_type, entity_id)
     return FsmStepResult(new_state="COMPLETED")
 
 
@@ -825,32 +828,44 @@ def _handle_request_locker_access_code(
     order_id = instance["entity_id"]
     user_id = instance["requested_by_user_id"]
     metadata = instance.get("metadata", {})
-    
-    if entity_type != "order":
-        logger.error(f"[FSM] request_locker_access_code: unsupported entity_type={entity_type}")
-        return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
 
-    if not metadata or not isinstance(metadata, dict):
-        logger.error(f"[FSM] request_locker_access_code: missing or invalid metadata for order {order_id}")
-        return FsmStepResult(new_state="FAILED", last_error="MISSING_METADATA")
+    # Поддерживаем только заказы
+    if entity_type != "order":
+        logger.warning("[FSM] request_locker_access_code: неподдерживаемый тип сущности '%s'", entity_type)
+        return FsmStepResult(new_state="FAILED", last_error="UNSUPPORTED_ENTITY_TYPE")
 
     leg = metadata.get("leg")
     if leg not in ("pickup", "delivery"):
-        logger.error(f"[FSM] request_locker_access_code: invalid leg={leg} for order {order_id}")
+        logger.warning("[FSM] request_locker_access_code: не указано или неверное плечо '%s' для заказа %s", leg, order_id)
         return FsmStepResult(new_state="FAILED", last_error="INVALID_LEG")
 
-    logger.info(f"[FSM] request_locker_access_code: role={user_role}, order={order_id}, leg={leg}, user={user_id}")
+    logger.info(
+        "[FSM] request_locker_access_code: роль=%s, заказ=%s, leg=%s, пользователь=%s",
+        user_role, order_id, leg, user_id
+    )
 
-    # Делегируем экшену
+    # 1. Централизованная проверка доступа
+    ok, auth_err = db.check_user_access(
+        session,
+        user_id=user_id,
+        entity_type=entity_type,
+        entity_id=order_id,
+        leg=leg,
+        skip_geo_check=(user_role == "driver") 
+    )
+    if not ok:
+        logger.warning("[FSM] request_locker_access_code: отказ в доступе — %s", auth_err)
+        return FsmStepResult(new_state="FAILED", last_error=f"AUTH_FAILED: {auth_err}")
+
+    # 2. Генерация и отправка кода
     success, error = ctx["access_code_actions"].request_access_code(
         session, order_id, user_id, leg
     )
-
     if not success:
-        logger.error(f"[FSM] request_locker_access_code FAILED: order={order_id}, error={error}")
+        logger.error("[FSM] request_locker_access_code: ошибка при запросе кода — %s", error)
         return FsmStepResult(new_state="FAILED", last_error=error or "REQUEST_FAILED")
 
-    logger.info(f"[FSM] request_locker_access_code COMPLETED: order={order_id}")
+    logger.info("[FSM] request_locker_access_code: успешно для заказа %s", order_id)
     return FsmStepResult(new_state="COMPLETED")
 
 def _handle_confirm_courier2_delivery(
@@ -942,132 +957,69 @@ def _handle_report_error(
 ) -> FsmStepResult:
     """
     Универсальный обработчик ошибок для ВСЕХ ролей и сущностей.
-    Поддерживает: order, locker, trip
+    Поддерживает: order, locker, trip.
     """
     user_role = instance["requested_user_role"]
-    entity_type = instance["entity_type"] 
-    entity_id = instance["entity_id"]
-    metadata = instance.get("metadata", {})
-    
-    error_type = metadata.get("error_type")
-    trip_id = metadata.get("trip_id")
-    order_mapping = ctx.get("order_mapping")
-    
-    logger.info("[FSM] report_error: role=%s, type=%s, entity=%s:%s", user_role, error_type, entity_type, entity_id)
+    entity_type = instance["entity_type"]
+    entity_id   = instance["entity_id"]
+    user_id     = instance["requested_by_user_id"]
+    metadata    = instance.get("metadata", {})
+    error_type  = metadata.get("error_type")
+    description = metadata.get("description", "")
+
+    logger.info(
+        "[FSM] report_error: роль=%s, сущность=%s:%s, пользователь=%s, тип_ошибки=%s",
+        user_role, entity_type, entity_id, user_id, error_type
+    )
 
     if not error_type:
-        return FsmStepResult(new_state="FAILED", last_error="MISSING_ERROR_TYPE_IN_METADATA")
+        return FsmStepResult(new_state="FAILED", last_error="MISSING_ERROR_TYPE")
 
-    # === Шаг 1. Определяем order_id, cell_id, leg ===
-    order_id = metadata.get("order_id")
-    cell_id = metadata.get("cell_id")
-    leg = None 
+    # 1. Получаем контекст (order_id, leg, cell_id)
+    ctx_entity = db.get_context_for_entity(session, entity_type, entity_id)
+    order_id = ctx_entity.get("order_id")
+    leg      = ctx_entity.get("leg")
 
-    if entity_type == "trip":
-        if not trip_id:
-            trip_id = entity_id
-        order_id = None
-        cell_id = None
-
-    elif entity_type == "locker":
-        if not cell_id:
-            cell_id = entity_id        
-        if not order_id:
-            order_id = db.get_order_id_by_cell_id(session, cell_id)        
-        if order_id and not leg:
-            order = db.get_order(session, order_id)
-            if order:
-                if cell_id == order.get("source_cell_id"):
-                    leg = "pickup"
-                elif cell_id == order.get("dest_cell_id"):
-                    leg = "delivery"
-                else:
-                    leg = None
-
-    elif entity_type == "order":
-        if not order_id:
-            order_id = entity_id
-        order = db.get_order(session, order_id)
-        if not order:
-            return FsmStepResult(new_state="FAILED", last_error="ORDER_NOT_FOUND")
-        
-        if not leg:
-            leg = db.get_leg_for_order(order)
-            if not leg:
-                return FsmStepResult(new_state="FAILED", last_error="UNKNOWN_LEG_FOR_STATUS")
-        
-        if not cell_id:
-            cell_id = order["source_cell_id"] if leg == "pickup" else order["dest_cell_id"]
-            if not cell_id:
-                return FsmStepResult(new_state="FAILED", last_error="CELL_NOT_FOUND_FOR_ORDER")
-    else:
-        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ENTITY_TYPE: {entity_type}")
-
-    # === Шаг 2. Централизованная проверка доступа ===
-    user_id = instance["requested_by_user_id"]
-
-    # Водителю для своих заказов/ячеек отключаем гео-контроль
-    skip_geo = (user_role == "driver" and entity_type in ("order", "locker", "trip"))
-    if order_id:
-        # Проверяем доступ к заказу
-        ok, auth_err = db.check_user_access(
-            session,
-            user_id=user_id,
-            user_role=user_role,
-            entity_type="order",
-            entity_id=order_id,
-            leg=leg,
-            skip_geo_check=skip_geo
-        )
-    elif entity_type == "trip":
-        ok, auth_err = db.check_user_access(
-            session,
-            user_id=user_id,
-            user_role=user_role,
-            entity_type="trip",
-            entity_id=entity_id,
-            leg=None,
-            skip_geo_check=skip_geo
-        )
-    else:
-        if user_role in ("operator", "administrator", "system"):
-            ok, auth_err = True, ""
-        else:
-            ok, auth_err = False, "DIRECT_LOCKER_ACCESS_DENIED"
-
+    # 2. Централизованная проверка доступа
+    ok, auth_err = db.check_user_access(
+        session,
+        user_id=user_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        leg=leg,          
+        skip_geo_check=(user_role == "driver"),
+    )
     if not ok:
+        logger.warning("[FSM] report_error: отказ в доступе — %s", auth_err)
         return FsmStepResult(new_state="FAILED", last_error=f"AUTH_FAILED: {auth_err}")
 
-    # === Шаг 3. Определяем эффективную роль (динамический получатель) ===
-    effective_role = user_role
-    if entity_type == "order" and leg == "delivery":
-        order = db.get_order(session, order_id)
-        if order and order.get("recipient_user_id") == user_id:
-            effective_role = "recipient"
+    # 3. Получаем универсальный обработчик отчёта об ошибке
+    report_actions = ctx.get("report_error_actions")
+    if not report_actions:
+        logger.error("[FSM] report_error: report_error_actions не зарегистрирован")
+        return FsmStepResult(new_state="FAILED", last_error="REPORT_ACTIONS_NOT_REGISTERED")
 
-    # === Шаг 4. Выбираем actions по эффективной роли ===
-    if effective_role == "driver":
-        actions = ctx["driver_actions"]
-    elif effective_role == "courier":
-        actions = ctx["courier_actions"]
-    elif effective_role == "client":
-        actions = ctx["client_actions"]
-    elif effective_role == "recipient":
-        actions = ctx["recipient_actions"]
-    elif effective_role == "operator":
-        actions = ctx["operator_actions"]
-    else:
-        return FsmStepResult(new_state="FAILED", last_error=f"UNSUPPORTED_ROLE_{effective_role}")
+    # 4. Вызываем единый метод отчёта
+    try:
+        success, msg = report_actions.report_error(
+            session,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            user_id=user_id,
+            error_type=error_type,
+            user_role=user_role,
+            description=description,
+        )
+    except Exception as e:
+        logger.exception("[FSM] report_error: ошибка вызова report_error_actions")
+        return FsmStepResult(new_state="FAILED", last_error=str(e))
 
-    # === Шаг 5. Вызов конкретного обработчика ошибок ===
-    success, error = actions.report_error(
-        session, cell_id, order_id, user_id, error_type, trip_id
-    )
-    
     if not success:
-        return FsmStepResult(new_state="FAILED", last_error=error)
-        
-    return FsmStepResult(new_state="COMPLETED")
+        logger.warning("[FSM] report_error: ошибка при обработке — %s", msg)
+        return FsmStepResult(new_state="FAILED", last_error=msg)
+
+    logger.info("[FSM] report_error: успешно для %s:%s", entity_type, entity_id)
+    return FsmStepResult(new_state="COMPLETED", last_error=msg if msg else None)
 
 # ==================== Направления ====================
 def _handle_direction_reserve_slot(
@@ -1372,6 +1324,7 @@ PROCESS_DEFS: Dict[str, Dict[str, FsmStateHandler]] = {
 
 def build_actions_context(db: DatabaseLayer, core_adapter: CoreAdapter) -> Dict[str, Any]:
     """Собирает actions-контексты для всех процессов."""
+    order_mapping = OrderMapping(db, core_adapter)
     return {
         "order_creation_actions": OrderCreationActions(db),
         "assignment_actions": AssignmentActions(db),
@@ -1384,6 +1337,8 @@ def build_actions_context(db: DatabaseLayer, core_adapter: CoreAdapter) -> Dict[
         "trip_actions": TripActions(db),
         "locker_actions": LockerActions(db),
         "order_mapping": OrderMapping(db, core_adapter),
+        "order_mapping": order_mapping,
+        "report_error_actions": ReportErrorActions(db, order_mapping),
     }
 
 

@@ -452,21 +452,27 @@ class DatabaseLayer:
         trip_id: Optional[int],
         user_id: int,
         issue_type: str,
-        description: str = ""
+        description: str = "",
+        user_role: Optional[str] = None,  
     ) -> int:
         """Создать запись об инциденте в таблице report_issues."""
         logger.debug("create_order_issue вызван: order_id=%s, type=%s", order_id, issue_type)
         
         try:
+            # Если роль не передана явно, получить из БД
+            if user_role is None:
+                user_role = self.get_user_role(session, user_id)
+            
             session.execute(
                 text("""
-                    INSERT INTO report_issues (order_id, trip_id, user_id, issue_type, description)
-                    VALUES (:order_id, :trip_id, :user_id, :issue_type, :description)
+                    INSERT INTO report_issues (order_id, trip_id, user_id, user_role, issue_type, description)
+                    VALUES (:order_id, :trip_id, :user_id, :user_role, :issue_type, :description)
                 """),
                 {
                     "order_id": order_id,  
                     "trip_id": trip_id,
                     "user_id": user_id,
+                    "user_role": user_role,
                     "issue_type": issue_type,
                     "description": description,
                 }
@@ -1094,6 +1100,80 @@ class DatabaseLayer:
                 source_city, dest_city, cell_size, e
             )
             raise DbLayerError(f"find_and_reserve_cells_by_cities failed: {e}") from e
+
+    def find_and_reserve_alternative_cell(
+        self,
+        session: Session,
+        order_id: int,
+        broken_cell_id: int,
+        leg: str
+    ) -> Optional[int]:
+        """
+        Найти свободную ячейку того же размера в том же постамате,
+        исключая сломанную, зарезервировать и привязать к заказу.
+        Возвращает ID новой ячейки или None.
+        """
+        # 1. Параметры сломанной ячейки
+        broken = session.execute(
+            text("SELECT locker_id, cell_type FROM locker_cells WHERE id = :cid"),
+            {"cid": broken_cell_id}
+        ).fetchone()
+        if not broken:
+            return None
+        locker_id, cell_type = broken
+
+        # 2. Поиск свободной ячейки с блокировкой
+        new_cell = session.execute(
+            text("""
+                SELECT id FROM locker_cells
+                WHERE locker_id = :lid AND cell_type = :ctype AND status = 'locker_free' AND id != :bid
+                LIMIT 1
+                FOR UPDATE
+            """),
+            {"lid": locker_id, "ctype": cell_type, "bid": broken_cell_id}
+        ).fetchone()
+        if not new_cell:
+            return None
+        new_cell_id = new_cell[0]
+
+        # 3. Резервируем новую ячейку
+        session.execute(
+            text("UPDATE locker_cells SET status = 'locker_reserved', current_order_id = :oid WHERE id = :cid"),
+            {"oid": order_id, "cid": new_cell_id}
+        )
+
+        # 4. Обновляем заказ (source_cell_id или dest_cell_id)
+        if leg == "pickup":
+            session.execute(
+                text("UPDATE orders SET source_cell_id = :new WHERE id = :oid"),
+                {"new": new_cell_id, "oid": order_id}
+            )
+        else:
+            session.execute(
+                text("UPDATE orders SET dest_cell_id = :new WHERE id = :oid"),
+                {"new": new_cell_id, "oid": order_id}
+            )
+
+        return new_cell_id
+
+    def detach_cell_from_order(self, session: Session, cell_id: int) -> None:
+        """
+        Отвязать ячейку от заказа (current_order_id = NULL).
+        Не меняет статус ячейки.
+        """
+        logger.debug("detach_cell_from_order вызван: cell_id=%s", cell_id)
+        try:
+            result = session.execute(
+                text("UPDATE locker_cells SET current_order_id = NULL WHERE id = :cid"),
+                {"cid": cell_id}
+            )
+            if result.rowcount == 0:
+                logger.warning("detach_cell_from_order: ячейка %s не найдена", cell_id)
+                raise DbLayerError(f"Ячейка {cell_id} не найдена")
+            logger.debug("detach_cell_from_order: ячейка %s отвязана", cell_id)
+        except Exception as e:
+            logger.error("detach_cell_from_order завершился с ошибкой для cell_id=%s: %s", cell_id, e)
+            raise DbLayerError(f"detach_cell_from_order failed: {e}") from e
 
     def create_order_record(
         self,
@@ -3223,58 +3303,103 @@ class DatabaseLayer:
 
 
     # ==================== Сервисные методы ====================
-    def get_leg_for_order(self, order: Dict[str, Any]) -> Optional[str]:
+    def get_context_for_entity(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int
+    ) -> Dict[str, Any]:
         """
-        Возвращает плечо ('pickup' или 'delivery') на основе статуса заказа.
-        Опирается на полный список статусов из всех 4 сценариев.
-        Возвращает None, если статус не удалось однозначно определить.
+        Возвращает контекст сущности: order_id, leg, cell_id.
+        - Для order: leg определяется по статусу.
+        - Для locker: ищет связанный заказ, leg по ячейке (source/dest).
+        - Для всех остальных возвращает пустой контекст.
         """
-        status = order.get("status", "")
-        
-        # Статусы, в которых работа идёт с ячейкой отправления (Постамат1)
-        pickup_statuses = {
-            "order_created",
-            "order_client_post1",
-            "order_courier1_assigned",
-            "order_courier_has_parcel",
-            "order_parcel_confirmed",
-            "order_parcel_submitted",
-            "order_picked_up_from_post1",
-        }
-        
-        # Статусы, в которых работа идёт с ячейкой назначения (Постамат2)
-        delivery_statuses = {
-            "order_in_transit_to_post2",
-            "order_arrived_at_post2",
-            "order_parcel_confirmed_post2",
-            "order_courier2_assigned",
-            "order_courier2_has_parcel",
-            "order_courier2_parcel_delivered",
-            "order_delivered_to_client",
-            "order_completed",
-        }
-        
-        if status in pickup_statuses:
-            return "pickup"
-        if status in delivery_statuses:
-            return "delivery"
-        
-        # Неизвестный статус – fallback на основе типа доставки
-        pickup_type = order.get("pickup_type", "courier")
-        delivery_type = order.get("delivery_type", "courier")
-        
-        # Если pickup_type=self и ещё не дошли до транзита – вероятно pickup
-        if pickup_type == "self" and status.startswith("order_client"):
-            return "pickup"
-        # Для остальных непонятных статусов возвращаем None
-        logger.warning("get_leg_for_order: неизвестный статус '%s', не удалось определить плечо", status)
-        return None
+        result = {"order_id": None, "leg": None, "cell_id": None}
+
+        try:
+            if entity_type == "order":
+                order = self.get_order(session, entity_id)
+                if not order:
+                    logger.warning("get_context_for_entity: заказ %s не найден", entity_id)
+                    return result
+
+                status = order.get("status", "")
+                pickup_statuses = {
+                    "order_created", "order_client_post1",
+                    "order_courier1_assigned", "order_courier_has_parcel",
+                    "order_parcel_confirmed", "order_parcel_submitted",
+                    "order_picked_up_from_post1"
+                }
+                delivery_statuses = {
+                    "order_in_transit_to_post2", "order_arrived_at_post2",
+                    "order_parcel_confirmed_post2", "order_courier2_assigned",
+                    "order_courier2_has_parcel", "order_courier2_parcel_delivered",
+                    "order_delivered_to_client", "order_completed"
+                }
+
+                if status in pickup_statuses:
+                    leg = "pickup"
+                elif status in delivery_statuses:
+                    leg = "delivery"
+                else:
+                    logger.warning(
+                        "get_context_for_entity: неизвестный статус '%s' для заказа %s",
+                        status, entity_id
+                    )
+                    return result
+
+                cell_id = order.get("source_cell_id") if leg == "pickup" else order.get("dest_cell_id")
+                result.update({"order_id": entity_id, "leg": leg, "cell_id": cell_id})
+
+            elif entity_type == "locker":
+                order_id = self.get_order_id_by_cell_id(session, entity_id)
+                if not order_id:
+                    logger.warning(
+                        "get_context_for_entity: ячейка %s не привязана к заказу",
+                        entity_id
+                    )
+                    return result
+
+                order = self.get_order(session, order_id)
+                if not order:
+                    logger.warning(
+                        "get_context_for_entity: заказ %s не найден для ячейки %s",
+                        order_id, entity_id
+                    )
+                    return result
+
+                if entity_id == order.get("source_cell_id"):
+                    leg = "pickup"
+                elif entity_id == order.get("dest_cell_id"):
+                    leg = "delivery"
+                else:
+                    logger.warning(
+                        "get_context_for_entity: ячейка %s не совпадает с source/dest заказа %s",
+                        entity_id, order_id
+                    )
+                    return result
+
+                result.update({"order_id": order_id, "leg": leg, "cell_id": entity_id})
+
+            else:
+                logger.debug(
+                    "get_context_for_entity: неподдерживаемый тип сущности '%s', возвращается пустой контекст",
+                    entity_type
+                )
+
+        except Exception as e:
+            logger.exception(
+                "get_context_for_entity: ошибка для %s:%s",
+                entity_type, entity_id
+            )
+
+        return result
 
     def check_user_access(
         self,
         session: Session,
         user_id: int,
-        user_role: str,
         entity_type: str,
         entity_id: int,
         leg: Optional[str] = None,
@@ -3286,93 +3411,126 @@ class DatabaseLayer:
         - Гео-привязки (город пользователя == город ячейки/направления)
         - Блокировка кросс-города для обычных ролей
         """
-        # 1. Базовые данные
-        user = self.get_user_by_id(session, user_id)
-        if not user:
-            return False, "USER_NOT_FOUND"
+        try:
+            # 1. Пользователь
+            user = self.get_user_by_id(session, user_id)
+            if not user:
+                logger.warning("check_user_access: пользователь %s не найден", user_id)
+                return False, "USER_NOT_FOUND"
 
-        user_city = (user.get("city") or "").strip()
-        is_operator = user_role in ("operator", "administrator")
-        is_system = user_role == "system"
+            user_role = user.get("role_name", "")
+            user_city = (user.get("city") or "").strip()
+            is_operator = user_role in ("operator", "administrator")
+            is_system = user_role == "system"
 
-        # 2. Определяем целевой город (только для гео-проверки)
-        target_city = ""
-        if entity_type == "order":
-            order = self.get_order(session, entity_id)
-            if not order:
-                return False, "ORDER_NOT_FOUND"
-            if not leg:
-                return False, "LEG_REQUIRED_FOR_ORDER"
-            cell_id = order.get("source_cell_id") if leg == "pickup" else order.get("dest_cell_id")
-            if not cell_id:
-                return False, "CELL_ID_MISSING"
-            target_city = self.get_locker_city_by_cell(session, cell_id)  # используем готовый метод
-        elif entity_type == "trip":
-            trip = self.get_trip(session, entity_id)
-            if not trip:
-                return False, "TRIP_NOT_FOUND"
-            target_city = trip.get("from_city", "").strip()
-        elif entity_type == "locker":
-            target_city = self.get_locker_city_by_cell(session, entity_id)
-        else:
-            return False, "UNSUPPORTED_ENTITY_TYPE"
+            logger.debug(
+                "check_user_access: user=%s, role=%s, city=%s, entity=%s:%s, leg=%s, skip_geo=%s",
+                user_id, user_role, user_city, entity_type, entity_id, leg, skip_geo_check
+            )
 
-        # 3. Гео-проверка (пропускаем только если явно skip_geo_check или system)
-        if not is_system and not skip_geo_check:
-            if user_city and target_city and user_city != target_city:
-                return False, f"CITY_MISMATCH: user_city='{user_city}', entity_city='{target_city}'"
+            # 2. Определяем целевой город и, при необходимости, order_id/leg
+            target_city = ""
 
-        # 4. Проверка прав на сущность (авторизация)
-        # Оператор/система проходят всегда
-        if is_operator or is_system:
-            return True, ""
+            if entity_type == "order":
+                order = self.get_order(session, entity_id)
+                if not order:
+                    logger.warning("check_user_access: заказ %s не найден", entity_id)
+                    return False, "ORDER_NOT_FOUND"
+                if not leg:
+                    logger.warning("check_user_access: не указано плечо для заказа %s", entity_id)
+                    return False, "LEG_REQUIRED_FOR_ORDER"
+                cell_id = order.get("source_cell_id") if leg == "pickup" else order.get("dest_cell_id")
+                if not cell_id:
+                    logger.warning("check_user_access: отсутствует cell_id для заказа %s, leg=%s", entity_id, leg)
+                    return False, "CELL_ID_MISSING"
+                target_city = self.get_locker_city_by_cell(session, cell_id)
 
-        if entity_type == "order":
-            order = self.get_order(session, entity_id)  # уже есть, но для ясности
-            stage = self.get_stage_order(session, entity_id, leg)
+            elif entity_type == "trip":
+                trip = self.get_trip(session, entity_id)
+                if not trip:
+                    logger.warning("check_user_access: рейс %s не найден", entity_id)
+                    return False, "TRIP_NOT_FOUND"
+                target_city = trip.get("from_city", "").strip()
 
-            # === ДИНАМИЧЕСКИЙ ПОЛУЧАТЕЛЬ ===
-            # Если пользователь является recipient_user_id этого заказа, для leg=='delivery' даём доступ
-            if leg == "delivery" and order.get("recipient_user_id") == user_id:
-                return True, ""  # теперь пользователь временно действует как получатель
+            elif entity_type == "locker":
+                # Используем централизованный метод, чтобы избежать дублирования
+                ctx = self.get_context_for_entity(session, entity_type, entity_id)
+                order_id = ctx.get("order_id")
+                if not order_id:
+                    logger.warning("check_user_access: ячейка %s не привязана к заказу", entity_id)
+                    if not is_operator and not is_system:
+                        return False, "DIRECT_LOCKER_ACCESS_DENIED"
+                    return True, ""   # оператору/системе доступ к любой ячейке
 
-            # Обычные проверки
-            if leg == "pickup":
-                if order.get("pickup_type") == "self":
-                    if user_role == "client" and order.get("client_user_id") == user_id:
-                        return True, ""
-                else:  # courier
-                    if user_role == "courier" and stage and stage.get("courier_user_id") == user_id:
-                        return True, ""
-                    if user_role == "driver" and stage and stage.get("reserved_by_driver_id") == user_id:
-                        return True, ""
+                # Делегируем проверку заказу
+                return self.check_user_access(
+                    session, user_id, "order", order_id,
+                    leg=ctx["leg"], skip_geo_check=skip_geo_check
+                )
 
-            elif leg == "delivery":
-                if order.get("delivery_type") == "self":
-                    # Уже обработано выше динамическим получателем, но если роль не прошла – отказ
-                    pass  # все нужные проверки уже сделаны
-                else:  # courier
-                    if user_role == "courier" and stage and stage.get("courier_user_id") == user_id:
-                        return True, ""
-                    if user_role == "driver":
-                        if stage and stage.get("trip_id"):
-                            trip = self.get_trip(session, stage["trip_id"])
-                            if trip and trip.get("driver_user_id") == user_id:
-                                return True, ""
+            else:
+                logger.warning("check_user_access: неподдерживаемый тип сущности '%s'", entity_type)
+                return False, "UNSUPPORTED_ENTITY_TYPE"
 
-            return False, "USER_NOT_AUTHORIZED"
+            # 3. Гео-проверка
+            if not is_system and not skip_geo_check:
+                if user_city and target_city and user_city != target_city:
+                    logger.info(
+                        "check_user_access: несовпадение городов user=%s (%s) vs entity=%s",
+                        user_city, target_city, entity_id
+                    )
+                    return False, f"CITY_MISMATCH: user_city='{user_city}', entity_city='{target_city}'"
 
-        elif entity_type == "trip":
-            trip = self.get_trip(session, entity_id)
-            if user_role == "driver" and trip.get("driver_user_id") == user_id:
+            # 4. Авторизация: оператор/система проходят всегда
+            if is_operator or is_system:
+                logger.debug("check_user_access: доступ оператору/системе разрешён")
                 return True, ""
-            return False, "USER_NOT_AUTHORIZED"
 
-        elif entity_type == "locker":
-            # Прямой доступ к ячейке не разрешён – только через заказ/рейс
-            return False, "DIRECT_LOCKER_ACCESS_DENIED"
+            # ===== ORDER =====
+            if entity_type == "order":
+                order = self.get_order(session, entity_id)
+                stage = self.get_stage_order(session, entity_id, leg)
 
-        return False, "UNKNOWN_AUTH_FAILURE"
+                if leg == "pickup":
+                    if order.get("pickup_type") == "self":
+                        if user_role == "client" and order.get("client_user_id") == user_id:
+                            return True, ""
+                        if user_role == "driver" and stage and stage.get("reserved_by_driver_id") == user_id:
+                            return True, ""
+                    else:  # courier
+                        if user_role == "courier" and stage and stage.get("courier_user_id") == user_id:
+                            return True, ""
+                        if user_role == "driver" and stage and stage.get("reserved_by_driver_id") == user_id:
+                            return True, ""
+
+                else:  # delivery
+                    if order.get("recipient_user_id") == user_id:
+                        return True, ""
+                    if user_role == "driver" and stage and stage.get("trip_id"):
+                        trip = self.get_trip(session, stage["trip_id"])
+                        if trip and trip.get("driver_user_id") == user_id:
+                            return True, ""
+                    if order.get("delivery_type") == "courier":
+                        if user_role == "courier" and stage and stage.get("courier_user_id") == user_id:
+                            return True, ""
+
+                logger.info("check_user_access: доступ запрещён для пользователя %s к заказу %s", user_id, entity_id)
+                return False, "USER_NOT_AUTHORIZED"
+
+            # ===== TRIP =====
+            elif entity_type == "trip":
+                trip = self.get_trip(session, entity_id)
+                if user_role == "driver" and trip and trip.get("driver_user_id") == user_id:
+                    return True, ""
+                logger.info("check_user_access: доступ запрещён для пользователя %s к рейсу %s", user_id, entity_id)
+                return False, "USER_NOT_AUTHORIZED"
+
+            logger.error("check_user_access: непредвиденное завершение для %s:%s", entity_type, entity_id)
+            return False, "UNKNOWN_AUTH_FAILURE"
+
+        except Exception as e:
+            logger.exception("check_user_access: внутренняя ошибка: %s", e)
+            return False, f"INTERNAL_ERROR: {e}"
     
     def get_all_cities(self, session: Session) -> List[str]:
         """

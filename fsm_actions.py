@@ -292,78 +292,30 @@ class ClientActions:
     def __init__(self, db: DatabaseLayer):
         self.db = db
 
-    def _get_source_cell_id(self, session: Session, order_id: int) -> int:
-        """Получить source_cell_id заказа."""
-        order = self.db.get_order(session, order_id)
-        if not order or not order.get("source_cell_id"):
-            logger.error("[CLIENT] source_cell_id not found for order %s", order_id)
-            raise DbLayerError(f"Нет source_cell_id для заказа {order_id}")
-        return order["source_cell_id"]
-
-    def open_cell_for_client(
-        self,
-        session: Session,
-        order_id: int,
-        user_id: int
-    ) -> Tuple[bool, str]:
-        """
-        Клиент открывает ячейку отправки.        
-        """
-        logger.info(
-            "[CLIENT] open_cell_for_client order=%s user=%s",
-            order_id, user_id
-        )
-
+    def open_cell_for_client(self, session, order_id, user_id):
         try:
-            # 1. Получаем ID ячейки
-            cell_id = self._get_source_cell_id(session, order_id)
-            logger.debug(
-                "[CLIENT] opening source cell %s for order %s",
-                cell_id, order_id
-            )            
-            # 2. FSM переход заказа: order_created → order_client_post1
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            cell_id = ctx.get("cell_id")
+            if not cell_id:
+                return False, "CELL_NOT_FOUND"
             self.db.order_client_deliv_post1(session, order_id, user_id)
-            logger.info(
-                "[CLIENT] order %s transitioned to order_client_post1",
-                order_id
-            )            
-            # 3. Открытие ячейки (Locker FSM)
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
-            logger.info(
-                "[CLIENT] cell %s opened successfully for order %s",
-                cell_id, order_id
-            )            
             return True, ""
-            
         except Exception as e:
-            logger.error(
-                "[CLIENT] failed to open cell for order %s: %s",
-                order_id, str(e)
-            )
+            logger.error("[CLIENT] open_cell_for_client failed: %s", e)
             return False, str(e)
 
-    def close_cell_for_client(
-        self,
-        session: Session,
-        order_id: int,
-        user_id: int
-    ) -> Tuple[bool, str]:
-        """
-        Клиент закрывает ячейку после помещения посылки.
-        """
-        logger.info("[CLIENT] close_cell_for_client order=%s user=%s", order_id, user_id)
-
+    def close_cell_for_client(self, session, order_id, user_id):
         try:
-            cell_id = self._get_source_cell_id(session, order_id)
-            logger.debug("[CLIENT] closing source cell %s for order %s", cell_id, order_id)
-            
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            cell_id = ctx.get("cell_id")
+            if not cell_id:
+                return False, "CELL_NOT_FOUND"
             self.db.order_confirm_parcel_in(session, order_id, user_id)
             self.db.close_locker(session, cell_id, user_id)
-            
-            logger.info("[CLIENT] cell %s closed successfully for order %s", cell_id, order_id)
             return True, ""
         except Exception as e:
-            logger.error("[CLIENT] failed to close cell for order %s: %s", order_id, str(e))
+            logger.error("[CLIENT] close_cell_for_client failed: %s", e)
             return False, str(e)
 
     def cancel_order(
@@ -403,67 +355,7 @@ class ClientActions:
             logger.error("[CLIENT] failed to cancel order %s: %s", order_id, str(e))
             return False, str(e)
 
-    def report_error(
-        self,
-        session: Session,
-        cell_id: int,
-        order_id: int,
-        user_id: int,
-        error_type: str,
-        trip_id: Optional[int] = None
-    ) -> Tuple[bool, str]:
-        """
-        Универсальный метод сообщения об ошибке клиентом.
-        
-        error_type: 'locker_failed_to_open' | 'locker_failed_to_close' | 'locker_not_closed' | 
-                    'cancelled_by_client' | 'wrong_cell' | 'other'
-        """
-        logger.info("[CLIENT] report_error cell=%s order=%s type=%s", cell_id, order_id, error_type)
-
-        try:
-            if error_type == "locker_failed_to_open":
-                logger.debug("[CLIENT] handling locker_failed_to_open")
-                self.db.locker_report_failed_to_open(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_failed_to_close":
-                logger.debug("[CLIENT] handling locker_failed_to_close")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_not_closed":
-                logger.debug("[CLIENT] handling locker_not_closed")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "cancelled_by_client":
-                logger.debug("[CLIENT] handling cancelled_by_client")
-                self.db.order_cancel_reservation(session, order_id, user_id)
-                
-            elif error_type == "wrong_cell":
-                logger.debug("[CLIENT] handling wrong_cell")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "other":
-                logger.debug("[CLIENT] handling other")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            else:
-                logger.warning("[CLIENT] unknown error_type=%s", error_type)
-                return False, f"UNKNOWN_ERROR_TYPE:{error_type}"
-
-            self.db.create_order_issue(
-                session, order_id, trip_id, user_id, error_type, f"Client reported: {error_type}"
-            )
-
-            logger.info("[CLIENT] report_error completed successfully")
-            return True, ""
-            
-        except Exception as e:
-            logger.error("[CLIENT] report_error failed: %s", e)
-            return False, str(e)
-
-
+    
 # =========================================================
 # RECIPIENT
 # =========================================================
@@ -474,136 +366,32 @@ class RecipientActions:
     def __init__(self, db: DatabaseLayer):
         self.db = db
 
-    def _get_dest_cell_id(self, session: Session, order_id: int) -> int:
-        order = self.db.get_order(session, order_id)
-        if not order or not order.get("dest_cell_id"):
-            logger.error("[RECIPIENT] dest_cell_id not found for order %s", order_id)
-            raise DbLayerError(f"Нет dest_cell_id для заказа {order_id}")
-        return order["dest_cell_id"]
-
-    def open_cell_for_recipient(
-        self,
-        session: Session,
-        order_id: int,
-        user_id: int
-    ) -> Tuple[bool, str]:
-        """
-        Получатель открывает ячейку получения.
-        """
-        logger.info("[RECIPIENT] open_cell order=%s user=%s", order_id, user_id)
-
+    def open_cell_for_recipient(self, session, order_id, user_id):
         try:
-            cell_id = self._get_dest_cell_id(session, order_id)
-            logger.debug("[RECIPIENT] opening destination cell %s for order %s", cell_id, order_id)
-            
-            # 1. Locker FSM: открываем ячейку
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            cell_id = ctx.get("cell_id")
+            if not cell_id:
+                return False, "CELL_NOT_FOUND"
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
-            logger.debug("[RECIPIENT] locker opened: cell=%s", cell_id)
-            
-            # 2. Order FSM: получатель забрал заказ
             self.db.order_pickup_by_recipient(session, order_id, user_id)
-            logger.debug("[RECIPIENT] order FSM transitioned: order_id=%s", order_id)
-            
-            logger.info("[RECIPIENT] cell %s opened successfully for order %s", cell_id, order_id)
             return True, ""
-            
         except Exception as e:
-            logger.error("[RECIPIENT] failed to open cell for order %s: %s", order_id, str(e))
+            logger.error("[RECIPIENT] open_cell_for_recipient failed: %s", e)
             return False, str(e)
 
-    def close_cell_for_recipient(
-        self,
-        session: Session,
-        order_id: int,
-        user_id: int
-    ) -> Tuple[bool, str]:
-        """
-        Получатель закрывает пустую ячейку.
-        """
-        logger.info("[RECIPIENT] close_cell order=%s user=%s", order_id, user_id)
-
+    def close_cell_for_recipient(self, session, order_id, user_id):
         try:
-            cell_id = self._get_dest_cell_id(session, order_id)
-            logger.debug("[RECIPIENT] closing destination cell %s for order %s", cell_id, order_id)
-            
-            # 1. Order FSM: заказ отмечен как доставленный
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            cell_id = ctx.get("cell_id")
+            if not cell_id:
+                return False, "CELL_NOT_FOUND"
             self.db.order_mark_delivered_parcel(session, order_id, user_id)
-            logger.debug("[RECIPIENT] order FSM transitioned: order_id=%s", order_id)
-            
-            # 2. Locker FSM: закрываем ячейку
             self.db.close_locker_pickup(session, cell_id, user_id)
-            logger.debug("[RECIPIENT] locker closed: cell=%s", cell_id)
-            
-            logger.info("[RECIPIENT] cell %s closed successfully for order %s", cell_id, order_id)
             return True, ""
-            
         except Exception as e:
-            logger.error("[RECIPIENT] failed to close cell for order %s: %s", order_id, str(e))
+            logger.error("[RECIPIENT] close_cell_for_recipient failed: %s", e)
             return False, str(e)
-
-    def report_error(
-        self,
-        session: Session,
-        cell_id: int,
-        order_id: int,
-        user_id: int,
-        error_type: str,
-        trip_id: Optional[int] = None
-    ) -> Tuple[bool, str]:
-        """
-        Универсальный метод сообщения об ошибке получателем.
-        
-        error_type: 'locker_failed_to_open' | 'locker_failed_to_close' | 'locker_not_closed' | 
-                    'parcel_missing' | 'parcel_damaged' | 'other'
-        """
-        logger.info("[RECIPIENT] report_error cell=%s order=%s type=%s", cell_id, order_id, error_type)
-
-        try:
-            if error_type == "locker_failed_to_open":
-                logger.debug("[RECIPIENT] handling locker_failed_to_open")
-                self.db.locker_report_failed_to_open(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_failed_to_close":
-                logger.debug("[RECIPIENT] handling locker_failed_to_close")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_not_closed":
-                logger.debug("[RECIPIENT] handling locker_not_closed")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "parcel_missing":
-                logger.debug("[RECIPIENT] handling parcel_missing")
-                self.db.order_report_parcel_missing(session, order_id, user_id)
-                self.db.confirm_locker_parcel_not_found(session, cell_id, user_id)
-                self.db.reset_locker(session, cell_id, user_id)
-                
-            elif error_type == "parcel_damaged":
-                logger.debug("[RECIPIENT] handling parcel_damaged")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "other":
-                logger.debug("[RECIPIENT] handling other")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            else:
-                logger.warning("[RECIPIENT] unknown error_type=%s", error_type)
-                return False, f"UNKNOWN_ERROR_TYPE:{error_type}"
-
-            self.db.create_order_issue(
-                session, order_id, trip_id, user_id, error_type, f"Recipient reported: {error_type}"
-            )
-
-            logger.info("[RECIPIENT] report_error completed successfully")
-            return True, ""
-            
-        except Exception as e:
-            logger.error("[RECIPIENT] report_error failed: %s", e)
-            return False, str(e)
-
-
+    
 # =========================================================
 # DRIVER
 # =========================================================
@@ -641,89 +429,30 @@ class DriverActions:
         cell_id: int,
         user_id: int
     ) -> Tuple[bool, str]:
-        """
-        Водитель открывает ячейку.
-        
-        Проверка авторизации:
-        - ДО создания рейса: stage_orders.reserved_by_driver_id
-        - ПОСЛЕ создания рейса: trips.driver_user_id (через stage_orders.trip_id)
-        """
         logger.info("[DRIVER] open_cell cell=%s user=%s", cell_id, user_id)
 
         try:
-            # 1. Получаем order_id по cell_id
-            order_id = self.db.get_order_id_by_cell_id(session, cell_id)
-            if not order_id:
-                raise DbLayerError(f"Ячейка {cell_id} не привязана ни к одному заказу")
+            # Получаем контекст для ячейки (он вернёт order_id, leg)
+            ctx = self.db.get_context_for_entity(session, "locker", cell_id)
+            order_id = ctx["order_id"]
+            leg = ctx["leg"]
+            if not order_id or not leg:
+                return False, "CELL_NOT_LINKED_TO_ORDER"
 
-            # 2. Получаем заказ и определяем направление
-            order = self.db.get_order(session, order_id)
-            if not order:
-                raise DbLayerError(f"Заказ {order_id} не найден")
-
-            # 3. Определяем intent: pickup или delivery
-            if cell_id == order["source_cell_id"]:
-                intent = "pickup"
-            elif cell_id == order["dest_cell_id"]:
-                intent = "delivery"
-            else:
-                raise DbLayerError(f"Ячейка {cell_id} не совпадает ни с source, ни с dest для заказа {order_id}")
-
-            # 4. Получаем stage_order
-            stage = self.db.get_stage_order(session, order_id, intent)
-            if not stage:
-                raise DbLayerError(f"Заказ {order_id} не имеет stage_order (leg={intent})")
-            
-            direction_id = stage.get("direction_id")
-            trip_id = stage.get("trip_id")
-
-            # 5. ПРОВЕРКА АВТОРИЗАЦИИ ВОДИТЕЛЯ
-            is_authorized = False
-            
-            if trip_id:
-                trip = self.db.get_trip(session, trip_id)
-                if trip and trip["driver_user_id"] == user_id:
-                    is_authorized = True
-            elif stage.get("reserved_by_driver_id") == user_id:
-                is_authorized = True
-            
-            if not is_authorized:
-                raise DbLayerError(
-                    f"Заказ {order_id} не принадлежит водителю {user_id}  "
-                    f"(trip_id={trip_id}, reserved_by_driver_id={stage.get('reserved_by_driver_id')})"
-                )
-
-            # 6. ПРОВЕРКА: у водителя есть активный резерв ИЛИ активный рейс
-            if trip_id:
-                if not trip or trip["driver_user_id"] != user_id:
-                    raise DbLayerError(f"Рейс {trip_id} не принадлежит водителю {user_id}")
-            elif direction_id:
-                reservations = self.db.get_driver_active_reservations(
-                    session, direction_id, user_id
-                )
-                if not reservations:
-                    raise DbLayerError(
-                        f"У водителя {user_id} нет активных резервов на направлении {direction_id}"
-                    )
-
-            # 7. Открываем ячейку (Locker FSM)
+            # Открываем ячейку
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
-            logger.debug("[DRIVER] cell %s opened (Locker FSM)", cell_id)
 
-            # 8. Order FSM — меняем статус заказа
-            if intent == "pickup":
-                logger.info("[DRIVER] processing pickup for order %s", order_id)                
+            # Обновляем статус заказа в зависимости от leg
+            if leg == "pickup":
                 self.db.order_mark_parcel_submitted(session, order_id, user_id)
-            elif intent == "delivery":
-                logger.info("[DRIVER] processing delivery for order %s", order_id)                
+            elif leg == "delivery":
                 self.db.order_arrive_at_post2(session, order_id, user_id)
 
             logger.info("[DRIVER] cell %s opened successfully", cell_id)
             return True, ""
 
         except Exception as e:
-            logger.error("[DRIVER] failed to open cell %s: %s", cell_id, str(e))
-            return False, str(e)
+            logger.error("[DRIVER] open_cell_for_driver failed: %s", str(e))
             return False, str(e)
 
     def close_cell_for_driver(
@@ -735,151 +464,30 @@ class DriverActions:
         logger.info("[DRIVER] close_cell cell=%s user=%s", cell_id, user_id)
 
         try:
-            # 1. Получаем order_id по cell_id
-            order_id = self.db.get_order_id_by_cell_id(session, cell_id)
-            if not order_id:
-                logger.warning("[DRIVER] cell %s not linked to any order, just closing", cell_id)
+            ctx = self.db.get_context_for_entity(session, "locker", cell_id)
+            order_id = ctx["order_id"]
+            leg = ctx["leg"]
+            if not order_id or not leg:
+                # Если ячейка не привязана к заказу, просто закрываем
                 self.db.close_locker(session, cell_id, user_id)
                 return True, ""
 
-            # 2. Получаем заказ
-            order = self.db.get_order(session, order_id)
-            if not order:
-                raise DbLayerError(f"Заказ {order_id} не найден")
-
-            # 3. Определяем intent
-            if cell_id == order["source_cell_id"]:
-                intent = "pickup"
-            elif cell_id == order["dest_cell_id"]:
-                intent = "delivery"
-            else:
-                intent = "unknown"
-
-            # 4. Получаем stage и проверяем авторизацию
-            stage = self.db.get_stage_order(session, order_id, intent)
-            if stage:
-                trip_id = stage.get("trip_id")
-                
-                # ПРОВЕРКА АВТОРИЗАЦИИ
-                is_authorized = False
-                
-                if trip_id:
-                    trip = self.db.get_trip(session, trip_id)
-                    if trip and trip["driver_user_id"] == user_id:
-                        is_authorized = True
-                elif stage.get("reserved_by_driver_id") == user_id:
-                    is_authorized = True
-                
-                if not is_authorized:
-                    raise DbLayerError(
-                        f"Заказ {order_id} не принадлежит водителю {user_id}"
-                    )
-
-            # 5. Обрабатываем в зависимости от intent
-            if intent == "pickup":
-                logger.info("[DRIVER] Finishing PICKUP: cell %s will be EMPTY", cell_id)                
-                self.db.close_locker_pickup(session, cell_id, user_id)                
+            if leg == "pickup":
+                self.db.close_locker_pickup(session, cell_id, user_id)
                 self.db.order_pickup_by_driver(session, order_id, user_id)
-
-            elif intent == "delivery":
-                logger.info("[DRIVER] Finishing DELIVERY: cell %s will be OCCUPIED", cell_id)                
+            elif leg == "delivery":
                 self.db.order_confirm_post2(session, order_id, user_id)
                 self.db.close_locker(session, cell_id, user_id)
-                
-            else:                
-                raise DbLayerError(f"Не удалось определить тип операции (pickup/delivery) для ячейки {cell_id}")
-                
-            return True, ""
-
-        except Exception as e:
-            logger.error("[DRIVER] failed to close cell %s for driver %s: %s", cell_id, user_id, str(e))
-            return False, str(e)
-
-    def report_error(
-        self,
-        session: Session,
-        cell_id: int,
-        order_id: int,
-        user_id: int,
-        error_type: str,
-        trip_id: Optional[int] = None
-    ) -> Tuple[bool, str]:
-        """
-        Универсальный метод сообщения об ошибке водителем.
-        
-        error_type: 
-        - Для locker: 'locker_failed_to_open' | 'locker_failed_to_close' | 'locker_not_closed'
-        - Для order: 'parcel_missing' | 'parcel_damaged' | 'other'
-        - Для trip: 'trip_breakdown' | 'trip_delayed' | 'trip_route_issue' | 'trip_manual_intervention'
-        """
-        logger.info("[DRIVER] report_error cell=%s order=%s trip=%s type=%s", cell_id, order_id, trip_id, error_type)
-
-        try:
-            # === ОШИБКИ РЕЙСА ===
-            if error_type in ["trip_breakdown", "trip_delayed", "trip_route_issue"]:
-                logger.debug("[DRIVER] handling trip error: %s", error_type)                
-                self.db.trip_report_failure(session, trip_id, user_id)
-                self.db.create_order_issue(
-                    session, None, trip_id, user_id, error_type, f"Driver reported: {error_type}"
-                )
-                return True, ""
-                
-            elif error_type == "trip_manual_intervention":
-                logger.debug("[DRIVER] handling trip_manual_intervention")                
-                self.db.trip_request_manual_intervention(session, trip_id, user_id)
-                self.db.create_order_issue(
-                    session, None, trip_id, user_id, error_type, f"Driver reported: {error_type}"
-                )
-                return True, ""
-            
-            # === ОШИБКИ ЯЧЕЙКИ ===
-            elif error_type == "locker_failed_to_open":
-                logger.debug("[DRIVER] handling locker_failed_to_open")
-                self.db.locker_report_failed_to_open(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_failed_to_close":
-                logger.debug("[DRIVER] handling locker_failed_to_close")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_not_closed":
-                logger.debug("[DRIVER] handling locker_not_closed")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-            
-            # === ОШИБКИ ЗАКАЗА ===
-            elif error_type == "parcel_missing":
-                logger.debug("[DRIVER] handling parcel_missing")
-                self.db.order_report_parcel_missing(session, order_id, user_id)
-                self.db.confirm_locker_parcel_not_found(session, cell_id, user_id)
-                self.db.reset_locker(session, cell_id, user_id)
-                
-            elif error_type == "parcel_damaged":
-                logger.debug("[DRIVER] handling parcel_damaged")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                self.db.reset_locker(session, cell_id, user_id)
-                
-            elif error_type == "other":
-                logger.debug("[DRIVER] handling other")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
             else:
-                logger.warning("[DRIVER] unknown error_type=%s", error_type)
-                return False, f"UNKNOWN_ERROR_TYPE:{error_type}"
+                self.db.close_locker(session, cell_id, user_id)
 
-            # Записываем инцидент в базу
-            self.db.create_order_issue(
-                session, order_id, trip_id, user_id, error_type, f"Driver reported: {error_type}"
-            )
-
-            logger.info("[DRIVER] report_error completed successfully")
+            logger.info("[DRIVER] cell %s closed successfully", cell_id)
             return True, ""
-            
-        except Exception as e:
-            logger.error("[DRIVER] report_error failed: %s", e)
-            return False, str(e)
 
+        except Exception as e:
+            logger.error("[DRIVER] close_cell_for_driver failed: %s", str(e))
+            return False, str(e)
+    
     def start_trip(
         self,
         session: Session,
@@ -991,17 +599,6 @@ class CourierActions:
     def __init__(self, db: DatabaseLayer):
         self.db = db
 
-    def _get_leg_and_cell_id(self, order: dict):
-        status = order["status"]
-
-        if status in ["order_courier1_assigned", "order_courier_has_parcel"]:
-            return "pickup", order["source_cell_id"]
-
-        if status in ["order_courier2_assigned", "order_courier2_has_parcel"]:
-            return "delivery", order["dest_cell_id"]
-
-        raise DbLayerError(f"Неизвестный статус курьера: {status}")
-
     def open_cell(
         self,
         session: Session,
@@ -1011,27 +608,23 @@ class CourierActions:
         logger.info("[COURIER] open_cell order=%s user=%s", order_id, user_id)
 
         try:
-            order = self.db.get_order(session, order_id)
-            if not order:
-                logger.warning("[COURIER] order %s not found", order_id)
-                return False, "ORDER_NOT_FOUND"
-
-            leg, cell_id = self._get_leg_and_cell_id(order)
-            logger.debug("[COURIER] determined leg %s for cell %s in order %s", leg, cell_id, order_id)
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            leg = ctx.get("leg")
+            cell_id = ctx.get("cell_id")
+            if not leg or not cell_id:
+                return False, "UNKNOWN_LEG_OR_CELL"
 
             if leg == "pickup":
-                logger.info("[COURIER] processing pickup parcel for order %s", order_id)
                 self.db.order_courier1_pickup_parcel(session, order_id, user_id)
             else:
-                logger.info("[COURIER] processing delivery parcel for order %s", order_id)
                 self.db.order_courier2_pickup_parcel(session, order_id, user_id)
 
             self.db.open_locker_for_recipient(session, cell_id, user_id, "")
-            logger.info("[COURIER] cell %s opened successfully for order %s", cell_id, order_id)
+            logger.info("[COURIER] cell %s opened for order %s", cell_id, order_id)
             return True, ""
-            
+
         except Exception as e:
-            logger.error("[COURIER] failed to open cell for order %s: %s", order_id, str(e))
+            logger.error("[COURIER] open_cell failed: %s", str(e))
             return False, str(e)
 
     def close_cell(
@@ -1043,28 +636,24 @@ class CourierActions:
         logger.info("[COURIER] close_cell order=%s user=%s", order_id, user_id)
 
         try:
-            order = self.db.get_order(session, order_id)
-            if not order:
-                logger.warning("[COURIER] order %s not found", order_id)
-                return False, "ORDER_NOT_FOUND"
-
-            leg, cell_id = self._get_leg_and_cell_id(order)
-            logger.debug("[COURIER] determined leg %s for cell %s in order %s", leg, cell_id, order_id)
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            leg = ctx.get("leg")
+            cell_id = ctx.get("cell_id")
+            if not leg or not cell_id:
+                return False, "UNKNOWN_LEG_OR_CELL"
 
             if leg == "pickup":
-                logger.info("[COURIER] confirming parcel in and closing pickup cell %s for order %s", cell_id, order_id)
                 self.db.order_confirm_parcel_in(session, order_id, user_id)
                 self.db.close_locker(session, cell_id, user_id)
             else:
-                logger.info("[COURIER] confirming delivery and closing delivery cell %s for order %s", cell_id, order_id)
                 self.db.order_courier2_delivered_parcel(session, order_id, user_id)
                 self.db.close_locker_pickup(session, cell_id, user_id)
 
-            logger.info("[COURIER] cell %s closed successfully for order %s", cell_id, order_id)
+            logger.info("[COURIER] cell %s closed for order %s", cell_id, order_id)
             return True, ""
-            
+
         except Exception as e:
-            logger.error("[COURIER] failed to close cell for order %s: %s", order_id, str(e))
+            logger.error("[COURIER] close_cell failed: %s", str(e))
             return False, str(e)
 
     def cancel_order(
@@ -1104,73 +693,7 @@ class CourierActions:
         except Exception as e:
             logger.error("[COURIER] failed to cancel order %s: %s", order_id, str(e))
             return False, str(e)
-
-    def report_error(
-        self,
-        session: Session,
-        cell_id: int,
-        order_id: int,
-        user_id: int,
-        error_type: str,
-        trip_id: Optional[int] = None
-    ) -> Tuple[bool, str]:
-        """
-        Универсальный метод сообщения об ошибке курьером.
-        
-        error_type: 'locker_failed_to_open' | 'locker_failed_to_close' | 'locker_not_closed' | 
-                    'parcel_missing' | 'parcel_damaged' | 'wrong_parcel' | 'other'
-        """
-        logger.info("[COURIER] report_error cell=%s order=%s type=%s", cell_id, order_id, error_type)
-
-        try:
-            if error_type == "locker_failed_to_open":
-                logger.debug("[COURIER] handling locker_failed_to_open")
-                self.db.locker_report_failed_to_open(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_failed_to_close":
-                logger.debug("[COURIER] handling locker_failed_to_close")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_not_closed":
-                logger.debug("[COURIER] handling locker_not_closed")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "parcel_missing":
-                logger.debug("[COURIER] handling parcel_missing")
-                self.db.order_report_parcel_missing(session, order_id, user_id)
-                self.db.confirm_locker_parcel_not_found(session, cell_id, user_id)
-                self.db.reset_locker(session, cell_id, user_id)
-                
-            elif error_type == "parcel_damaged":
-                logger.debug("[COURIER] handling parcel_damaged")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "wrong_parcel":
-                logger.debug("[COURIER] handling wrong_parcel")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "other":
-                logger.debug("[COURIER] handling other")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            else:
-                logger.warning("[COURIER] unknown error_type=%s", error_type)
-                return False, f"UNKNOWN_ERROR_TYPE:{error_type}"
-
-            self.db.create_order_issue(
-                session, order_id, trip_id, user_id, error_type, f"Courier reported: {error_type}"
-            )
-
-            logger.info("[COURIER] report_error completed successfully")
-            return True, ""
-            
-        except Exception as e:
-            logger.error("[COURIER] report_error failed: %s", e)
-            return False, str(e)
-
+    
     def confirm_delivery_with_code(
         self,
         session: Session,
@@ -1275,95 +798,7 @@ class OperatorActions:
         except Exception as e:
             logger.error("[OPERATOR] failed to force cancel order %s: %s", order_id, str(e))
             return False, str(e)
-
-    def report_error(
-        self,
-        session: Session,
-        cell_id: int,
-        order_id: int,
-        user_id: int,
-        error_type: str,
-        trip_id: Optional[int] = None
-    ) -> Tuple[bool, str]:
-        """
-        Универсальный метод сообщения об ошибке оператором (ручное вмешательство).
-        error_type: 
-        - Для locker: 'locker_failed_to_open' | 'locker_failed_to_close' | 'locker_not_closed'
-        - Для order: 'parcel_missing' | 'parcel_damaged' | 'manual_override' | 'other'
-        - Для trip: 'trip_breakdown' | 'trip_delayed' | 'trip_route_issue' | 'trip_manual_intervention'
-        
-        """
-        logger.info("[OPERATOR] report_error cell=%s order=%s trip=%s type=%s", cell_id, order_id, trip_id, error_type)
-
-        try:
-            # === ОШИБКИ РЕЙСА (используем существующие методы db_layer) ===
-            if error_type in ["trip_breakdown", "trip_delayed", "trip_route_issue"]:
-                logger.debug("[OPERATOR] handling trip error: %s", error_type)
-                self.db.trip_report_failure(session, trip_id, user_id)
-                self.db.create_order_issue(
-                    session, 0, trip_id, user_id, error_type, f"Operator reported: {error_type}"
-                )
-                return True, ""
-                
-            elif error_type == "trip_manual_intervention":
-                logger.debug("[OPERATOR] handling trip_manual_intervention")
-                self.db.trip_request_manual_intervention(session, trip_id, user_id)
-                self.db.create_order_issue(
-                    session, 0, trip_id, user_id, error_type, f"Operator reported: {error_type}"
-                )
-                return True, ""
-            
-            # === ОШИБКИ ЯЧЕЙКИ ===
-            elif error_type == "locker_failed_to_open":
-                logger.debug("[OPERATOR] handling locker_failed_to_open")
-                self.db.locker_report_failed_to_open(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_failed_to_close":
-                logger.debug("[OPERATOR] handling locker_failed_to_close")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "locker_not_closed":
-                logger.debug("[OPERATOR] handling locker_not_closed")
-                self.db.locker_not_closed(session, cell_id, user_id)
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            # === ОШИБКИ ЗАКАЗА ===
-            elif error_type == "parcel_missing":
-                logger.debug("[OPERATOR] handling parcel_missing")
-                self.db.order_report_parcel_missing(session, order_id, user_id)
-                self.db.confirm_locker_parcel_not_found(session, cell_id, user_id)
-                self.db.reset_locker(session, cell_id, user_id)
-                
-            elif error_type == "parcel_damaged":
-                logger.debug("[OPERATOR] handling parcel_damaged")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "manual_override":
-                logger.debug("[OPERATOR] handling manual_override")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            elif error_type == "other":
-                logger.debug("[OPERATOR] handling other")
-                self.db.order_request_manual_intervention(session, order_id, user_id)
-                
-            else:
-                logger.warning("[OPERATOR] unknown error_type=%s", error_type)
-                return False, f"UNKNOWN_ERROR_TYPE:{error_type}"
-
-            # Записываем инцидент в базу
-            self.db.create_order_issue(
-                session, order_id, trip_id, user_id, error_type, f"Operator reported: {error_type}"
-            )
-
-            logger.info("[OPERATOR] report_error completed successfully")
-            return True, ""
-            
-        except Exception as e:
-            logger.error("[OPERATOR] report_error failed: %s", e)
-            return False, str(e)
-
+    
     def reset_locker(
         self,
         session: Session,
@@ -1415,106 +850,41 @@ class AccessCodeActions:
         leg: str
     ) -> Tuple[bool, str]:
         try:
-            # 1. Загрузить заказ
             order = self.db.get_order(session, order_id)
             if not order:
                 return False, "ORDER_NOT_FOUND"
 
-            # 2. Проверить статус
+            # Проверка, разрешён ли код при текущем статусе
             allowed_statuses = {
                 "pickup": ["order_created", "order_courier1_assigned", "order_parcel_confirmed"],
-                "delivery": ["order_in_transit_to_post2", "order_courier2_assigned", "order_courier2_parcel_delivered", "order_parcel_confirmed_post2"]
+                "delivery": ["order_in_transit_to_post2", "order_courier2_assigned",
+                             "order_courier2_parcel_delivered", "order_parcel_confirmed_post2"]
             }
             if order["status"] not in allowed_statuses[leg]:
                 return False, f"CODE_NOT_ALLOWED_IN_{order['status']}"
 
-            # 3. Определить, кто авторизован
-            authorized_user_id = None
-            user_role = self.db.get_user_role(session, user_id)
-            
-            if leg == "pickup":
-                # ✅ PICKUP
-                if order["pickup_type"] == "self":
-                    if user_role == "client":
-                        authorized_user_id = order["client_user_id"]
-                    elif user_role == "driver":
-                        stage = self.db.get_stage_order(session, order_id, "pickup")
-                        if stage and stage.get("reserved_by_driver_id") == user_id:
-                            authorized_user_id = user_id
-                    elif user_role == "operator": 
-                        authorized_user_id = user_id
-                    else:
-                        return False, "USER_NOT_AUTHORIZED"
-                else:
-                    stage = self.db.get_stage_order(session, order_id, "pickup")
-                    if user_role == "courier":
-                        authorized_user_id = stage["courier_user_id"] if stage else None
-                    elif user_role == "driver":
-                        if stage and stage.get("reserved_by_driver_id") == user_id:
-                            authorized_user_id = user_id
-                    elif user_role == "operator": 
-                        authorized_user_id = user_id
-                    else:
-                        return False, "USER_NOT_AUTHORIZED"
-                        
-            else: 
-                # ✅ DELIVERY
-                if order["delivery_type"] == "self":
-                    if user_role == "driver":
-                        stage = self.db.get_stage_order(session, order_id, "delivery")
-                        if stage and stage.get("trip_id"):
-                            trip = self.db.get_trip(session, stage["trip_id"])
-                            if trip and trip["driver_user_id"] == user_id:
-                                authorized_user_id = user_id
-                    elif user_role == "recipient":
-                        authorized_user_id = order.get("recipient_user_id")
-                    elif user_role == "operator": 
-                        authorized_user_id = user_id
-                    else:
-                        return False, "USER_NOT_AUTHORIZED"
-                else:
-                    if user_role == "driver":
-                        stage = self.db.get_stage_order(session, order_id, "delivery")
-                        if stage and stage.get("trip_id"):
-                            trip = self.db.get_trip(session, stage["trip_id"])
-                            if trip and trip["driver_user_id"] == user_id:
-                                authorized_user_id = user_id
-                    elif user_role == "courier":
-                        stage = self.db.get_stage_order(session, order_id, "delivery")
-                        authorized_user_id = stage["courier_user_id"] if stage else None
-                    elif user_role == "recipient":
-                        authorized_user_id = order.get("recipient_user_id")
-                    elif user_role == "operator":
-                        authorized_user_id = user_id
-                    else:
-                        return False, "USER_NOT_AUTHORIZED"
-
-            if authorized_user_id != user_id:
-                return False, "USER_NOT_AUTHORIZED"
-
-            # 4. Проверить лимит
+            # Лимит запросов
             recent = self.db.count_recent_access_code_requests(session, order_id, leg, 15)
             if recent >= 3:
                 return False, "TOO_MANY_CODE_REQUESTS"
 
-            # 5. Определить cell_id
-            cell_id = order["source_cell_id"] if leg == "pickup" else order["dest_cell_id"]
+            # Получаем cell_id через контекст
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            cell_id = ctx.get("cell_id")
             if not cell_id:
                 return False, "CELL_ID_MISSING"
 
-            # 6. Генерация PIN
+            # Генерация и отправка PIN
             pin, token_id = self.db.generate_and_store_access_token(
                 session, order_id, leg, cell_id, user_id, expires_minutes=15
             )
-
-            # 7. Отправить PIN
             self.db.send_code_to_user(session, user_id, pin)
-            
-            logger.info(f"Access code issued: order={order_id}, leg={leg}, user={user_id}, token={token_id}")
+
+            logger.info("Access code issued: order=%s, leg=%s, user=%s, token=%s", order_id, leg, user_id, token_id)
             return True, ""
 
         except Exception as e:
-            logger.exception(f"request_access_code failed for order {order_id}: {e}")
+            logger.exception("request_access_code failed for order %s: %s", order_id, e)
             return False, str(e)
 
 # ==================== РЕЙСЫ ====================
@@ -1749,6 +1119,304 @@ class TripActions:
             logger.exception("[TripActions] cancel_reservation failed")
             return False, "CANCEL_RESERVATION_FAILED: %s" % e
 
+# ================= Автоматизация типовых ошибок =====================
+class ReportErrorActions:
+    """Централизованная обработка типовых проблем."""
+
+    def __init__(self, db: DatabaseLayer, order_mapping):
+        self.db = db
+        self.order_mapping = order_mapping
+        self._scenario_map = {
+            # Проблемы с ячейками
+            "locker_failed_to_open":   self.resolve_locker_issue,
+            "locker_failed_to_close":  self.resolve_locker_issue,
+            "locker_not_closed":       self.resolve_locker_issue,
+            # Проблемы с посылками
+            "parcel_missing":          self.resolve_parcel_missing,
+            "parcel_damaged":          self.resolve_parcel_damaged,
+            "wrong_parcel":            self.resolve_parcel_damaged,
+            # Проблемы с рейсами
+            "trip_breakdown":          self.resolve_trip_breakdown,
+        }
+
+    def report_error(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int,
+        user_id: int,
+        error_type: str,
+        user_role: str,
+        description: str = ""
+    ) -> Tuple[bool, str]:
+        """Единая точка входа для всех жалоб."""
+        logger.info(
+            "[ReportErrorActions] report_error: role=%s, entity=%s:%s, error=%s",
+            user_role, entity_type, entity_id, error_type
+        )
+
+        handler = self._scenario_map.get(error_type)
+        if not handler:
+            logger.warning("[ReportErrorActions] unsupported error_type: %s", error_type)
+            return False, f"UNSUPPORTED_ERROR_TYPE: {error_type}"
+
+        try:
+            return handler(
+                session, entity_type, entity_id, user_id, error_type,
+                user_role, description
+            )
+        except DbLayerError as e:
+            logger.error("[ReportErrorActions] DbLayerError: %s", e)
+            return False, f"DB_ERROR: {e}"
+        except Exception as e:
+            logger.exception("[ReportErrorActions] Unexpected exception")
+            return False, f"INTERNAL_ERROR: {e}"
+
+    # ------------------------------------------------------------------
+    # Сценарий: проблемы с ячейкой
+    # ------------------------------------------------------------------
+    def resolve_locker_issue(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int,
+        user_id: int,
+        error_type: str,
+        user_role: str,
+        description: str
+    ) -> Tuple[bool, str]:
+        """Любые неисправности ячейки: автоматическое перебронирование или ручное вмешательство."""
+        # 1. Получаем необходимые данные
+        if entity_type == "locker":
+            cell_id = entity_id
+            order_id = self.db.get_order_id_by_cell_id(session, cell_id)
+            if not order_id:
+                return False, "CELL_NOT_LINKED_TO_ORDER"
+            order = self.db.get_order(session, order_id)
+            if not order:
+                return False, "ORDER_NOT_FOUND"
+            leg = "pickup" if cell_id == order["source_cell_id"] else "delivery"
+        elif entity_type == "order":
+            order_id = entity_id
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            leg = ctx.get("leg")
+            cell_id = ctx.get("cell_id")
+            if not leg or not cell_id:
+                return False, "INCOMPLETE_ENTITY_CONTEXT"
+        else:
+            return False, "ENTITY_TYPE_MUST_BE_ORDER_OR_LOCKER"
+
+        logger.info(
+            "[resolve_locker_issue] order=%s, cell=%s, leg=%s, role=%s, error=%s",
+            order_id, cell_id, leg, user_role, error_type
+        )
+
+        # 2. Определяем контекст: забираем посылку или кладём
+        is_retrieval = (
+            (user_role == "driver" and leg == "pickup") or
+            (user_role == "courier" and leg == "delivery") or
+            (user_role == "recipient" and leg == "delivery")
+        )
+
+        try:
+            if is_retrieval:
+                self.db.set_locker_maintenance(session, cell_id, user_id)
+                self.db.order_request_manual_intervention(session, order_id, user_id)
+                self.db.create_order_issue(
+                    session,
+                    order_id=order_id,
+                    trip_id=None,
+                    user_id=user_id,
+                    issue_type=error_type,
+                    description=f"Ячейка {cell_id} не открылась при заборе посылки ({error_type}). Требуется ручное вмешательство. {description}"
+                )
+                return True, "MANUAL_INTERVENTION_REQUIRED"
+
+            # ---------- DEPOSIT ----------
+            self.db.set_locker_maintenance(session, cell_id, user_id)
+            self.db.detach_cell_from_order(session, cell_id)
+
+            new_cell_id = self.db.find_and_reserve_alternative_cell(
+                session, order_id, broken_cell_id=cell_id, leg=leg
+            )
+
+            if new_cell_id:
+                self.db.create_order_issue(
+                    session,
+                    order_id=order_id,
+                    trip_id=None,
+                    user_id=user_id,
+                    issue_type="auto_rebooked",
+                    description=f"Ячейка {cell_id} ({error_type}) заменена на {new_cell_id}. {description}"
+                )
+                return True, f"Ваша новая ячейка: {new_cell_id}"
+
+            # Нет свободной ячейки
+            self.db.order_request_manual_intervention(session, order_id, user_id)
+            self.db.create_order_issue(
+                session,
+                order_id=order_id,
+                trip_id=None,
+                user_id=user_id,
+                issue_type=error_type,
+                description=f"Ячейка {cell_id} ({error_type}), свободных нет. {description}"
+            )
+            return True, "NO_FREE_CELL"
+
+        except DbLayerError as e:
+            logger.error("[resolve_locker_issue] DbLayerError: %s", e)
+            return False, f"DB_ERROR: {e}"
+        except Exception as e:
+            logger.exception("[resolve_locker_issue] Unexpected error")
+            return False, f"INTERNAL_ERROR: {e}"
+
+    # ------------------------------------------------------------------
+    # Сценарий: посылка пропала
+    # ------------------------------------------------------------------
+    def resolve_parcel_missing(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int,
+        user_id: int,
+        error_type: str,
+        user_role: str,
+        description: str
+    ) -> Tuple[bool, str]:
+        if entity_type == "order":
+            order_id = entity_id
+            ctx = self.db.get_context_for_entity(session, "order", order_id)
+            leg = ctx.get("leg")
+            cell_id = ctx.get("cell_id")
+            if not leg or not cell_id:
+                return False, "INCOMPLETE_ENTITY_CONTEXT"
+        elif entity_type == "locker":
+            cell_id = entity_id
+            order_id = self.db.get_order_id_by_cell_id(session, cell_id)
+            if not order_id:
+                return False, "CELL_NOT_LINKED_TO_ORDER"
+        else:
+            return False, "ENTITY_TYPE_MUST_BE_ORDER_OR_LOCKER"
+
+        logger.info("[resolve_parcel_missing] order=%s, cell=%s, user=%s, role=%s",
+                    order_id, cell_id, user_id, user_role)
+
+        try:
+            self.db.reset_locker(session, cell_id, user_id)
+            self.db.order_request_manual_intervention(session, order_id, user_id)
+            if user_role in ("driver", "courier"):
+                self.order_mapping.complete_suborder_in_core(session, order_id, user_id)
+            self.db.create_order_issue(
+                session, order_id=order_id, trip_id=None, user_id=user_id,
+                issue_type=error_type,
+                description=f"Посылка пропала в ячейке {cell_id}. {description}"
+            )
+            return True, ""
+        except Exception as e:
+            logger.exception("[resolve_parcel_missing] failed")
+            return False, str(e)
+
+    # ------------------------------------------------------------------
+    # Сценарий: посылка повреждена (или не та)
+    # ------------------------------------------------------------------
+    def resolve_parcel_damaged(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int,
+        user_id: int,
+        error_type: str,
+        user_role: str,
+        description: str
+    ) -> Tuple[bool, str]:
+        if entity_type == "order":
+            order_id = entity_id
+        elif entity_type == "locker":
+            order_id = self.db.get_order_id_by_cell_id(session, entity_id)
+            if not order_id:
+                return False, "CELL_NOT_LINKED_TO_ORDER"
+        else:
+            return False, "ENTITY_TYPE_MUST_BE_ORDER_OR_LOCKER"
+
+        logger.info("[resolve_parcel_damaged] order=%s, user=%s, role=%s",
+                    order_id, user_id, user_role)
+
+        try:
+            self.db.order_request_manual_intervention(session, order_id, user_id)
+            if user_role in ("driver", "courier"):
+                self.order_mapping.complete_suborder_in_core(session, order_id, user_id)
+            self.db.create_order_issue(
+                session, order_id=order_id, trip_id=None, user_id=user_id,
+                issue_type=error_type,
+                description=f"Посылка повреждена. {description}"
+            )
+            return True, ""
+        except Exception as e:
+            logger.exception("[resolve_parcel_damaged] failed")
+            return False, str(e)
+
+    # ------------------------------------------------------------------
+    # Сценарий: поломка рейса
+    # ------------------------------------------------------------------
+    def resolve_trip_breakdown(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int,
+        user_id: int,
+        error_type: str,
+        user_role: str,
+        description: str
+    ) -> Tuple[bool, str]:
+        if entity_type != "trip":
+            return False, "ENTITY_TYPE_MUST_BE_TRIP"
+
+        trip_id = entity_id
+        trip = self.db.get_trip(session, trip_id)
+        if not trip:
+            return False, "TRIP_NOT_FOUND"
+
+        driver_id = trip.get("driver_user_id")
+        if not driver_id:
+            return False, "NO_DRIVER_ASSIGNED"
+
+        logger.info("[resolve_trip_breakdown] trip=%s, driver=%s, user=%s, role=%s",
+                    trip_id, driver_id, user_id, user_role)
+
+        try:
+            order_ids = self.db.get_orders_in_trip(session, trip_id)
+            if not order_ids:
+                return False, "NO_ORDERS_IN_TRIP"
+
+            # 1. Core – снять подзаказы водителя
+            for order_id in order_ids:
+                self.order_mapping.remove_suborder_performer_in_core(
+                    session,
+                    local_order_id=order_id,
+                    performer_local_user_id=driver_id,
+                    user_id=driver_id,
+                    reason=f"trip_breakdown: {description}"
+                )
+
+            # 2. FSM – снять водителя с рейса и заказов
+            self.db.remove_driver_from_trip(session, trip_id, user_id)
+            self.db.clear_driver_from_stage_orders(session, order_ids)
+            self.db.trip_request_manual_intervention(session, trip_id, user_id)
+
+            # 3. Инцидент
+            self.db.create_order_issue(
+                session,
+                order_id=None,
+                trip_id=trip_id,
+                user_id=user_id,
+                issue_type=error_type,
+                description=f"Рейс {trip_id} сломан, водитель снят. {description}"
+            )
+            return True, ""
+        except Exception as e:
+            logger.exception("[resolve_trip_breakdown] failed")
+            return False, str(e)
+            
 # ================== Очистка ячеек постаматов ===========================
 class LockerActions:
     """Действия для управления ячейками (системные операции)."""
