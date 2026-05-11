@@ -1130,7 +1130,6 @@ class ReportErrorActions:
             # Проблемы с ячейками
             "locker_failed_to_open":   self.resolve_locker_issue,
             "locker_failed_to_close":  self.resolve_locker_issue,
-            "locker_not_closed":       self.resolve_locker_issue,
             # Проблемы с посылками
             "parcel_missing":          self.resolve_parcel_missing,
             "parcel_damaged":          self.resolve_parcel_damaged,

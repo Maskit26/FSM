@@ -3755,6 +3755,7 @@ class DatabaseLayer:
     ) -> Tuple[bool, int, str]:
         """
         Резервирует capacity заказов за водителем в направлении.
+        Возвращает (успех, количество зарезервированных заказов, сообщение).
         """
         logger.debug(
             "reserve_orders_for_direction вызван: direction_id=%s, driver_user_id=%s, capacity=%s",
@@ -3810,11 +3811,10 @@ class DatabaseLayer:
             
             reservation_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
             
-            # 4. Атомарный UPDATE заказов
-            result = session.execute(text("""
-                UPDATE stage_orders so
-                SET so.reserved_by_driver_id = :driver_user_id,
-                    so.reservation_id = :reservation_id
+            # 4. Выбрать уникальные ID заказов
+            order_rows = session.execute(text("""
+                SELECT DISTINCT so.order_id
+                FROM stage_orders so
                 WHERE so.direction_id = :direction_id
                 AND so.leg IN ('pickup', 'delivery')
                 AND so.reserved_by_driver_id IS NULL
@@ -3822,29 +3822,54 @@ class DatabaseLayer:
                 ORDER BY so.order_id ASC
                 LIMIT :capacity
             """), {
-                "driver_user_id": driver_user_id,
-                "reservation_id": reservation_id,
                 "direction_id": direction_id,
                 "capacity": capacity,
-            })
-            
-            reserved_count = result.rowcount
-            
-            if reserved_count == 0:
+            }).fetchall()
+
+            if not order_rows:
                 logger.warning(
-                    "reserve_orders_for_direction: не удалось зарезервировать заказы direction_id=%s",
+                    "reserve_orders_for_direction: не удалось найти заказы для резерва direction_id=%s",
                     direction_id
                 )
                 return False, 0, "RESERVATION_FAILED"
+
+            order_ids = [row[0] for row in order_rows]
+            reserved_count = len(order_ids) 
             
-            # 5. ЧАСТИЧНЫЙ РЕЗЕРВ (логирование)
+            # 5. Обновить все строки для выбранных заказов (pickup + delivery)
+            logger.info(
+                "Резервирование заказов: driver=%s, direction=%s, reservation=%s, заказы=%s",
+                driver_user_id, direction_id, reservation_id, order_ids
+            )
+
+            placeholders = ', '.join([f':order_{i}' for i in range(len(order_ids))])
+            params = {f'order_{i}': oid for i, oid in enumerate(order_ids)}
+            params["driver_user_id"] = driver_user_id
+            params["reservation_id"] = reservation_id
+            params["direction_id"] = direction_id
+
+            result = session.execute(text(f"""
+                UPDATE stage_orders so
+                SET so.reserved_by_driver_id = :driver_user_id,
+                    so.reservation_id = :reservation_id
+                WHERE so.direction_id = :direction_id
+                AND so.order_id IN ({placeholders})
+                AND so.leg IN ('pickup', 'delivery')
+            """), params)
+
+            logger.info(
+                "Обновлено %d строк в stage_orders для заказов %s",
+                result.rowcount, order_ids
+            )
+
+            # 6. ЧАСТИЧНЫЙ РЕЗЕРВ (логирование)
             if reserved_count < capacity:
                 logger.warning(
                     "reserve_orders_for_direction: частичный резерв запрошено=%s, зарезервировано=%s",
                     capacity, reserved_count
                 )
             
-            # 6. Обновить driver_reservations.reserved_count
+            # 7. Обновить driver_reservations.reserved_count
             session.execute(text("""
                 UPDATE driver_reservations
                 SET reserved_count = :count
@@ -3854,7 +3879,7 @@ class DatabaseLayer:
                 "reservation_id": reservation_id,
             })
             
-            # 7. Обновить счётчики в directions (БЕЗ orders_total!)
+            # 8. Обновить счётчики в directions
             self.recalculate_direction_counters(session, direction_id)
             
             logger.info(
@@ -3977,7 +4002,10 @@ class DatabaseLayer:
                     WHERE fal_close.entity_type = 'locker'
                     AND fal_close.action_name IN ('locker_close_pickup', 'locker_close_locker')
                     AND fal_close.user_id = :driver_user_id
-                    AND fal_close.created_at > fal_open.created_at
+                    AND (
+                        fal_close.created_at > fal_open.created_at
+                        OR (fal_close.created_at = fal_open.created_at AND fal_close.id > fal_open.id)
+                    )
                 )
                 AND lc.current_order_id IN (
                     SELECT so.order_id
