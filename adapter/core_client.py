@@ -2,7 +2,7 @@
 import requests
 import logging
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from .exceptions import CoreUnavailableError, CoreAuthError, CoreValidationError
 
@@ -114,6 +114,40 @@ class CoreClient:
         except Exception as e:
             logger.error("Core get_token error: %s", e)
             raise CoreUnavailableError(str(e)) from e
+
+    def get_cache_data(self, key: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Загружает и парсит публичный кэш Core (data_postamat.json).
+        Если key указан, возвращает только указанный раздел словаря (например, 'cities').
+        Если key не указан, возвращает весь распарсенный словарь.
+        """
+        try:
+            resp = requests.get(
+                "https://ibronevik.ru/taxi/cache/data_postamat.json",
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # data может быть словарём, где сразу лежат нужные разделы
+            if isinstance(data, dict):
+                if key:
+                    # Ищем key на верхнем уровне или внутри data.data
+                    section = data.get(key) or data.get("data", {}).get(key)
+                    if isinstance(section, dict):
+                        logger.info("Загружен раздел '%s' (%d записей)", key, len(section))
+                        return section
+                    else:
+                        logger.warning("Раздел '%s' не найден или имеет неверный формат", key)
+                        return {}
+                else:
+                    return data
+            else:
+                logger.error("Неожиданный формат data_postamat.json: %s", type(data))
+                return {}
+        except Exception as e:
+            logger.error("Не удалось загрузить data_postamat.json: %s", e)
+            return {}
 
 # ===================== CORE ORDER ======================
     

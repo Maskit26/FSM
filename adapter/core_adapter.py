@@ -98,6 +98,26 @@ class CoreAdapter:
             logger.error("get_user_cars failed: %s", e)
             return []
 
+    def resolve_city_name(self, city_id: str) -> Optional[str]:
+        """
+        Расшифровывает город из кеша
+        """
+        if not city_id:
+            return None
+        try:
+            cities = self.client.get_cache_data("cities")
+            city_info = cities.get(str(city_id))
+            if city_info and isinstance(city_info, dict):
+                name = city_info.get("1")
+                if name:
+                    logger.info("Город %s расшифрован → %s", city_id, name)
+                    return name
+            logger.warning("Город с ID %s не найден в справочнике", city_id)
+            return None
+        except Exception as e:
+            logger.error("Ошибка при расшифровке города %s: %s", city_id, e)
+            return None
+
 # ========================= Деавторизация =========================
     def logout_user_with_token(self, token: str, u_hash: str) -> Dict[str, Any]:
         logger.info("logout_user_with_token")

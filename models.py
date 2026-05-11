@@ -52,9 +52,9 @@ class CellCreateRequest(BaseModel):
     cell_type: str = "S"
 
 class FsmEnqueueRequest(BaseModel):
-    entity_type: str        # 'order' | 'trip' ...
+    entity_type: str   
     entity_id: int
-    process_name: str       # например 'order_assign_courier1'    
+    process_name: str    
     user_id: int
     target_user_id: Optional[int] = None
     target_role: Optional[str] = None
@@ -143,7 +143,7 @@ class UserRegisterRequest(BaseModel):
     phone: str
     email: Optional[str] = None
     role_name: str = "client"
-    city: Optional[str] = None
+    city: str
     password: str
 
 class UserRegisterResponse(BaseModel):
@@ -151,7 +151,7 @@ class UserRegisterResponse(BaseModel):
     user_id: int
     core_user_id: Optional[int] = None
     performer_type: Optional[str] = None
-    core_sync_status: str  # success, failed, unavailable
+    core_sync_status: str 
     message: str
 
 class UserLoginRequest(BaseModel):

@@ -30,6 +30,8 @@ def to_core_register(user_data: Dict[str, Any]) -> Dict[str, Any]:
         payload["u_phone"] = user_data["phone"]
     if user_data.get("email"):
         payload["u_email"] = user_data["email"]
+    if user_data.get("city"):
+        payload["u_city"] = user_data["city"]
 
     u_details = {"source": "fsm_backend"}
     data_obj = {"u_details": u_details}
@@ -94,6 +96,7 @@ def from_core_login(core_response: Any) -> Dict[str, Any]:
         "core_role": auth_user.get("u_role"),
         "user_name": auth_user.get("u_name"),
         "phone": auth_user.get("u_phone"),
+        "city": auth_user.get("u_city"),
     }
 
 # =================== Создание авто ===================

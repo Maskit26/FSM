@@ -85,7 +85,7 @@ class UserMapping:
             raise ValueError("auth_data is required for creating new user mapping")
 
         user_name = auth_data.get("user_name", f"User_{core_u_id}")
-        phone = auth_data.get("login", "")
+        phone = auth_data.get("phone") or auth_data.get("login", "")
         core_role = auth_data.get("core_role", 1)
 
         # Определяем локальную роль
@@ -100,12 +100,17 @@ class UserMapping:
             else:
                 local_role = "client"
 
+        # --- Обработка города ---
+        city_name = self.core_adapter.resolve_city_name(auth_data.get("city"))
+        if city_name is None:
+            city_name = auth_data.get("city") or "Неизвестен"
+
         local_user_id = self.db.create_user_record(
             session=session,
             phone=phone,
             name=user_name,
             role_name=local_role,
-            city=auth_data.get("city"),
+            city=city_name,             
         )
 
         self.db.create_user_core_mapping(
