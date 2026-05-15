@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, Request, Query
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fsm_engine import PROCESS_DEFS
+from fsm_actions import ReportErrorActions
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
@@ -928,14 +929,22 @@ async def process_timeouts(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Ошибка обработки таймаутов: {str(e)}")
 
-@app.get("/api/error-types", response_model=List[str])
-async def get_error_types(db: DatabaseLayer = Depends(get_db)):
-    """Получить список доступных типов ошибок."""
-    with get_db_session(read_only=True) as session:
-        try:
-            return db.get_error_types(session)
-        except DbLayerError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+@app.get("/api/error-scenarios", response_model=List[dict])
+async def get_error_scenarios(
+    role: Optional[str] = Query(None, description="Роль пользователя"),
+    entity_type: Optional[str] = Query(None, description="Тип сущности (order, locker, trip)")
+):
+    """Возвращает список поддерживаемых типов ошибок, опционально отфильтрованный."""
+    try:
+        scenarios = ReportErrorActions.get_supported_scenarios(role=role, entity_type=entity_type)
+        logger.info(
+            "Запрошен список сценариев ошибок (role=%s, entity=%s), найдено=%d",
+            role, entity_type, len(scenarios)
+        )
+        return scenarios
+    except Exception as e:
+        logger.exception("Ошибка получения списка сценариев ошибок")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # ==================== FSM ACTIONS ====================
 

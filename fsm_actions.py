@@ -1123,6 +1123,27 @@ class TripActions:
 class ReportErrorActions:
     """Централизованная обработка типовых проблем."""
 
+    SCENARIO_DESCRIPTIONS = {
+        "order": [
+            {"error_type": "parcel_missing",         "label": "Посылка пропала",
+             "roles": ["driver", "courier", "recipient"]},
+            {"error_type": "parcel_damaged",         "label": "Посылка повреждена",
+             "roles": ["driver", "courier", "recipient"]},
+            {"error_type": "wrong_parcel",           "label": "В ячейке чужая посылка",
+             "roles": ["driver", "courier", "recipient"]},
+        ],
+        "locker": [
+            {"error_type": "locker_failed_to_open",  "label": "Ячейка не открылась",
+             "roles": ["client", "courier", "driver", "recipient", "operator"]},
+            {"error_type": "locker_failed_to_close", "label": "Ячейка не закрылась",
+             "roles": ["client", "courier", "driver", "recipient", "operator"]},
+        ],
+        "trip": [
+            {"error_type": "trip_breakdown",         "label": "Поломка рейса",
+             "roles": ["driver"]},
+        ],
+    }
+
     def __init__(self, db: DatabaseLayer, order_mapping):
         self.db = db
         self.order_mapping = order_mapping
@@ -1137,6 +1158,25 @@ class ReportErrorActions:
             # Проблемы с рейсами
             "trip_breakdown":          self.resolve_trip_breakdown,
         }
+
+    def get_supported_scenarios(role: str = None, entity_type: str = None) -> list[dict]:
+        """Возвращает список сценариев с учётом фильтров по роли и типу сущности."""
+        scenarios = []
+        # Если entity_type задан, берём только его раздел, иначе все разделы
+        entities = [entity_type] if entity_type else ReportErrorActions.SCENARIO_DESCRIPTIONS.keys()
+
+        for ent in entities:
+            for item in ReportErrorActions.SCENARIO_DESCRIPTIONS.get(ent, []):
+                # Фильтр по роли
+                if role and role not in item["roles"]:
+                    continue
+                # Добавляем плоский объект, готовый для фронта
+                scenarios.append({
+                    "error_type": item["error_type"],
+                    "label": item["label"],
+                    "entity_type": ent
+                })
+        return scenarios
 
     def report_error(
         self,
