@@ -1126,11 +1126,11 @@ class ReportErrorActions:
     SCENARIO_DESCRIPTIONS = {
         "order": [
             {"error_type": "parcel_missing",         "label": "Посылка пропала",
-             "roles": ["driver", "courier", "recipient"]},
+             "roles": ["driver", "courier", "recipient", "client"]},
             {"error_type": "parcel_damaged",         "label": "Посылка повреждена",
-             "roles": ["driver", "courier", "recipient"]},
+             "roles": ["driver", "courier", "recipient", "client"]},
             {"error_type": "wrong_parcel",           "label": "В ячейке чужая посылка",
-             "roles": ["driver", "courier", "recipient"]},
+             "roles": ["driver", "courier", "recipient", "client"]},
         ],
         "locker": [
             {"error_type": "locker_failed_to_open",  "label": "Ячейка не открылась",
