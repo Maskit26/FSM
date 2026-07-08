@@ -4,10 +4,10 @@
 
 Развить текущий табличный FSM в декларативную FSM Platform, пригодную для нескольких доменов: courier, taxi и будущих сервисов.
 
-Базовая идея остаётся прежней:
+Базовая идея:
 
 ```text
-state + action -> transition -> new_state
+state + event -> candidate transitions -> selected transition -> new_state
 ```
 
 Но вокруг SQL-ядра добавляется Python Runtime, который выполняет общий pipeline:
@@ -24,15 +24,15 @@ context -> guard -> transition -> effect
 
 ```text
 fsm_states
-fsm_actions
+fsm_events
 fsm_transitions
-fsm_action_logs
-fsm_perform_action
+fsm_transition_logs
+fsm_perform_transition
 ```
 
 Ответственность SQL Core:
 
-- проверить допустимость перехода;
+- проверить, что выбранный Runtime transition всё ещё допустим для текущего state;
 - сменить статус сущности;
 - записать журнал перехода.
 
@@ -51,13 +51,16 @@ fsm_core/
   timers.py
 ```
 
+В документе `Runtime` означает весь общий движок `fsm_core`. `transition_runner.py` — внутренний компонент Runtime, который физически реализует pipeline перехода.
+
 Ответственность Runtime:
 
 - получить FSM instance;
 - найти зарегистрированный ProcessDef;
 - собрать context через доменный context_builder;
-- найти transition;
-- выполнить guard;
+- найти candidate transitions;
+- выполнить guards;
+- выбрать ровно один transition;
 - вызвать SQL Core для перехода;
 - выполнить local effects;
 - вернуть результат worker.
@@ -97,27 +100,96 @@ domains/
 Для декларативной модели `fsm_transitions` расширяется:
 
 ```sql
+RENAME TABLE fsm_actions TO fsm_events;
+
+ALTER TABLE fsm_transitions
+CHANGE COLUMN action_id event_id BIGINT NOT NULL;
+
+RENAME TABLE fsm_action_logs TO fsm_transition_logs;
+
+ALTER TABLE fsm_transition_logs
+CHANGE COLUMN action_name event_name VARCHAR(100) NOT NULL;
+
+ALTER TABLE fsm_transition_logs
+ADD COLUMN transition_id BIGINT NULL;
+
 ALTER TABLE fsm_transitions
 ADD COLUMN guard_name VARCHAR(100) NULL,
 ADD COLUMN guard_params JSON NULL,
+ADD COLUMN priority INT NOT NULL DEFAULT 100,
 ADD COLUMN effect_name VARCHAR(100) NULL,
 ADD COLUMN effect_params JSON NULL;
+
+CREATE UNIQUE INDEX ux_fsm_transition_priority
+ON fsm_transitions (entity_type, from_state_id, event_id, priority);
 ```
 
-Поля nullable, чтобы существующие постаматные переходы продолжили работать без изменений.
+`guard_name`, `guard_params`, `effect_name`, `effect_params` nullable, чтобы существующие постаматные переходы продолжили работать без изменений. `priority` получает `DEFAULT 100`.
 
 `guard_name` и `effect_name` — это не SQL-логика. Это ссылки на Python-функции, зарегистрированные в Runtime.
+
+Для MVP используется event/guard-routing модель:
+
+```text
+entity_type + from_state + event_name -> candidate transitions
+candidate transitions sorted by priority ASC + guard_name -> selected transition
+```
+
+`event_name` — это FSM event/trigger. Историческое название `action` в старом SQL Core больше не используется в новой инструкции.
+
+`guard_name` выбирает конкретный transition из candidate transitions. Для одного `entity_type + from_state + event_name` может быть несколько строк `fsm_transitions`.
+
+Runtime выбирает transition по правилу:
+
+```text
+1. candidate transitions сортируются по priority ASC;
+2. чем меньше priority, тем раньше проверяется transition;
+3. более специфичные guards должны иметь меньший priority;
+4. fallback/default transition должен иметь самый большой priority;
+5. transition без guard_name считается default transition;
+6. Runtime выбирает первый transition, у которого guard=true или guard_name=NULL;
+7. если не подошёл ни один guard, переход не выполняется;
+8. если для одного entity_type + from_state + event_name есть несколько transitions с одинаковым priority, Runtime возвращает AMBIGUOUS_TRANSITION.
+```
+
+`priority` должен быть уникален внутри одного набора candidate transitions. Это нужно, чтобы порядок выбора не зависел от порядка строк в БД.
+
+Default transition (`guard_name = NULL`) должен быть единственным для одного `entity_type + from_state + event_name` и иметь самый большой `priority`.
+
+SQL Core вызывается уже после выбора transition:
+
+```text
+fsm_perform_transition(
+  entity_type,
+  entity_id,
+  transition_id,
+  event_name,
+  user_id
+)
+```
+
+SQL Core обязан повторно проверить, что:
+
+```text
+- transition_id существует;
+- transition.entity_type совпадает с entity_type;
+- transition.event_name совпадает с event_name;
+- текущий state сущности всё ещё равен transition.from_state.
+```
+
+После этого SQL Core меняет state на `transition.to_state` и пишет `fsm_transition_logs`, включая `transition_id` и `event_name`.
 
 Пример:
 
 ```text
 entity_type = taxi_order
 from_state = draft
-action_name = order_submit
+event_name = order_submit
 to_state = searching_driver
 
 guard_name = can_submit_taxi_order
 guard_params = {"require_payment_method": true}
+priority = 100
 
 effect_name = create_trip_and_start_matching
 effect_params = {"notify_client": true}
@@ -127,8 +199,8 @@ effect_params = {"notify_client": true}
 
 ```text
 БД хранит декларативную карту перехода.
-Python Runtime исполняет guard/effect.
-SQL Core фиксирует смену состояния.
+Python Runtime исполняет guard/effect и выбирает transition.
+SQL Core фиксирует выбранный transition.
 ```
 
 ## Структура `fsm_core`
@@ -136,7 +208,7 @@ SQL Core фиксирует смену состояния.
 ```text
 fsm_core/
   engine.py
-    -- главный вход: run_action / run_instance
+    -- главный вход: run_event / run_instance
     -- получает instance
     -- берёт ProcessDef из registry
     -- запускает transition_runner
@@ -144,9 +216,10 @@ fsm_core/
   transition_runner.py
     -- общий pipeline:
        build context
-       load transition
-       run guard
-       perform transition
+       load candidate transitions
+       run guards
+       select transition
+       perform selected transition
        run effect
 
   registry.py
@@ -200,7 +273,7 @@ domains/taxi/engine.py
 `processes.py` только сообщает Runtime:
 
 ```text
-я умею выполнять процесс taxi_order_creation;
+я умею выполнять процесс submit_order;
 я умею выполнять guard can_submit_taxi_order;
 я умею выполнять effect start_driver_matching.
 ```
@@ -226,7 +299,7 @@ ProcessDef(
     service="taxi",
     process_name="submit_order",
     entity_type="taxi_order",
-    action_name="order_submit",
+    event_name="order_submit",
     context_builder=build_taxi_order_context,
 )
 ```
@@ -243,10 +316,10 @@ instance.service + instance.process_name -> ProcessDef
 
 ```text
 process_name — внешняя job/команда для worker и Runtime;
-action_name — внутренний FSM action/trigger для SQL Core.
+event_name — внутренний FSM event/trigger для Runtime.
 ```
 
-`action_name` не хранится в `server_fsm_instances` и не приходит напрямую с frontend. Runtime получает его из `ProcessDef`.
+`event_name` не хранится в `server_fsm_instances` и не приходит напрямую с frontend. Runtime получает его из `ProcessDef`.
 
 Для мультидомена в `server_fsm_instances` нужно добавить поле:
 
@@ -262,12 +335,12 @@ Runtime выполняет любой доменный процесс по од�
 1. Worker взял строку из server_fsm_instances.
 2. Runtime читает service, process_name, entity_type, entity_id.
 3. Runtime ищет ProcessDef в ProcessRegistry.
-4. Runtime получает action_name из ProcessDef.
+4. Runtime получает event_name из ProcessDef.
 5. Runtime вызывает context_builder из ProcessDef.
 6. Runtime читает текущий state сущности.
-7. Runtime ищет transition в fsm_transitions по entity_type + current_state + action_name.
-8. Runtime выполняет guard из GuardRegistry.
-9. Runtime вызывает SQL Core / fsm_perform_action.
+7. Runtime ищет candidate transitions в fsm_transitions по entity_type + current_state + event_name.
+8. Runtime выполняет guards из GuardRegistry и выбирает один transition.
+9. Runtime вызывает SQL Core / fsm_perform_transition для выбранного transition.
 10. Runtime выполняет effect из EffectRegistry.
 11. Runtime возвращает FsmResult.
 ```
@@ -293,13 +366,13 @@ Runtime выполняет любой доменный процесс по од�
 5. fsm_core.engine получает instance и находит ProcessDef:
    service = taxi
    process_name = submit_order
-   action_name = order_submit
+   event_name = order_submit
 
 6. Runtime вызывает taxi context_builder:
    domains/taxi/context.py
 
 7. transition_runner читает transition:
-   taxi_order + current_state=draft + action_name=order_submit
+   taxi_order + current_state=draft + event_name=order_submit
 
 8. transition содержит:
    guard_name = can_submit_taxi_order
@@ -312,12 +385,13 @@ Runtime выполняет любой доменный процесс по од�
 
 11. Если guard failed:
     переход не выполняется;
-    instance -> FAILED или WAITING по правилам процесса.
+    instance_status -> FAILED или WAITING по правилам процесса.
 
 12. Если guard ok:
-    Runtime вызывает fsm_perform_action или transition runner;
+    transition_runner выполняет шаг perform transition:
+    вызывает SQL Core / fsm_perform_transition;
     state: draft -> searching_driver;
-    пишется fsm_action_logs.
+    пишется fsm_transition_logs.
 
 13. EffectRegistry находит:
     domains.taxi.effects.create_trip_and_start_matching
@@ -326,7 +400,7 @@ Runtime выполняет любой доменный процесс по од�
     - создать trip;
     - записать realtime_event;
     - поставить timer;
-    - записать core_outbox, если нужен Core API.
+    - записать core_outbox для вызова Core API.
 
 15. Worker делает COMMIT.
 
@@ -348,13 +422,14 @@ fsm_worker
     fsm_core.engine.run_instance(session, instance)
       build context
       guard()
-      fsm_perform_action()
+      fsm_perform_transition()
       local effects
-      outbox/realtime_events/timers insert
+      core_outbox/realtime_events/fsm_timers insert
   COMMIT
 
 если ошибка:
   ROLLBACK
+  mark instance FAILED в отдельной короткой transaction
 
 finally:
   close session
@@ -369,7 +444,25 @@ domain code использует эту же session;
 commit/rollback делает только worker boundary.
 ```
 
-Guard — Python-функция, но она получает ту же DB session, что и `fsm_perform_action`.
+Guard — Python-функция, но она получает ту же DB session, что и `fsm_perform_transition`.
+
+Guard failed не считается exception:
+
+```text
+guard false
+  -> SQL Core не вызывается
+  -> state сущности не меняется
+  -> instance_status обновляется на WAITING или FAILED
+  -> worker делает COMMIT
+```
+
+Exception в guard, SQL Core или local effect считается ошибкой выполнения:
+
+```text
+exception
+  -> ROLLBACK всей transaction перехода
+  -> новая короткая transaction помечает instance_status = FAILED
+```
 
 ## Атомарность перехода
 
@@ -377,12 +470,13 @@ Guard — Python-функция, но она получает ту же DB sessi
 
 ```text
 1. выбор текущего состояния сущности;
-2. выбор transition из fsm_transitions;
+2. выбор candidate transitions из fsm_transitions;
 3. выполнение guard;
-4. смена состояния entity;
-5. запись fsm_action_logs;
-6. local DB effects, если они часть консистентного состояния;
-7. insert в outbox/realtime_events/timers.
+4. выбор ровно одного selected transition;
+5. смена состояния entity;
+6. запись fsm_transition_logs;
+7. local DB effects, если они часть консистентного состояния;
+8. insert в core_outbox/realtime_events/fsm_timers.
 ```
 
 Внешние side effects не выполняются внутри транзакции:
@@ -468,7 +562,9 @@ Core API — внешний сервис. Его нельзя откатить �
 
 ```text
 FSM effect:
-  - пишет core_outbox;
+  - пишет core_outbox.
+
+worker boundary:
   - commit.
 
 core_outbox_worker:
@@ -515,13 +611,13 @@ timer -> напрямую поменять status
 Нужно:
 
 ```text
-timer fired -> server_fsm_instance(process_name) -> Runtime -> action_name -> обычный FSM pipeline
+timer fired -> server_fsm_instance(process_name) -> Runtime -> event_name -> обычный FSM pipeline
 ```
 
 То есть:
 
 ```text
-timer -> process_name -> ProcessDef.action_name -> transition lookup -> guard -> state change -> effect -> log
+timer -> process_name -> ProcessDef.event_name -> transition lookup -> guard routing -> state change -> effect -> log
 ```
 
 Timer subsystem нужна для:
@@ -588,7 +684,7 @@ effect_name = mark_trip_started
 Он моделируется обычным FSM flow:
 
 ```text
-NO_DRIVERS_AVAILABLE --order_rematch_driver--> SEARCHING_DRIVER
+NO_DRIVERS_AVAILABLE --event_name=order_rematch_driver--> SEARCHING_DRIVER
 ```
 
 Запуск делает не worker по знанию taxi state. Доменный effect создаёт timer:
@@ -607,7 +703,7 @@ process_name = rematch_driver
 
 ```text
 VOTE:
-  pickupWindowTimeout -> process_name=vote_no_show -> action_name=order_vote_no_show
+  pickupWindowTimeout -> process_name=vote_no_show -> event_name=order_vote_no_show
 
 DIRECT:
   pickup_timeout/no-show не реализуется в MVP.
@@ -664,10 +760,10 @@ Registry относится к Python Runtime, не к SQL Core.
 FSM Platform
 ├── SQL Core
 │   ├── fsm_states
-│   ├── fsm_actions
+│   ├── fsm_events
 │   ├── fsm_transitions
-│   ├── fsm_action_logs
-│   └── fsm_perform_action
+│   ├── fsm_transition_logs
+│   └── fsm_perform_transition
 │
 └── Python Runtime
     ├── engine
