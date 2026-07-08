@@ -71,14 +71,14 @@ domains/
   taxi/
     context.py
     guards.py
-    actions.py
+    effects.py
     processes.py
     engine.py
 
   courier/
     context.py
     guards.py
-    actions.py
+    effects.py
     processes.py
     engine.py
 ```
@@ -163,7 +163,7 @@ fsm_core/
 
   timers.py
     -- создание/отмена/срабатывание таймеров
-    -- timer -> обычный action
+    -- timer -> обычный server_fsm_instance(process_name)
 ```
 
 ## Структура домена
@@ -179,11 +179,11 @@ domains/taxi/guards.py
   -- driver_can_accept_order
   -- payment_is_confirmed
 
-domains/taxi/actions.py
+domains/taxi/effects.py
   -- start_driver_matching
   -- assign_driver
   -- create_realtime_event
-  -- schedule_offer_timeout
+  -- schedule_matching_timeout
 
 domains/taxi/processes.py
   -- регистрирует ProcessDef
@@ -214,7 +214,7 @@ service = taxi
 process_name = submit_order
 entity_type = taxi_order
 entity_id = 123
-fsm_state = PENDING
+instance_status = PENDING
 ```
 
 Таблица не является справочником всех процессов. Она хранит только инстансы.
@@ -286,7 +286,7 @@ Runtime выполняет любой доменный процесс по од�
    process_name = submit_order
    entity_type = taxi_order
    entity_id = order_id
-   fsm_state = PENDING
+   instance_status = PENDING
 
 4. fsm_worker забирает instance.
 
@@ -320,7 +320,7 @@ Runtime выполняет любой доменный процесс по од�
     пишется fsm_action_logs.
 
 13. EffectRegistry находит:
-    domains.taxi.actions.create_trip_and_start_matching
+    domains.taxi.effects.create_trip_and_start_matching
 
 14. Effect выполняет local DB effects:
     - создать trip;
@@ -333,7 +333,7 @@ Runtime выполняет любой доменный процесс по од�
 16. После commit:
     realtime gateway доставляет события;
     core_outbox_worker вызывает Core API;
-    timer subsystem позже порождает обычные FSM actions.
+    timer subsystem позже создаёт обычные FSM jobs.
 ```
 
 ## Транзакции
@@ -430,7 +430,22 @@ effect_params
 
 `effect_type` можно оставить концепцией в документации/Python-коде.
 
-Если понадобится строгая декларативность и несколько effects на один transition, лучше добавить отдельную таблицу:
+Если transition должен выполнить несколько локальных действий, для MVP используется composite effect:
+
+```text
+effect_name = create_trip_and_start_matching
+```
+
+Внутри Python effect может:
+
+```text
+- создать trip;
+- записать realtime_event;
+- записать core_outbox;
+- поставить timer.
+```
+
+После MVP, если понадобится строгая декларативность и несколько effects на один transition, добавляется отдельная таблица:
 
 ```sql
 CREATE TABLE fsm_transition_effects (
@@ -460,16 +475,36 @@ core_outbox_worker:
   - читает core_outbox;
   - вызывает Core API;
   - сохраняет результат;
-  - при необходимости запускает следующий FSM action.
+  - при необходимости создаёт следующий server_fsm_instance.
 ```
 
 Запись в `core_outbox` — это local DB effect.
 
 Runtime не должен знать бизнес-смысл outbox-события. Runtime только даёт транзакцию и вызывает effect.
 
+Для MVP `core_outbox` закладывается сразу.
+
+Минимальная схема:
+
+```text
+core_outbox
+  id
+  service
+  event_type
+  payload_json
+  status = PENDING / PROCESSING / COMPLETED / FAILED
+  attempts_count
+  next_retry_at
+  last_error
+  created_at
+  processed_at
+```
+
+Все вызовы Core API проходят через `core_outbox`. Внешний Core API не вызывается напрямую из guard/effect внутри transition. Effect только пишет `core_outbox`.
+
 ## Timers
 
-Таймер — это источник Action, а не отдельный способ менять состояние.
+Таймер — это источник новой FSM job, а не отдельный способ менять состояние.
 
 Нельзя:
 
@@ -480,13 +515,13 @@ timer -> напрямую поменять status
 Нужно:
 
 ```text
-timer fired -> action -> обычный FSM pipeline
+timer fired -> server_fsm_instance(process_name) -> Runtime -> action_name -> обычный FSM pipeline
 ```
 
 То есть:
 
 ```text
-timer -> transition lookup -> guard -> state change -> effect -> log
+timer -> process_name -> ProcessDef.action_name -> transition lookup -> guard -> state change -> effect -> log
 ```
 
 Timer subsystem нужна для:
@@ -498,7 +533,91 @@ Timer subsystem нужна для:
 - защиты от повторного выполнения.
 ```
 
-Но результатом работы таймера всегда должен быть обычный FSM action.
+Но результатом работы таймера всегда должен быть обычный `server_fsm_instance` с `process_name`.
+
+Для MVP таймеры хранятся в отдельной таблице `fsm_timers`. `server_fsm_instances.next_timer_at` не используется как source of truth.
+
+Минимальная схема:
+
+```text
+fsm_timers
+  id
+  service
+  entity_type
+  entity_id
+  process_name
+  fire_at
+  status = SCHEDULED / FIRED / CANCELLED / FAILED
+  payload_json
+  idempotency_key
+  created_at
+  fired_at
+  cancelled_at
+```
+
+При срабатывании `timer_worker` создаёт `server_fsm_instance`:
+
+```text
+service = taxi
+process_name = rematch_driver
+entity_type = taxi_order
+entity_id = order_id
+instance_status = PENDING
+```
+
+## Taxi MVP decisions
+
+`Trip` сразу выделяется отдельной доменной сущностью и отдельной таблицей `trips`.
+
+Для MVP допускается, что основной lifecycle заказа остаётся в `taxi_order`, а `create_trip` является effect перехода заказа. Отдельный сложный Trip FSM добавляется, когда у поездки появляется самостоятельный lifecycle.
+
+`BOARDING_VERIFICATION` для MVP не выделяется в отдельную сущность.
+
+Посадка моделируется как guard/effect между переходами:
+
+```text
+order_driver_arrived -> order_in_ride
+guard_name = can_start_ride
+effect_name = mark_trip_started
+```
+
+`BoardingSession` добавляется позже только при появлении отдельного lifecycle посадки: OTP, retry, dispute, timeout, audit.
+
+`Re-matching` для MVP не является отдельной saga/orchestration.
+
+Он моделируется обычным FSM flow:
+
+```text
+NO_DRIVERS_AVAILABLE --order_rematch_driver--> SEARCHING_DRIVER
+```
+
+Запуск делает не worker по знанию taxi state. Доменный effect создаёт timer:
+
+```text
+effect_name = schedule_rematch_timer
+```
+
+Timer subsystem позже создаёт:
+
+```text
+process_name = rematch_driver
+```
+
+Точные таймеры taxi для MVP:
+
+```text
+VOTE:
+  pickupWindowTimeout -> process_name=vote_no_show -> action_name=order_vote_no_show
+
+DIRECT:
+  pickup_timeout/no-show не реализуется в MVP.
+
+OFFER:
+  pickup_timeout/no-show не реализуется в MVP.
+  offer_accept_timeout не реализуется в MVP.
+```
+
+Расширение DIRECT/OFFER таймерами после MVP делается через новые `fsm_timers`, `ProcessDef` и `fsm_transitions` без изменения общей архитектуры.
 
 ## Worker
 
@@ -529,7 +648,7 @@ Timer subsystem нужна для:
 Для нескольких worker-процессов нужны поля:
 
 ```text
-fsm_state = PENDING / PROCESSING / COMPLETED / FAILED
+instance_status = PENDING / PROCESSING / WAITING / COMPLETED / FAILED
 locked_at
 locked_by
 processing_started_at
