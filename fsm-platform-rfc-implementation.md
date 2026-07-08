@@ -113,7 +113,7 @@ ADD COLUMN effect_params JSON NULL;
 ```text
 entity_type = taxi_order
 from_state = draft
-action = submit_order
+action_name = order_submit
 to_state = searching_driver
 
 guard_name = can_submit_taxi_order
@@ -211,7 +211,7 @@ domains/taxi/engine.py
 
 ```text
 service = taxi
-process_name = taxi_order_creation
+process_name = submit_order
 entity_type = taxi_order
 entity_id = 123
 fsm_state = PENDING
@@ -224,8 +224,9 @@ fsm_state = PENDING
 ```python
 ProcessDef(
     service="taxi",
-    process_name="taxi_order_creation",
+    process_name="submit_order",
     entity_type="taxi_order",
+    action_name="order_submit",
     context_builder=build_taxi_order_context,
 )
 ```
@@ -237,6 +238,15 @@ instance.service + instance.process_name -> ProcessDef
 ```
 
 Если процесс не зарегистрирован, Runtime возвращает ошибку `UNKNOWN_PROCESS`.
+
+Правило именования:
+
+```text
+process_name — внешняя job/команда для worker и Runtime;
+action_name — внутренний FSM action/trigger для SQL Core.
+```
+
+`action_name` не хранится в `server_fsm_instances` и не приходит напрямую с frontend. Runtime получает его из `ProcessDef`.
 
 Для мультидомена в `server_fsm_instances` нужно добавить поле:
 
@@ -250,15 +260,16 @@ Runtime выполняет любой доменный процесс по од�
 
 ```text
 1. Worker взял строку из server_fsm_instances.
-2. Runtime читает service, process_name, entity_type, entity_id, action.
+2. Runtime читает service, process_name, entity_type, entity_id.
 3. Runtime ищет ProcessDef в ProcessRegistry.
-4. Runtime вызывает context_builder из ProcessDef.
-5. Runtime читает текущий state сущности.
-6. Runtime ищет transition в fsm_transitions.
-7. Runtime выполняет guard из GuardRegistry.
-8. Runtime вызывает SQL Core / fsm_perform_action.
-9. Runtime выполняет effect из EffectRegistry.
-10. Runtime возвращает FsmResult.
+4. Runtime получает action_name из ProcessDef.
+5. Runtime вызывает context_builder из ProcessDef.
+6. Runtime читает текущий state сущности.
+7. Runtime ищет transition в fsm_transitions по entity_type + current_state + action_name.
+8. Runtime выполняет guard из GuardRegistry.
+9. Runtime вызывает SQL Core / fsm_perform_action.
+10. Runtime выполняет effect из EffectRegistry.
+11. Runtime возвращает FsmResult.
 ```
 
 Для Runtime нет разницы между taxi и courier. Различается только доменная реализация context/guard/effect.
@@ -272,23 +283,23 @@ Runtime выполняет любой доменный процесс по од�
 
 3. API или domain service создаёт server_fsm_instance:
    service = taxi
-   process_name = taxi_order_creation
+   process_name = submit_order
    entity_type = taxi_order
    entity_id = order_id
-   requested_action = submit_order
    fsm_state = PENDING
 
 4. fsm_worker забирает instance.
 
 5. fsm_core.engine получает instance и находит ProcessDef:
    service = taxi
-   process_name = taxi_order_creation
+   process_name = submit_order
+   action_name = order_submit
 
 6. Runtime вызывает taxi context_builder:
    domains/taxi/context.py
 
 7. transition_runner читает transition:
-   taxi_order + current_state=draft + action=submit_order
+   taxi_order + current_state=draft + action_name=order_submit
 
 8. transition содержит:
    guard_name = can_submit_taxi_order
