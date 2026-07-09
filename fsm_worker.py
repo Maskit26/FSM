@@ -1,38 +1,35 @@
 # fsm_worker.py
+"""FSM worker: claim instance → run_instance → commit/rollback."""
 
-import time
+from __future__ import annotations
+
+import json
 import logging
 import os
-import json
-from typing import Any, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import socket
+import time
 from contextlib import contextmanager
-from sqlalchemy import create_engine
-from sqlalchemy.engine import URL
-from sqlalchemy.orm import sessionmaker, Session
+from typing import Any, Dict, Tuple
 
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
+from sqlalchemy.orm import Session, sessionmaker
 
 from db_layer import DatabaseLayer, DbLayerError
-from adapter.core_adapter import CoreAdapter
-import domains.courier.processes  # noqa: F401 - registers courier processes
+from domains.bootstrap import register_domains
 from fsm_core.engine import run_instance
 from fsm_core.registry import default_process_registry
 from fsm_core.types import FsmResult
 
 load_dotenv()
 
-# ================== CONFIG ==================
+POLL_INTERVAL_SECONDS = int(os.getenv("FSM_POLL_INTERVAL_SECONDS", "5"))
+BATCH_SIZE = int(os.getenv("FSM_BATCH_SIZE", "20"))
+MAX_ATTEMPTS = int(os.getenv("FSM_MAX_ATTEMPTS", "5"))
+STUCK_THRESHOLD_MINUTES = int(os.getenv("FSM_STUCK_THRESHOLD_MINUTES", "60"))
+WORKER_ID = os.getenv("FSM_WORKER_ID", socket.gethostname())
 
-POLL_INTERVAL_SECONDS = 5
-BATCH_SIZE = 20
-MAX_ATTEMPTS = 5
-STUCK_THRESHOLD_MINUTES = 60
-MAX_WORKERS = 1
-LOCKER_CLEANUP_INTERVAL_SECONDS = 300
-_last_cleanup_check = 0
-
-# ================== DB SETUP ==================
 
 def get_required_env(name: str) -> str:
     value = os.getenv(name)
@@ -80,27 +77,16 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# ================== LOGGING ==================
-
 logging.basicConfig(
     level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
+    format="[%(asctime)s] %(levelname)s: %(message)s",
 )
-
 logger = logging.getLogger(__name__)
 
-# ================== CORE ADAPTER ====================
-core_adapter = CoreAdapter(
-    core_url=os.getenv("CORE_URL", "https://ibronevik.ru/taxi/c/postamat/"),
-    core_api_key=os.getenv("CORE_API_KEY", ""),
-    core_timeout=5
-)
-
-# ================== CONTEXT MANAGER ==================
 
 @contextmanager
-def get_db_session() -> Session:
-    """Контекст для сессии в воркере (всегда write)."""
+def session_scope() -> Session:
+    """Transaction boundary воркера: commit при успехе, rollback при exception."""
     session = SessionLocal()
     try:
         yield session
@@ -111,10 +97,9 @@ def get_db_session() -> Session:
     finally:
         session.close()
 
-# ================== HELPERS ==================
 
 def row_to_instance_dict(row: Tuple[Any, ...]) -> Dict[str, Any]:
-    # row — это tuple из fetchall(), поэтому индексируем по позиции
+    """Строка server_fsm_instances → dict для run_instance."""
     instance = {
         "id": row[0],
         "entity_type": row[1],
@@ -129,280 +114,182 @@ def row_to_instance_dict(row: Tuple[Any, ...]) -> Dict[str, Any]:
         "target_user_id": row[10],
         "target_role": row[11],
         "metadata_json": row[12],
+        "service": row[13] if len(row) > 13 and row[13] else "courier",
     }
-    instance["service"] = row[13] if len(row) > 13 and row[13] else "courier"
+    try:
+        instance["metadata"] = (
+            json.loads(instance["metadata_json"]) if instance.get("metadata_json") else {}
+        )
+    except (ValueError, TypeError, json.JSONDecodeError):
+        logger.warning(
+            "[FSM] invalid metadata_json instance_id=%s",
+            instance["id"],
+        )
+        instance["metadata"] = {}
     return instance
 
-# ================== CORE ==================
 
-def process_instance(
+def _log_error_independently(db: DatabaseLayer, instance: Dict[str, Any], error: str) -> None:
+    """Записать ошибку в fsm_errors_log отдельной короткой транзакцией."""
+    with session_scope() as log_session:
+        db.log_error_to_db(
+            session=log_session,
+            error_message=error,
+            entity_type=instance.get("entity_type"),
+            entity_id=instance.get("entity_id"),
+            action_name=instance.get("process_name"),
+            user_id=instance.get("requested_by_user_id"),
+        )
+
+
+def _mark_instance_failed(
     db: DatabaseLayer,
-    core_adapter: CoreAdapter,
-    instance_row: Any,
+    instance_id: int,
+    error: str,
+    attempts_increment: int = 1,
 ) -> None:
-    """
-    ОДИН FSM instance = ОДНА транзакция.
-    Сессия создаётся и управляется внутри этого вызова.
-    """
-    with get_db_session() as session:
-        try:
-            instance = row_to_instance_dict(instance_row)
-            # ДЕСЕРИАЛИЗАЦИЯ METADATA
-            try:
-                instance["metadata"] = json.loads(instance["metadata_json"]) if instance.get("metadata_json") else {}
-            except (ValueError, TypeError, json.JSONDecodeError):
-                logger.warning(
-                    "[FSM] invalid metadata_json for instance_id=%s: %s",
-                    instance["id"],
-                    instance.get("metadata_json")
-                )
-                instance["metadata"] = {}
+    """Пометить инстанс FAILED в отдельной транзакции (после rollback основной)."""
+    with session_scope() as fail_session:
+        db.update_fsm_instance(
+            session=fail_session,
+            instance_id=instance_id,
+            new_state="FAILED",
+            last_error=error,
+            attempts_increment=attempts_increment,
+        )
 
-            runtime_ctx = {"core_adapter": core_adapter}
 
-            logger.info(
-                "[FSM] start instance_id=%s process=%s state=%s attempts=%s",
-                instance["id"],
-                instance["process_name"],
-                instance["fsm_state"],
-                instance["attempts_count"],
-            )
+def process_instance(db: DatabaseLayer, instance_id: int) -> None:
+    """Один инстанс = одна транзакция: claim → run_instance → сохранить результат."""
+    with session_scope() as session:
+        row = db.try_claim_fsm_instance(session, instance_id)
+        if row is None:
+            return
 
-            # ================= MAX ATTEMPTS =================
-            if instance["attempts_count"] >= MAX_ATTEMPTS:
-                logger.warning("[FSM] max attempts exceeded id=%s", instance["id"])
+        instance = row_to_instance_dict(row)
+        runtime_ctx = {"worker_id": WORKER_ID}
 
-                db.update_fsm_instance(
-                    session=session,
-                    instance_id=instance["id"],
-                    new_state="FAILED",
-                    last_error="MAX_ATTEMPTS_EXCEEDED",
-                    attempts_increment=0,
-                )
+        logger.info(
+            "[FSM] start id=%s service=%s process=%s attempts=%s worker=%s",
+            instance["id"],
+            instance["service"],
+            instance["process_name"],
+            instance["attempts_count"],
+            WORKER_ID,
+        )
 
-                if instance["process_name"] == "order_creation":
-                    db.mark_request_failed(
-                        session=session,
-                        request_id=instance["entity_id"],
-                        error_code="MAX_ATTEMPTS",
-                        error_message="FSM attempts exceeded",
-                    )
-                return
-
-            # ================= RUN STEP =================
-            try:
-                result: FsmResult = run_instance(
-                    session=session,
-                    db=db,
-                    runtime_ctx=runtime_ctx,
-                    instance=instance,
-                )
-            except Exception as step_error:
-                logger.exception("[FSM] step error instance_id=%s", instance["id"])               
-
-                result = FsmResult(
-                    new_state="FAILED",
-                    last_error=str(step_error),
-                    attempts_increment=1,
-                    payload=None,
-                )            
-
-            # ================= UPDATE INSTANCE =================
-            if result.new_state == "FAILED":
-                logger.warning("[FSM] Step failed. Rolling back everything for instance %s", instance["id"])
-                
-                with SessionLocal() as log_session:
-                    try:
-                        db.log_error_to_db(
-                            session=log_session,
-                            error_message=result.last_error,
-                            entity_type=instance["entity_type"],
-                            entity_id=instance["entity_id"],
-                            action_name=instance["process_name"],
-                            user_id=instance["requested_by_user_id"]
-                        )
-                        log_session.commit()
-                        logger.info("[FSM] Error log saved independently")
-                    except Exception as log_e:
-                        log_session.rollback()
-                        logger.error("[FSM] Failed to save log_error_to_db: %s", log_e)
-                session.rollback() 
-                
-                # записать ошибку в НОВОЙ транзакции
-                db.update_fsm_instance(
-                    session=session,
-                    instance_id=instance["id"],
-                    new_state="FAILED",
-                    last_error=result.last_error,
-                    attempts_increment=result.attempts_increment or 0,
-                )
-                return 
-            
-            # Если всё SUCCESS
+        if instance["attempts_count"] >= MAX_ATTEMPTS:
+            logger.warning("[FSM] max attempts id=%s", instance["id"])
             db.update_fsm_instance(
                 session=session,
                 instance_id=instance["id"],
-                new_state=result.new_state,
-                last_error=result.last_error,
-                next_timer_at=result.next_timer_at,
-                attempts_increment=result.attempts_increment or 0,
+                new_state="FAILED",
+                last_error="MAX_ATTEMPTS_EXCEEDED",
+                attempts_increment=0,
             )
-            # ================= HANDLE ORDER REQUEST =================
-            if instance["process_name"] == "order_creation":
-                if result.new_state == "COMPLETED":
-                    order_id = result.payload.get("order_id") if result.payload else None
-                    logger.info(
-                        "[FSM] order_creation COMPLETED request_id=%s order_id=%s",
-                        instance["entity_id"],
-                        order_id,
-                    )
-                    db.mark_request_completed(
-                        session=session,
-                        request_id=instance["entity_id"],
-                        order_id=order_id,
-                    )
+            return
 
-                elif result.new_state == "FAILED":
-                    logger.warning(
-                        "[FSM] order_creation FAILED request_id=%s err=%s",
-                        instance["entity_id"],
-                        result.last_error,
-                    )
-                    db.mark_request_failed(
-                        session=session,
-                        request_id=instance["entity_id"],
-                        error_code=result.last_error or "FSM_FAILED",
-                        error_message=result.last_error or "FSM failed",
-                    )
+        try:
+            result: FsmResult = run_instance(
+                session=session,
+                db=db,
+                runtime_ctx=runtime_ctx,
+                instance=instance,
+            )
+        except Exception as step_error:
+            logger.exception("[FSM] exception id=%s", instance["id"])
+            session.rollback()
+            _log_error_independently(db, instance, str(step_error))
+            _mark_instance_failed(
+                db,
+                instance_id=instance["id"],
+                error=str(step_error),
+                attempts_increment=1,
+            )
+            return
 
-            logger.info("[FSM] done instance_id=%s → %s", instance["id"], result.new_state)
+        if result.new_state == "FAILED":
+            logger.warning(
+                "[FSM] failed id=%s err=%s",
+                instance["id"],
+                result.last_error,
+            )
+            session.rollback()
+            _log_error_independently(db, instance, result.last_error or "FSM_FAILED")
+            _mark_instance_failed(
+                db,
+                instance_id=instance["id"],
+                error=result.last_error or "FSM_FAILED",
+                attempts_increment=result.attempts_increment or 1,
+            )
+            return
 
-        except Exception:
-            logger.exception("[FSM] CRITICAL ERROR instance_id=%s", instance["id"])
-            raise
+        db.update_fsm_instance(
+            session=session,
+            instance_id=instance["id"],
+            new_state=result.new_state,
+            last_error=result.last_error,
+            next_timer_at=result.next_timer_at,
+            attempts_increment=result.attempts_increment or 0,
+        )
+        logger.info("[FSM] done id=%s → %s", instance["id"], result.new_state)
 
-# ================== STUCK CHECK ==================
 
 def check_stuck_instances(db: DatabaseLayer) -> int:
-    with get_db_session() as session:
-        try:
-            stuck_ids = db.get_stuck_fsm_instances(
+    """PROCESSING дольше порога → FAILED (STUCK_TIMEOUT)."""
+    with session_scope() as session:
+        stuck_ids = db.get_stuck_fsm_instances(
+            session=session,
+            threshold_minutes=STUCK_THRESHOLD_MINUTES,
+        )
+        for instance_id in stuck_ids:
+            db.update_fsm_instance(
                 session=session,
-                threshold_minutes=STUCK_THRESHOLD_MINUTES,
+                instance_id=instance_id,
+                new_state="FAILED",
+                last_error="STUCK_TIMEOUT",
+                attempts_increment=0,
             )
-
-            if not stuck_ids:
-                return 0
-
-            for instance_id in stuck_ids:
-                db.update_fsm_instance(
-                    session=session,
-                    instance_id=instance_id,
-                    new_state="FAILED",
-                    last_error="STUCK_TIMEOUT",
-                    attempts_increment=0,
-                )
-
+        if stuck_ids:
             logger.warning("[FSM] stuck failed count=%s", len(stuck_ids))
-            return len(stuck_ids)
+        return len(stuck_ids)
 
-        except Exception:
-            logger.exception("[FSM] stuck check failed")
-            raise
 
-# ================== MAIN LOOP ==================
+def poll_once(db: DatabaseLayer) -> int:
+    """Один цикл: список ready → claim/process каждого → stuck check."""
+    with session_scope() as session:
+        instance_ids = db.list_ready_fsm_instance_ids(session, limit=BATCH_SIZE)
 
-def main():
+    processed = 0
+    for instance_id in instance_ids:
+        process_instance(db, instance_id)
+        processed += 1
+
+    check_stuck_instances(db)
+    return processed
+
+
+def main() -> None:
     db = DatabaseLayer()
-    global _last_cleanup_check
-    logger.info("[FSM] worker started")
-    logger.info("[FSM] processes: %s", default_process_registry.list_process_names("courier"))
-    last_reservation_expire_check = 0    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        while True:
-            try: 
-                # === ПРОВЕРКА ПРОСРОЧЕННЫХ РЕЗЕРВОВ (каждые 5 минут) ===
-                now = time.time()
-                if now - last_reservation_expire_check >= 300: 
-                    with get_db_session() as session_inner:
-                        expired = db.get_expired_reservations(session_inner)
-                        
-                        for res in expired:
-                            logger.info(
-                                "[AUTO_EXPIRE] Истёк резерв reservation_id=%s, driver=%s, direction=%s",
-                                res["reservation_id"], res["driver_user_id"], res["direction_id"]
-                            )
-                            try:                                
-                                released = db.expire_reservation_direct(
-                                    session_inner,
-                                    res["reservation_id"],
-                                    999999  # системный пользователь
-                                )
-                                logger.info(
-                                    "[AUTO_EXPIRE] reservation_id=%s: released=%d заказов, статус=reservation_expired",
-                                    res["reservation_id"], released
-                                )
-                                
-                            except Exception as e:
-                                session_inner.rollback()
-                                logger.exception(
-                                    "[AUTO_EXPIRE] failed reservation_id=%s: %s",
-                                    res["reservation_id"], e
-                                )
-                                continue
-                        session_inner.commit()
-                        
-                    if expired:
-                        logger.info("[AUTO_EXPIRE] Обработано %d просроченных резервов", len(expired))
-                    
-                    last_reservation_expire_check = now
+    register_domains()
+    logger.info("[FSM] worker started worker_id=%s db=%s", WORKER_ID, DB_NAME)
+    logger.info(
+        "[FSM] registered processes: %s",
+        default_process_registry.list_process_names(),
+    )
 
-                # Получаем готовые инстансы
-                with get_db_session() as session:
-                    rows = db.fetch_ready_fsm_instances(
-                        session=session,
-                        limit=BATCH_SIZE,
-                    )
-
-                if not rows:
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-
-                # Обрабатываем каждый инстанс в отдельной транзакции
-                futures = [
-                    executor.submit(process_instance, db, core_adapter, row)
-                    for row in rows
-                ]
-
-                for f in as_completed(futures):
-                    f.result()  # проброс исключений
-
-                # Проверяем зависшие инстансы
-                check_stuck_instances(db)                  
-
-                # ================= Создаём инстанс locker_cleanup периодически =================
-                current_time = time.time()
-                if current_time - _last_cleanup_check >= LOCKER_CLEANUP_INTERVAL_SECONDS:
-                    try:
-                        with get_db_session() as session:
-                            db.ensure_locker_cleanup_instance(
-                                session=session,
-                                threshold_minutes=30
-                            )                           
-                        
-                        _last_cleanup_check = current_time
-                        
-                    except Exception as e:
-                        logger.error(f"[FSM] Ошибка создания locker_cleanup: {e}")             
-
-            except DbLayerError:
-                logger.exception("[FSM] DbLayerError")
+    while True:
+        try:
+            count = poll_once(db)
+            if count == 0:
                 time.sleep(POLL_INTERVAL_SECONDS)
-            except Exception:
-                logger.exception("[FSM] unexpected error")
-                time.sleep(POLL_INTERVAL_SECONDS)
+        except DbLayerError:
+            logger.exception("[FSM] DbLayerError")
+            time.sleep(POLL_INTERVAL_SECONDS)
+        except Exception:
+            logger.exception("[FSM] unexpected error")
+            time.sleep(POLL_INTERVAL_SECONDS)
 
-# ================== ENTRY ==================
 
 if __name__ == "__main__":
     main()

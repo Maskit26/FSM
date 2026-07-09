@@ -46,4 +46,4 @@ def register_all(
     return process_registry
 
 
-register_all()
+# Регистрация выполняется через domains.bootstrap.register_domains()

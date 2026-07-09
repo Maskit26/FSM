@@ -2271,6 +2271,76 @@ class DatabaseLayer:
             logger.error("get_fsm_instance_state failed: %s", e)
             raise DbLayerError(f"Failed to get FSM instance state: {e}") from e
 
+    def list_ready_fsm_instance_ids(
+        self,
+        session: Session,
+        limit: int,
+    ) -> List[int]:
+        """ID инстансов PENDING/WAITING, готовых к claim (без блокировки)."""
+        try:
+            rows = session.execute(
+                text("""
+                    SELECT id
+                    FROM server_fsm_instances
+                    WHERE fsm_state IN ('PENDING', 'WAITING')
+                      AND (next_timer_at IS NULL OR next_timer_at <= NOW())
+                    ORDER BY id
+                    LIMIT :limit
+                """),
+                {"limit": limit},
+            ).fetchall()
+            return [row[0] for row in rows]
+        except Exception as e:
+            logger.error("list_ready_fsm_instance_ids failed: %s", e)
+            raise DbLayerError(f"Failed to list ready FSM instances: {e}") from e
+
+    def try_claim_fsm_instance(
+        self,
+        session: Session,
+        instance_id: int,
+    ) -> Optional[Any]:
+        """Атомарно перевести инстанс в PROCESSING; None если уже занят или не ready."""
+        try:
+            updated = session.execute(
+                text("""
+                    UPDATE server_fsm_instances
+                    SET fsm_state = 'PROCESSING', updated_at = NOW()
+                    WHERE id = :id
+                      AND fsm_state IN ('PENDING', 'WAITING')
+                      AND (next_timer_at IS NULL OR next_timer_at <= NOW())
+                """),
+                {"id": instance_id},
+            )
+            if updated.rowcount == 0:
+                return None
+
+            row = session.execute(
+                text("""
+                    SELECT
+                        id,
+                        entity_type,
+                        entity_id,
+                        process_name,
+                        fsm_state,
+                        next_timer_at,
+                        attempts_count,
+                        last_error,
+                        requested_by_user_id,
+                        requested_user_role,
+                        target_user_id,
+                        target_role,
+                        metadata_json,
+                        service
+                    FROM server_fsm_instances
+                    WHERE id = :id
+                """),
+                {"id": instance_id},
+            ).fetchone()
+            return row
+        except Exception as e:
+            logger.error("try_claim_fsm_instance failed: instance_id=%s error=%s", instance_id, e)
+            raise DbLayerError(f"Failed to claim FSM instance {instance_id}: {e}") from e
+
     def fetch_ready_fsm_instances(
         self,
         session: Session,
@@ -2371,18 +2441,14 @@ class DatabaseLayer:
         session: Session,
         threshold_minutes: int,
     ) -> List[int]:
-        """
-        Возвращает ID FSM-инстансов, которые:
-        - не COMPLETED / FAILED
-        - updated_at слишком давно
-        """
+        """ID инстансов в PROCESSING дольше threshold (зависли при обработке)."""
         logger.debug("get_stuck_fsm_instances вызван: threshold_minutes=%s", threshold_minutes)
         try:
             rows = session.execute(
                 text("""
                     SELECT id
                     FROM server_fsm_instances
-                    WHERE fsm_state NOT IN ('COMPLETED', 'FAILED')
+                    WHERE fsm_state = 'PROCESSING'
                       AND updated_at < NOW() - INTERVAL :minutes MINUTE
                 """),
                 {"minutes": threshold_minutes},

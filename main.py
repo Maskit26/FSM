@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Query
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-import domains.courier.processes  # noqa: F401 - registers courier processes
+from domains.bootstrap import register_domains
 from fsm_core.registry import default_process_registry
 from fsm_actions import ReportErrorActions
 from dotenv import load_dotenv
@@ -49,6 +49,7 @@ logging.basicConfig(
 # ЗАГРУЗКА ENV
 # ======================
 load_dotenv()
+register_domains()
 
 def get_required_env(name: str) -> str:
     value = os.getenv(name)
