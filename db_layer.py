@@ -58,19 +58,6 @@ class DatabaseLayer:
         ).fetchone()
         return row is not None
 
-    def _routine_exists(self, session: Session, routine_name: str) -> bool:
-        row = session.execute(
-            text("""
-                SELECT 1
-                FROM information_schema.routines
-                WHERE routine_schema = DATABASE()
-                  AND routine_name = :routine_name
-                LIMIT 1
-            """),
-            {"routine_name": routine_name},
-        ).fetchone()
-        return row is not None
-
 
     # ==================== FSM БАЗОВЫЙ ВЫЗОВ ====================
 
@@ -5826,7 +5813,6 @@ class DatabaseLayer:
         )
         
         try:
-            # 1. Получаем ID текущего состояния
             state_row = session.execute(
                 text("SELECT id FROM fsm_states WHERE name = :name"),
                 {"name": current_state}
@@ -5841,16 +5827,16 @@ class DatabaseLayer:
             
             from_state_id = state_row[0]
             
-            # 2. Получаем все действия, доступные из этого состояния
             rows = session.execute(
                 text("""
                     SELECT fa.name
                     FROM fsm_transitions ft
                     JOIN fsm_actions fa ON fa.id = ft.action_id
-                    WHERE ft.from_state_id = :from_state_id
+                    WHERE ft.entity_type = :entity_type
+                      AND ft.from_state_id = :from_state_id
                     ORDER BY fa.name
                 """),
-                {"from_state_id": from_state_id}
+                {"entity_type": entity_type, "from_state_id": from_state_id}
             ).fetchall()
             
             actions = [row[0] for row in rows]
@@ -5885,43 +5871,19 @@ class DatabaseLayer:
                     return value
                 return json.loads(value)
 
-            has_guard = self._column_exists(session, "fsm_transitions", "guard_name")
-            has_effect = self._column_exists(session, "fsm_transitions", "effect_name")
-            select_extra = ""
-            order_by = "ft.id"
-            if has_guard:
-                select_extra += """
-                        ft.guard_name,
-                        ft.guard_params,
-                        ft.priority,
-                """
-                order_by = "ft.priority, ft.id"
-            else:
-                select_extra += """
-                        NULL AS guard_name,
-                        NULL AS guard_params,
-                        100 AS priority,
-                """
-            if has_effect:
-                select_extra += """
-                        ft.effect_name,
-                        ft.effect_params
-                """
-            else:
-                select_extra += """
-                        NULL AS effect_name,
-                        NULL AS effect_params
-                """
-
             rows = session.execute(
-                text(f"""
+                text("""
                     SELECT
                         ft.id,
                         ft.entity_type,
                         fs_from.name AS from_state,
                         fs_to.name AS to_state,
                         fa.name AS event_name,
-                        {select_extra}
+                        ft.guard_name,
+                        ft.guard_params,
+                        ft.priority,
+                        ft.effect_name,
+                        ft.effect_params
                     FROM fsm_transitions ft
                     JOIN fsm_states fs_from ON fs_from.id = ft.from_state_id
                     JOIN fsm_states fs_to ON fs_to.id = ft.to_state_id
@@ -5929,7 +5891,7 @@ class DatabaseLayer:
                     WHERE ft.entity_type = :entity_type
                       AND fs_from.name = :current_state
                       AND fa.name = :event_name
-                    ORDER BY {order_by}
+                    ORDER BY ft.priority, ft.id
                 """),
                 {
                     "entity_type": entity_type,

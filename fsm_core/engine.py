@@ -22,6 +22,7 @@ def run_instance(
     instance: Dict[str, Any],
     registry: Optional[ProcessRegistry] = None,
 ) -> FsmResult:
+    """Вход worker: ProcessDef из registry → TransitionRunner.run. Commit/rollback — в worker."""
     process_registry = registry or default_process_registry
     service = instance.get("service") or "courier"
     process_name = instance.get("process_name")

@@ -10,11 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class TransitionRunner:
-    """Runs the FSM pipeline for one process instance.
-
-    MVP supports compatibility handlers so existing courier processes can move
-    behind the platform runtime before the SQL transition model is fully active.
-    """
+    """RFC-pipeline для одного server_fsm_instance (без знания о доменах)."""
 
     def __init__(
         self,
@@ -32,35 +28,11 @@ class TransitionRunner:
         instance: Dict[str, Any],
         process_def: ProcessDef,
     ) -> FsmResult:
+        """Один шаг FSM: context → candidates → guards → SQL transition → effect."""
         domain_context: Dict[str, Any] = {}
         if process_def.context_builder:
             domain_context = process_def.context_builder(session, db, runtime_ctx, instance)
 
-        use_declarative = (
-            process_def.metadata.get("runtime") == "declarative"
-            or process_def.handler is None
-        )
-        if not use_declarative and process_def.handler:
-            logger.debug(
-                "[FSM_CORE] compatibility handler service=%s process=%s event=%s",
-                process_def.service,
-                process_def.process_name,
-                process_def.runtime_event_name,
-            )
-            return FsmResult.from_legacy(
-                process_def.handler(session, db, domain_context, instance)
-            )
-
-        return self._run_declarative(session, db, domain_context, instance, process_def)
-
-    def _run_declarative(
-        self,
-        session: Any,
-        db: Any,
-        domain_context: Dict[str, Any],
-        instance: Dict[str, Any],
-        process_def: ProcessDef,
-    ) -> FsmResult:
         entity_type = process_def.entity_type or instance.get("entity_type")
         entity_id = instance.get("entity_id")
         user_id = instance.get("requested_by_user_id") or 0
@@ -150,6 +122,7 @@ class TransitionRunner:
         instance: Dict[str, Any],
         candidates: Iterable[TransitionDef],
     ) -> Optional[TransitionDef | FsmResult]:
+        """Выбрать один transition из candidates (по priority и guards)."""
         for transition in candidates:
             if not transition.guard_name:
                 return transition
@@ -178,6 +151,7 @@ class TransitionRunner:
         return None
 
     def _transition_from_row(self, row: Dict[str, Any]) -> TransitionDef:
+        """Строка из get_candidate_transitions → TransitionDef."""
         return TransitionDef(
             id=row["id"],
             entity_type=row["entity_type"],
@@ -192,6 +166,7 @@ class TransitionRunner:
         )
 
     def _find_ambiguous_priority(self, candidates: Iterable[TransitionDef]) -> Optional[int]:
+        """Вернуть priority, если он повторяется у двух candidates (иначе None)."""
         seen: set[int] = set()
         for transition in candidates:
             if transition.priority in seen:
@@ -200,6 +175,7 @@ class TransitionRunner:
         return None
 
     def _normalize_guard_result(self, value: Any) -> GuardResult:
+        """Привести ответ guard к GuardResult (bool/tuple тоже допускаются)."""
         if isinstance(value, GuardResult):
             return value
         if isinstance(value, bool):
@@ -211,6 +187,7 @@ class TransitionRunner:
         return GuardResult(ok=bool(value))
 
     def _normalize_effect_result(self, value: Any) -> EffectResult:
+        """Привести ответ effect к EffectResult (bool/tuple/dict тоже допускаются)."""
         if isinstance(value, EffectResult):
             return value
         if isinstance(value, bool):
@@ -222,6 +199,7 @@ class TransitionRunner:
         return EffectResult(ok=True, payload=value if isinstance(value, dict) else None)
 
     def _failed(self, error: str) -> FsmResult:
+        """Штатная ошибка шага; worker обработает FAILED и last_error."""
         return FsmResult(
             new_state="FAILED",
             last_error=error,
