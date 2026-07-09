@@ -6,10 +6,14 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 *.egg-info/
 dist/
 build/
+
+# Local tooling (not part of repo)
+scripts/
 
 # IDEs
 .vscode/

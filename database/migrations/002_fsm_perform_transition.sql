@@ -1,0 +1,11 @@
+-- FSM Platform: SQL Core procedure fsm_perform_transition
+--
+-- Run in DBeaver (database testdb) in this order:
+--   1) 002_fsm_perform_transition_schema.sql
+--   2) 002_fsm_perform_transition_procedure_drop.sql
+--   3) 002_fsm_perform_transition_procedure_body.sql  (Ctrl+A, Ctrl+Enter)
+--   4) 002_fsm_perform_transition_procedure_cleanup.sql
+--
+-- Reliable alternative:
+--   set DB_NAME=testdb in .env
+--   python scripts/apply_migration_002.py

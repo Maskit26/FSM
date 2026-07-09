@@ -8,18 +8,17 @@ from typing import Any, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import sessionmaker, Session
 
 from dotenv import load_dotenv
 
 from db_layer import DatabaseLayer, DbLayerError
 from adapter.core_adapter import CoreAdapter
-from fsm_engine import (
-    build_actions_context,
-    run_fsm_step,
-    FsmStepResult,
-    PROCESS_DEFS,
-)
+import domains.courier.processes  # noqa: F401 - registers courier processes
+from fsm_core.engine import run_instance
+from fsm_core.registry import default_process_registry
+from fsm_core.types import FsmResult
 
 load_dotenv()
 
@@ -35,15 +34,50 @@ _last_cleanup_check = 0
 
 # ================== DB SETUP ==================
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "3306")
-DB_NAME = os.getenv("DB_NAME", "testdb")
-DB_USER = os.getenv("DB_USER", "fsm")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "6eF1zb")
+def get_required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
-DATABASE_URL = f"mysql+mysqlconnector://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
 
-engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True, isolation_level="READ COMMITTED")
+DB_HOST = get_required_env("DB_HOST")
+DB_PORT = get_required_env("DB_PORT")
+DB_NAME = get_required_env("DB_NAME")
+DB_USER = get_required_env("DB_USER")
+DB_PASSWORD = get_required_env("DB_PASSWORD")
+DB_SSL_MODE = os.getenv("DB_SSL_MODE", "REQUIRED").upper().replace("-", "_")
+DB_SSL_CA = os.getenv("DB_SSL_CA")
+
+DATABASE_URL = URL.create(
+    drivername="mysql+mysqlconnector",
+    username=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=int(DB_PORT),
+    database=DB_NAME,
+    query={"charset": "utf8mb4"},
+)
+
+connect_args: Dict[str, Any] = {}
+if DB_SSL_MODE in {"REQUIRED", "PREFERRED", "VERIFY_CA", "VERIFY_IDENTITY"}:
+    connect_args["ssl_disabled"] = False
+    if DB_SSL_CA:
+        connect_args["ssl_ca"] = DB_SSL_CA
+    if DB_SSL_MODE in {"VERIFY_CA", "VERIFY_IDENTITY"}:
+        connect_args["ssl_verify_cert"] = True
+    if DB_SSL_MODE == "VERIFY_IDENTITY":
+        connect_args["ssl_verify_identity"] = True
+elif DB_SSL_MODE == "DISABLED":
+    connect_args["ssl_disabled"] = True
+
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,
+    isolation_level="READ COMMITTED",
+    connect_args=connect_args,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # ================== LOGGING ==================
@@ -81,7 +115,7 @@ def get_db_session() -> Session:
 
 def row_to_instance_dict(row: Tuple[Any, ...]) -> Dict[str, Any]:
     # row — это tuple из fetchall(), поэтому индексируем по позиции
-    return {
+    instance = {
         "id": row[0],
         "entity_type": row[1],
         "entity_id": row[2],
@@ -96,6 +130,8 @@ def row_to_instance_dict(row: Tuple[Any, ...]) -> Dict[str, Any]:
         "target_role": row[11],
         "metadata_json": row[12],
     }
+    instance["service"] = row[13] if len(row) > 13 and row[13] else "courier"
+    return instance
 
 # ================== CORE ==================
 
@@ -122,7 +158,7 @@ def process_instance(
                 )
                 instance["metadata"] = {}
 
-            actions_ctx = build_actions_context(db, core_adapter)
+            runtime_ctx = {"core_adapter": core_adapter}
 
             logger.info(
                 "[FSM] start instance_id=%s process=%s state=%s attempts=%s",
@@ -155,16 +191,16 @@ def process_instance(
 
             # ================= RUN STEP =================
             try:
-                result: FsmStepResult = run_fsm_step(
+                result: FsmResult = run_instance(
                     session=session,
                     db=db,
-                    actions_ctx=actions_ctx,
+                    runtime_ctx=runtime_ctx,
                     instance=instance,
                 )
             except Exception as step_error:
                 logger.exception("[FSM] step error instance_id=%s", instance["id"])               
 
-                result = FsmStepResult(
+                result = FsmResult(
                     new_state="FAILED",
                     last_error=str(step_error),
                     attempts_increment=1,
@@ -280,7 +316,7 @@ def main():
     db = DatabaseLayer()
     global _last_cleanup_check
     logger.info("[FSM] worker started")
-    logger.info("[FSM] processes: %s", list(PROCESS_DEFS.keys()))
+    logger.info("[FSM] processes: %s", default_process_registry.list_process_names("courier"))
     last_reservation_expire_check = 0    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while True:

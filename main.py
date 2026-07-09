@@ -7,10 +7,12 @@ from contextlib import contextmanager
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Query
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-from fsm_engine import PROCESS_DEFS
+import domains.courier.processes  # noqa: F401 - registers courier processes
+from fsm_core.registry import default_process_registry
 from fsm_actions import ReportErrorActions
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import sessionmaker, Session
 from adapter import CoreAdapter, UserMapping
 import logging
@@ -48,18 +50,47 @@ logging.basicConfig(
 # ======================
 load_dotenv()
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "3306")
-DB_NAME = os.getenv("DB_NAME", "testdb")
-DB_USER = os.getenv("DB_USER", "fsm")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "6eF1zb")
+def get_required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+DB_HOST = get_required_env("DB_HOST")
+DB_PORT = get_required_env("DB_PORT")
+DB_NAME = get_required_env("DB_NAME")
+DB_USER = get_required_env("DB_USER")
+DB_PASSWORD = get_required_env("DB_PASSWORD")
+DB_SSL_MODE = os.getenv("DB_SSL_MODE", "REQUIRED").upper().replace("-", "_")
+DB_SSL_CA = os.getenv("DB_SSL_CA")
 
 # ======================
 # SQLALCHEMY ENGINE И SESSIONMAKER
 # ======================
-DATABASE_URL = f"mysql+mysqlconnector://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
+DATABASE_URL = URL.create(
+    drivername="mysql+mysqlconnector",
+    username=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=int(DB_PORT),
+    database=DB_NAME,
+    query={"charset": "utf8mb4"},
+)
 
-engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+connect_args: Dict[str, Any] = {}
+if DB_SSL_MODE in {"REQUIRED", "PREFERRED", "VERIFY_CA", "VERIFY_IDENTITY"}:
+    connect_args["ssl_disabled"] = False
+    if DB_SSL_CA:
+        connect_args["ssl_ca"] = DB_SSL_CA
+    if DB_SSL_MODE in {"VERIFY_CA", "VERIFY_IDENTITY"}:
+        connect_args["ssl_verify_cert"] = True
+    if DB_SSL_MODE == "VERIFY_IDENTITY":
+        connect_args["ssl_verify_identity"] = True
+elif DB_SSL_MODE == "DISABLED":
+    connect_args["ssl_disabled"] = True
+
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # ======================
@@ -683,11 +714,12 @@ async def get_operator_lockers(
 @app.post("/api/fsm/enqueue", response_model=ApiResponse)
 async def enqueue_fsm(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(get_db)):
     with get_db_session(read_only=False) as session:
-        if request.process_name not in PROCESS_DEFS:
+        if not default_process_registry.has(request.service, request.process_name):
+            available_processes = default_process_registry.list_process_names(request.service)
             raise HTTPException(
                 status_code=400,
-                detail=f"Недопустимое имя процесса: '{request.process_name}'. "
-                       f"Доступные процессы: {', '.join(sorted(PROCESS_DEFS.keys()))}"
+                detail=f"Недопустимый процесс '{request.service}/{request.process_name}'. "
+                       f"Доступные процессы: {', '.join(available_processes)}"
             )
         # 1) Проверяем пользователя (пока userid приходит от фронта в body)
         role = db.get_user_role(session, request.user_id)
@@ -703,6 +735,7 @@ async def enqueue_fsm(request: FsmEnqueueRequest, db: DatabaseLayer = Depends(ge
                 session,
                 entity_type=request.entity_type,
                 entity_id=request.entity_id,
+                service=request.service,
                 process_name=request.process_name,
                 fsm_state=fsm_state,
                 requested_by_user_id=request.user_id,

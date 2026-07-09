@@ -52,6 +52,7 @@ class CellCreateRequest(BaseModel):
     cell_type: str = "S"
 
 class FsmEnqueueRequest(BaseModel):
+    service: str = "courier"
     entity_type: str   
     entity_id: int
     process_name: str    

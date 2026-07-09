@@ -44,6 +44,33 @@ class DatabaseLayer:
     """Чистый stateless слой доступа к данным. Не хранит engine, не создаёт сессию."""
     pass
         
+    def _column_exists(self, session: Session, table_name: str, column_name: str) -> bool:
+        row = session.execute(
+            text("""
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = DATABASE()
+                  AND table_name = :table_name
+                  AND column_name = :column_name
+                LIMIT 1
+            """),
+            {"table_name": table_name, "column_name": column_name},
+        ).fetchone()
+        return row is not None
+
+    def _routine_exists(self, session: Session, routine_name: str) -> bool:
+        row = session.execute(
+            text("""
+                SELECT 1
+                FROM information_schema.routines
+                WHERE routine_schema = DATABASE()
+                  AND routine_name = :routine_name
+                LIMIT 1
+            """),
+            {"routine_name": routine_name},
+        ).fetchone()
+        return row is not None
+
 
     # ==================== FSM БАЗОВЫЙ ВЫЗОВ ====================
 
@@ -56,43 +83,48 @@ class DatabaseLayer:
         user_id: int,
         extra_id: Optional[str] = None,
     ) -> bool:
-        safe_extra_id = extra_id if extra_id is not None else ""
+        """Legacy API wrapper: resolve transition by state+event, then call SQL Core."""
+        del extra_id  # unused; kept for API compatibility
 
         try:
-            connection = session.connection().connection
-            cursor = connection.cursor()
+            current_state = self.get_entity_current_state(session, entity_type, entity_id)
+            if not current_state:
+                raise DbLayerError(
+                    f"Entity state not found: {entity_type}:{entity_id}"
+                )
 
-            try:
-                cursor.callproc("fsm_perform_action", [
-                    entity_type, 
-                    entity_id, 
-                    action_name, 
-                    user_id, 
-                    safe_extra_id
-                ])
+            candidates = self.get_candidate_transitions(
+                session=session,
+                entity_type=entity_type,
+                current_state=current_state,
+                event_name=action_name,
+            )
+            if not candidates:
+                raise DbLayerError(
+                    f"No transition for {entity_type}/{current_state}/{action_name}"
+                )
 
-                results = []
-                for result in cursor.stored_results():
-                    results.extend(result.fetchall())
+            defaults = [row for row in candidates if not row.get("guard_name")]
+            if len(defaults) == 1:
+                selected = defaults[0]
+            elif len(candidates) == 1:
+                selected = candidates[0]
+            else:
+                raise DbLayerError(
+                    f"Ambiguous transition for {entity_type}/{current_state}/{action_name}"
+                )
 
-                while cursor.nextset():
-                    pass
-
-                if results:
-                    result_text = str(results[0][0])
-                    if "FSM action completed" in result_text:
-                        logger.debug("[FSM] Success: %s", result_text)
-                        return True
-                    else:
-                        raise DbLayerError(f"FSM Procedure returned: {result_text}")
-                
-                raise DbLayerError("FSM Procedure: No result returned")
-
-            finally:
-                cursor.close()
+            return self.perform_transition(
+                session=session,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                transition_id=int(selected["id"]),
+                event_name=action_name,
+                user_id=user_id,
+            )
 
         except Exception as e:
-            logger.error("[FSM] Call failed: %s", e)                       
+            logger.error("[FSM] Call failed: %s", e)
             raise DbLayerError(f"FSM {action_name} failed: {e}") from e
 
     def log_error_to_db(
@@ -2053,41 +2085,20 @@ class DatabaseLayer:
         target_user_id: Optional[int] = None,
         target_role: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        service: str = "courier",
     ) -> int:
         """Создать или обновить инстанс FSM-процесса."""
         logger.debug(
-            "enqueue_fsm_instance вызван: entity_type=%s, entity_id=%s, process_name=%s, state=%s",
-            entity_type, entity_id, process_name, fsm_state
+            "enqueue_fsm_instance вызван: service=%s, entity_type=%s, entity_id=%s, process_name=%s, state=%s",
+            service, entity_type, entity_id, process_name, fsm_state
         )
         try:
             metadata_json = json.dumps(metadata) if metadata is not None else None
-            session.execute(text("""
-                INSERT INTO server_fsm_instances (
-                    entity_type, entity_id, process_name, fsm_state, attempts_count,
-                    requested_by_user_id, requested_user_role,
-                    target_user_id, target_role,
-                    last_error, next_timer_at, metadata_json
-                ) VALUES (
-                    :entity_type, :entity_id, :process_name, :fsm_state, 0,
-                    :requested_by_user_id, :requested_user_role,
-                    :target_user_id, :target_role,
-                    NULL, NULL,
-                    :metadata_json
-                )
-                ON DUPLICATE KEY UPDATE
-                    fsm_state = VALUES(fsm_state),
-                    attempts_count = 0,
-                    last_error = NULL,
-                    next_timer_at = NULL,
-                    requested_by_user_id = VALUES(requested_by_user_id),
-                    requested_user_role = VALUES(requested_user_role),
-                    target_user_id = VALUES(target_user_id),
-                    target_role = VALUES(target_role),
-                    metadata_json = VALUES(metadata_json),
-                    updated_at = NOW()
-            """), {
+            has_service = self._column_exists(session, "server_fsm_instances", "service")
+            params = {
                 "entity_type": entity_type,
                 "entity_id": entity_id,
+                "service": service,
                 "process_name": process_name,
                 "fsm_state": fsm_state,
                 "requested_by_user_id": requested_by_user_id,
@@ -2095,7 +2106,60 @@ class DatabaseLayer:
                 "target_user_id": target_user_id,
                 "target_role": target_role,
                 "metadata_json": metadata_json,
-            })
+            }
+            if has_service:
+                session.execute(text("""
+                    INSERT INTO server_fsm_instances (
+                        service, entity_type, entity_id, process_name, fsm_state, attempts_count,
+                        requested_by_user_id, requested_user_role,
+                        target_user_id, target_role,
+                        last_error, next_timer_at, metadata_json
+                    ) VALUES (
+                        :service, :entity_type, :entity_id, :process_name, :fsm_state, 0,
+                        :requested_by_user_id, :requested_user_role,
+                        :target_user_id, :target_role,
+                        NULL, NULL,
+                        :metadata_json
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        service = VALUES(service),
+                        fsm_state = VALUES(fsm_state),
+                        attempts_count = 0,
+                        last_error = NULL,
+                        next_timer_at = NULL,
+                        requested_by_user_id = VALUES(requested_by_user_id),
+                        requested_user_role = VALUES(requested_user_role),
+                        target_user_id = VALUES(target_user_id),
+                        target_role = VALUES(target_role),
+                        metadata_json = VALUES(metadata_json),
+                        updated_at = NOW()
+                """), params)
+            else:
+                session.execute(text("""
+                    INSERT INTO server_fsm_instances (
+                        entity_type, entity_id, process_name, fsm_state, attempts_count,
+                        requested_by_user_id, requested_user_role,
+                        target_user_id, target_role,
+                        last_error, next_timer_at, metadata_json
+                    ) VALUES (
+                        :entity_type, :entity_id, :process_name, :fsm_state, 0,
+                        :requested_by_user_id, :requested_user_role,
+                        :target_user_id, :target_role,
+                        NULL, NULL,
+                        :metadata_json
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        fsm_state = VALUES(fsm_state),
+                        attempts_count = 0,
+                        last_error = NULL,
+                        next_timer_at = NULL,
+                        requested_by_user_id = VALUES(requested_by_user_id),
+                        requested_user_role = VALUES(requested_user_role),
+                        target_user_id = VALUES(target_user_id),
+                        target_role = VALUES(target_role),
+                        metadata_json = VALUES(metadata_json),
+                        updated_at = NOW()
+                """), params)
 
             row = session.execute(text("""
                 SELECT id
@@ -2234,8 +2298,9 @@ class DatabaseLayer:
         """
         logger.debug("fetch_ready_fsm_instances вызван: limit=%s", limit)
         try:
+            service_select = ", service" if self._column_exists(session, "server_fsm_instances", "service") else ""
             rows = session.execute(
-                text("""
+                text(f"""
                     SELECT
                         id,
                         entity_type,
@@ -2250,6 +2315,7 @@ class DatabaseLayer:
                         target_user_id,
                         target_role,
                         metadata_json
+                        {service_select}
                     FROM server_fsm_instances
                     WHERE fsm_state NOT IN ('COMPLETED', 'FAILED')
                       AND (next_timer_at IS NULL OR next_timer_at <= NOW())
@@ -5715,6 +5781,11 @@ class DatabaseLayer:
                     text("SELECT status FROM locker_cells WHERE id = :id"),
                     {"id": entity_id}
                 ).scalar()
+            elif entity_type == "driver_reservations":
+                result = session.execute(
+                    text("SELECT status FROM driver_reservations WHERE id = :id"),
+                    {"id": entity_id}
+                ).scalar()
             else:
                 logger.error("get_entity_current_state: неизвестный entity_type=%s", entity_type)
                 raise DbLayerError(f"Неизвестный entity_type: {entity_type}")
@@ -5796,6 +5867,171 @@ class DatabaseLayer:
                 entity_type, current_state, e
             )
             raise DbLayerError(f"Failed to get available actions: {e}") from e
+
+
+    def get_candidate_transitions(
+        self,
+        session: Session,
+        entity_type: str,
+        current_state: str,
+        event_name: str,
+    ) -> List[Dict[str, Any]]:
+        """Load declarative transition candidates for the new runtime."""
+        try:
+            def parse_json_dict(value: Any) -> Dict[str, Any]:
+                if not value:
+                    return {}
+                if isinstance(value, dict):
+                    return value
+                return json.loads(value)
+
+            has_guard = self._column_exists(session, "fsm_transitions", "guard_name")
+            has_effect = self._column_exists(session, "fsm_transitions", "effect_name")
+            select_extra = ""
+            order_by = "ft.id"
+            if has_guard:
+                select_extra += """
+                        ft.guard_name,
+                        ft.guard_params,
+                        ft.priority,
+                """
+                order_by = "ft.priority, ft.id"
+            else:
+                select_extra += """
+                        NULL AS guard_name,
+                        NULL AS guard_params,
+                        100 AS priority,
+                """
+            if has_effect:
+                select_extra += """
+                        ft.effect_name,
+                        ft.effect_params
+                """
+            else:
+                select_extra += """
+                        NULL AS effect_name,
+                        NULL AS effect_params
+                """
+
+            rows = session.execute(
+                text(f"""
+                    SELECT
+                        ft.id,
+                        ft.entity_type,
+                        fs_from.name AS from_state,
+                        fs_to.name AS to_state,
+                        fa.name AS event_name,
+                        {select_extra}
+                    FROM fsm_transitions ft
+                    JOIN fsm_states fs_from ON fs_from.id = ft.from_state_id
+                    JOIN fsm_states fs_to ON fs_to.id = ft.to_state_id
+                    JOIN fsm_actions fa ON fa.id = ft.action_id
+                    WHERE ft.entity_type = :entity_type
+                      AND fs_from.name = :current_state
+                      AND fa.name = :event_name
+                    ORDER BY {order_by}
+                """),
+                {
+                    "entity_type": entity_type,
+                    "current_state": current_state,
+                    "event_name": event_name,
+                },
+            ).fetchall()
+
+            return [
+                {
+                    "id": row[0],
+                    "entity_type": row[1],
+                    "from_state": row[2],
+                    "to_state": row[3],
+                    "event_name": row[4],
+                    "guard_name": row[5],
+                    "guard_params": parse_json_dict(row[6]),
+                    "priority": row[7],
+                    "effect_name": row[8],
+                    "effect_params": parse_json_dict(row[9]),
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error("get_candidate_transitions failed: %s", e)
+            raise DbLayerError(f"Failed to get candidate transitions: {e}") from e
+
+    def perform_transition(
+        self,
+        session: Session,
+        entity_type: str,
+        entity_id: int,
+        transition_id: int,
+        event_name: str,
+        user_id: int,
+    ) -> bool:
+        """Call SQL Core stored procedure fsm_perform_transition."""
+        try:
+            connection = session.connection().connection
+            cursor = connection.cursor()
+            try:
+                cursor.callproc("fsm_perform_transition", [
+                    entity_type,
+                    entity_id,
+                    transition_id,
+                    event_name,
+                    user_id,
+                ])
+                while cursor.nextset():
+                    pass
+                return True
+            finally:
+                cursor.close()
+        except Exception as e:
+            logger.error("perform_transition failed: %s", e)
+            raise DbLayerError(f"FSM transition {transition_id} failed: {e}") from e
+
+    def create_fsm_timer(
+        self,
+        session: Session,
+        service: str,
+        entity_type: str,
+        entity_id: int,
+        process_name: str,
+        fire_at: datetime,
+        payload: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> int:
+        payload_json = json.dumps(payload) if payload is not None else None
+        session.execute(
+            text("""
+                INSERT INTO fsm_timers (
+                    service, entity_type, entity_id, process_name, fire_at,
+                    status, payload_json, idempotency_key, created_at
+                ) VALUES (
+                    :service, :entity_type, :entity_id, :process_name, :fire_at,
+                    'SCHEDULED', :payload_json, :idempotency_key, NOW()
+                )
+            """),
+            {
+                "service": service,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "process_name": process_name,
+                "fire_at": fire_at,
+                "payload_json": payload_json,
+                "idempotency_key": idempotency_key,
+            },
+        )
+        return int(session.execute(text("SELECT LAST_INSERT_ID()")).scalar())
+
+    def cancel_fsm_timer(self, session: Session, timer_id: int) -> None:
+        session.execute(
+            text("""
+                UPDATE fsm_timers
+                SET status = 'CANCELLED',
+                    cancelled_at = NOW()
+                WHERE id = :timer_id
+                  AND status = 'SCHEDULED'
+            """),
+            {"timer_id": timer_id},
+        )
 
 
     def get_fsm_action_history(
