@@ -986,8 +986,8 @@ class DatabaseLayer:
             try:
                 row = session.execute(
                     text("""
-                        SELECT id, client_user_id, recipient_user_id, parcel_type, cell_size,
-                               sender_delivery, recipient_delivery, status
+                        SELECT id, client_user_id, recipient_user_id, from_city, to_city,
+                               parcel_type, cell_size, sender_delivery, recipient_delivery, status
                         FROM order_requests
                         WHERE id = :id
                     """),
@@ -1001,12 +1001,14 @@ class DatabaseLayer:
                 result = {
                     "id": row[0],
                     "client_user_id": row[1],
-                    "recipient_user_id": row[2], 
-                    "parcel_type": row[3],
-                    "cell_size": row[4],
-                    "sender_delivery": row[5],
-                    "recipient_delivery": row[6],
-                    "status": row[7]
+                    "recipient_user_id": row[2],
+                    "from_city": row[3],
+                    "to_city": row[4],
+                    "parcel_type": row[5],
+                    "cell_size": row[6],
+                    "sender_delivery": row[7],
+                    "recipient_delivery": row[8],
+                    "status": row[9],
                 }
                 logger.debug("get_order_request: успешно получена заявка request_id=%s", request_id)
                 return result
@@ -1103,7 +1105,7 @@ class DatabaseLayer:
             session.execute(text("""
                 UPDATE locker_cells
                 SET status = 'locker_reserved'
-                WHERE id IN (:src_id, :dst_id)
+                WHERE id = :src_id OR id = :dst_id
             """), {
                 "src_id": src_id,
                 "dst_id": dst_id,
@@ -1119,6 +1121,47 @@ class DatabaseLayer:
                 source_city, dest_city, cell_size, e
             )
             raise DbLayerError(f"find_and_reserve_cells_by_cities failed: {e}") from e
+
+    def has_free_cells_for_route(
+        self,
+        session: Session,
+        source_city: str,
+        dest_city: str,
+        cell_size: str,
+    ) -> bool:
+        """Read-only проверка наличия свободных ячеек на маршруте (без резерва)."""
+        try:
+            src = session.execute(
+                text("""
+                    SELECT 1
+                    FROM locker_cells lc
+                    JOIN lockers l ON lc.locker_id = l.id
+                    WHERE l.city = :source_city
+                      AND lc.cell_type = :cell_size
+                      AND lc.status = 'locker_free'
+                    LIMIT 1
+                """),
+                {"source_city": source_city, "cell_size": cell_size},
+            ).fetchone()
+            if not src:
+                return False
+
+            dst = session.execute(
+                text("""
+                    SELECT 1
+                    FROM locker_cells lc
+                    JOIN lockers l ON lc.locker_id = l.id
+                    WHERE l.city = :dest_city
+                      AND lc.cell_type = :cell_size
+                      AND lc.status = 'locker_free'
+                    LIMIT 1
+                """),
+                {"dest_city": dest_city, "cell_size": cell_size},
+            ).fetchone()
+            return dst is not None
+        except Exception as e:
+            logger.error("has_free_cells_for_route failed: %s", e)
+            raise DbLayerError(f"has_free_cells_for_route failed: {e}") from e
 
     def find_and_reserve_alternative_cell(
         self,
@@ -1204,6 +1247,9 @@ class DatabaseLayer:
         recipient_user_id: Optional[int],
         source_cell_id: int,
         dest_cell_id: int,
+        from_city: Optional[str] = None,
+        to_city: Optional[str] = None,
+        parcel_type: Optional[str] = None,
     ) -> int:
         logger.debug(
             "create_order_record вызван: client_user_id=%s, source_cell_id=%s, dest_cell_id=%s",
@@ -1220,7 +1266,10 @@ class DatabaseLayer:
                     delivery_type,
                     status,
                     client_user_id,
-                    recipient_user_id
+                    recipient_user_id,
+                    from_city,
+                    to_city,
+                    parcel_type
                 )
                 VALUES (
                     :description,
@@ -1230,7 +1279,10 @@ class DatabaseLayer:
                     :delivery,
                     'order_created',
                     :client,
-                    :recipient
+                    :recipient,
+                    :from_city,
+                    :to_city,
+                    :parcel_type
                 )
             """), {
                 "description": description,
@@ -1240,6 +1292,9 @@ class DatabaseLayer:
                 "delivery": delivery_type,
                 "client": client_user_id,
                 "recipient": recipient_user_id,
+                "from_city": from_city,
+                "to_city": to_city,
+                "parcel_type": parcel_type,
             })
 
             order_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
@@ -1283,6 +1338,141 @@ class DatabaseLayer:
         except Exception as e:
             logger.error("mark_request_completed: неизвестная ошибка для request_id=%s: %s", request_id, e)
             raise DbLayerError(f"General error in mark_request_completed for request {request_id}: {e}") from e
+
+    def link_order_request_to_order(
+        self,
+        session: Session,
+        request_id: int,
+        order_id: int,
+    ) -> None:
+        """Привязать order_id к заявке (status уже сменён SQL transition)."""
+        session.execute(
+            text("""
+                UPDATE order_requests
+                SET order_id = :order_id,
+                    error_code = NULL,
+                    error_message = NULL
+                WHERE id = :request_id
+            """),
+            {"request_id": request_id, "order_id": order_id},
+        )
+
+    def create_order_from_request(
+        self,
+        session: Session,
+        *,
+        request_id: int,
+        from_city: str,
+        to_city: str,
+        cell_size: str,
+        client_user_id: int,
+        recipient_user_id: int,
+        pickup_type: str,
+        delivery_type: str,
+        parcel_type: str,
+        description: str,
+    ) -> Dict[str, Any]:
+        """
+        Локальное создание заказа после успешного FSM-перехода заявки:
+        резерв ячеек → orders → bind → stage_orders → link request.
+        """
+        ok, src_cell_id, dst_cell_id = self.find_and_reserve_cells_by_cities(
+            session, from_city, to_city, cell_size
+        )
+        if not ok or src_cell_id is None or dst_cell_id is None:
+            raise DbLayerError("NO_FREE_CELLS")
+
+        order_id = self.create_order_record(
+            session=session,
+            description=description,
+            pickup_type=pickup_type,
+            delivery_type=delivery_type,
+            client_user_id=client_user_id,
+            recipient_user_id=recipient_user_id,
+            source_cell_id=src_cell_id,
+            dest_cell_id=dst_cell_id,
+            from_city=from_city,
+            to_city=to_city,
+            parcel_type=parcel_type,
+        )
+
+        self.bind_cells_for_order(session, order_id, src_cell_id, dst_cell_id)
+        self.create_stage_order(session, None, order_id, "pickup")
+        self.create_stage_order(session, None, order_id, "delivery")
+        self.link_order_request_to_order(session, request_id, order_id)
+
+        logger.info(
+            "create_order_from_request: request=%s order=%s cells=%s→%s",
+            request_id,
+            order_id,
+            src_cell_id,
+            dst_cell_id,
+        )
+        return {
+            "order_id": order_id,
+            "src_cell_id": src_cell_id,
+            "dst_cell_id": dst_cell_id,
+        }
+
+    def get_order_request_by_order_id(
+        self,
+        session: Session,
+        order_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Найти staging-заявку по привязанному order_id."""
+        row = session.execute(
+            text("""
+                SELECT id, client_user_id, recipient_user_id, parcel_type, cell_size,
+                       sender_delivery, recipient_delivery, status, order_id
+                FROM order_requests
+                WHERE order_id = :order_id
+                ORDER BY id DESC
+                LIMIT 1
+            """),
+            {"order_id": order_id},
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "client_user_id": row[1],
+            "recipient_user_id": row[2],
+            "parcel_type": row[3],
+            "cell_size": row[4],
+            "sender_delivery": row[5],
+            "recipient_delivery": row[6],
+            "status": row[7],
+            "order_id": row[8],
+        }
+
+    def enqueue_core_outbox(
+        self,
+        session: Session,
+        service: str,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> int:
+        """Записать событие в core_outbox для асинхронного вызова Core API."""
+        try:
+            session.execute(
+                text("""
+                    INSERT INTO core_outbox (
+                        service, event_type, payload_json, status, attempts_count
+                    ) VALUES (
+                        :service, :event_type, :payload_json, 'PENDING', 0
+                    )
+                """),
+                {
+                    "service": service,
+                    "event_type": event_type,
+                    "payload_json": json.dumps(payload),
+                },
+            )
+            outbox_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+            return int(outbox_id)
+        except Exception as e:
+            logger.error("enqueue_core_outbox failed: %s", e)
+            raise DbLayerError(f"enqueue_core_outbox failed: {e}") from e
 
     def mark_request_failed(
         self,
@@ -2003,7 +2193,7 @@ class DatabaseLayer:
                     """
                     UPDATE locker_cells
                     SET status = 'locker_reserved', current_order_id = :order_id
-                    WHERE id IN (:src_id, :dst_id)
+                    WHERE id = :src_id OR id = :dst_id
                     """
                 ),
                 {"order_id": order_id, "src_id": source_cell_id, "dst_id": dest_cell_id},
@@ -2040,7 +2230,7 @@ class DatabaseLayer:
                 text("""
                     UPDATE locker_cells
                     SET current_order_id = :order_id
-                    WHERE id IN (:source_id, :dest_id)
+                    WHERE id = :source_id OR id = :dest_id
                 """),
                 {
                     "order_id": order_id,
@@ -2575,57 +2765,59 @@ class DatabaseLayer:
         session: Session,
         client_user_id: int,
         recipient_user_id: int,
+        from_city: str,
+        to_city: str,
         parcel_type: str,
         cell_size: str,
         sender_delivery: str,
         recipient_delivery: str,
-    ) -> Tuple[int, int]: 
+    ) -> Tuple[int, int]:
+        """
+        API entry: order_request(request_received) + FSM instance on order_request.
+        orders ещё нет — создаётся в effect после резерва ячеек.
+        Returns (request_id, instance_id).
+        """
         logger.debug("create_order_request_and_fsm: client=%s", client_user_id)
         try:
             session.execute(
                 text("""
                     INSERT INTO order_requests
-                        (client_user_id, recipient_user_id, parcel_type, cell_size, sender_delivery, recipient_delivery)
+                        (client_user_id, recipient_user_id, from_city, to_city,
+                         parcel_type, cell_size, sender_delivery, recipient_delivery, status)
                     VALUES
-                        (:client_user_id, :recipient_user_id, :parcel_type, :cell_size, :sender_delivery, :recipient_delivery)
+                        (:client_user_id, :recipient_user_id, :from_city, :to_city,
+                         :parcel_type, :cell_size, :sender_delivery, :recipient_delivery,
+                         'request_received')
                 """),
                 {
                     "client_user_id": client_user_id,
                     "recipient_user_id": recipient_user_id,
+                    "from_city": from_city,
+                    "to_city": to_city,
                     "parcel_type": parcel_type,
                     "cell_size": cell_size,
                     "sender_delivery": sender_delivery,
                     "recipient_delivery": recipient_delivery,
                 },
             )
-            request_id = session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
-            request_id = int(request_id)
+            request_id = int(session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one())
 
-            session.execute(
-                text("""
-                    INSERT INTO server_fsm_instances
-                        (entity_type, entity_id, process_name, fsm_state, attempts_count)
-                    VALUES
-                        (:entity_type, :entity_id, :process_name, :fsm_state, :attempts_count)
-                """),
-                {
-                    "entity_type": "order_request",
-                    "entity_id": request_id,
-                    "process_name": "order_creation",
-                    "fsm_state": "PENDING",
-                    "attempts_count": 0,
-                },
+            instance_id = self.enqueue_fsm_instance(
+                session=session,
+                entity_type="order_request",
+                entity_id=request_id,
+                process_name="order_creation",
+                fsm_state="PENDING",
+                requested_by_user_id=client_user_id,
+                requested_user_role="client",
+                service="courier",
             )
-            instance_id = session.execute(
-                text("""
-                    SELECT id FROM server_fsm_instances
-                    WHERE entity_type = 'order_request' AND entity_id = :request_id
-                    AND process_name = 'order_creation'
-                """),
-                {"request_id": request_id}
-            ).scalar_one()
 
-            logger.info("Создана заявка %s и FSM-инстанс %s", request_id, instance_id)
+            logger.info(
+                "Созданы заявка %s и FSM-инстанс %s",
+                request_id,
+                instance_id,
+            )
             return request_id, instance_id
 
         except Exception as e:
@@ -5839,6 +6031,11 @@ class DatabaseLayer:
                     text("SELECT status FROM driver_reservations WHERE id = :id"),
                     {"id": entity_id}
                 ).scalar()
+            elif entity_type == "order_request":
+                result = session.execute(
+                    text("SELECT status FROM order_requests WHERE id = :id"),
+                    {"id": entity_id}
+                ).scalar()
             else:
                 logger.error("get_entity_current_state: неизвестный entity_type=%s", entity_type)
                 raise DbLayerError(f"Неизвестный entity_type: {entity_type}")
@@ -5895,12 +6092,12 @@ class DatabaseLayer:
             
             rows = session.execute(
                 text("""
-                    SELECT fa.name
+                    SELECT fe.name
                     FROM fsm_transitions ft
-                    JOIN fsm_actions fa ON fa.id = ft.action_id
+                    JOIN fsm_events fe ON fe.id = ft.event_id
                     WHERE ft.entity_type = :entity_type
                       AND ft.from_state_id = :from_state_id
-                    ORDER BY fa.name
+                    ORDER BY fe.name
                 """),
                 {"entity_type": entity_type, "from_state_id": from_state_id}
             ).fetchall()
@@ -5944,7 +6141,7 @@ class DatabaseLayer:
                         ft.entity_type,
                         fs_from.name AS from_state,
                         fs_to.name AS to_state,
-                        fa.name AS event_name,
+                        fe.name AS event_name,
                         ft.guard_name,
                         ft.guard_params,
                         ft.priority,
@@ -5953,10 +6150,10 @@ class DatabaseLayer:
                     FROM fsm_transitions ft
                     JOIN fsm_states fs_from ON fs_from.id = ft.from_state_id
                     JOIN fsm_states fs_to ON fs_to.id = ft.to_state_id
-                    JOIN fsm_actions fa ON fa.id = ft.action_id
+                    JOIN fsm_events fe ON fe.id = ft.event_id
                     WHERE ft.entity_type = :entity_type
                       AND fs_from.name = :current_state
-                      AND fa.name = :event_name
+                      AND fe.name = :event_name
                     ORDER BY ft.priority, ft.id
                 """),
                 {

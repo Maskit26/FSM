@@ -123,6 +123,7 @@ class TransitionRunner:
         candidates: Iterable[TransitionDef],
     ) -> Optional[TransitionDef | FsmResult]:
         """Выбрать один transition из candidates (по priority и guards)."""
+        last_reason: Optional[str] = None
         for transition in candidates:
             if not transition.guard_name:
                 return transition
@@ -142,12 +143,15 @@ class TransitionRunner:
             )
             if guard_result.ok:
                 return transition
-            logger.debug(
+            logger.warning(
                 "[FSM_CORE] guard declined transition_id=%s guard=%s reason=%s",
                 transition.id,
                 transition.guard_name,
                 guard_result.reason,
             )
+            last_reason = guard_result.reason
+        if last_reason:
+            return self._failed(f"NO_GUARD_MATCHED: {last_reason}")
         return None
 
     def _transition_from_row(self, row: Dict[str, Any]) -> TransitionDef:

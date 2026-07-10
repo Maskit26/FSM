@@ -13,6 +13,8 @@ class OrderCreateRequest(BaseModel):
 class ClientCreateOrderRequest(BaseModel):
     client_user_id: int
     recipient_user_id: int
+    from_city: str
+    to_city: str
     parcel_type: str
     cell_size: str
     sender_delivery: str

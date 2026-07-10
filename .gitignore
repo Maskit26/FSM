@@ -32,6 +32,7 @@ scripts/
 # Database
 *.db
 *.sqlite3
+database/migrations/
 
 # OS
 .DS_Store

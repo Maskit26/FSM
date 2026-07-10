@@ -11,8 +11,17 @@ from fsm_core.registry import (
 from fsm_core.types import ProcessDef
 
 from .context import build_courier_context
-from .effects import noop_effect, release_orders_on_reservation_cancel
-from .guards import always_allow, can_cancel_driver_reservation, is_driver
+from .effects import (
+    finalize_order_creation,
+    noop_effect,
+    release_orders_on_reservation_cancel,
+)
+from .guards import (
+    always_allow,
+    can_cancel_driver_reservation,
+    can_create_order,
+    is_driver,
+)
 
 SERVICE_NAME = "courier"
 
@@ -26,11 +35,23 @@ def register_all(
     guard_registry.register("always_allow", always_allow)
     guard_registry.register("is_driver", is_driver)
     guard_registry.register("can_cancel_driver_reservation", can_cancel_driver_reservation)
+    guard_registry.register("can_create_order", can_create_order)
 
     effect_registry.register("noop_effect", noop_effect)
     effect_registry.register(
         "release_orders_on_reservation_cancel",
         release_orders_on_reservation_cancel,
+    )
+    effect_registry.register("finalize_order_creation", finalize_order_creation)
+
+    process_registry.register(
+        ProcessDef(
+            service=SERVICE_NAME,
+            process_name="order_creation",
+            entity_type="order_request",
+            event_name="order_create",
+            context_builder=build_courier_context,
+        )
     )
 
     process_registry.register(
