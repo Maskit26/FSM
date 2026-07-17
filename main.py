@@ -34,8 +34,8 @@ async def lifespan(app: FastAPI):
             host=os.getenv("DB_HOST", "localhost"),
             port=int(os.getenv("DB_PORT", "3307")),
             database=os.getenv("DB_NAME", "testdb"),
-            user=os.getenv("DB_USER", "root"),
-            password=os.getenv("DB_PASSWORD", "root"),
+            user=os.getenv("DB_USER", "****"),
+            password=os.getenv("DB_PASSWORD", "****"),
             echo=False
         )
         print("✅ Database connected")
