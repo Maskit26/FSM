@@ -10,7 +10,7 @@ pip install sqlalchemy mysql-connector-python
 Использование:
 from db_layer import DatabaseLayer, DbLayerError, FsmCallError
 
-db = DatabaseLayer(port=3307, password="root")
+
 order_id = db.create_order(...)
 trip_id, success, msg = db.assign_order_to_trip_smart(order_id, "Москва", "СПб")
 """
