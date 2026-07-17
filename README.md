@@ -192,7 +192,7 @@ DB_PASSWORD=YOUR_STRONG_PASSWORD
 DB_NAME=testdb
 ```
 
-Убедитесь, что `db_layer.py` и `main.py` читают эти переменные через `os.getenv()` или `python-dotenv`.
+Убедитесь, что `main.py` и `fsm_worker.py` читают эти переменные через `python-dotenv` (файл `.env` в корне проекта).
 
 ### Шаг 7. Создание systemd-сервисов
 
