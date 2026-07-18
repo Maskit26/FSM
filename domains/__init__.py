@@ -1,1 +1,1 @@
-"""Domain packages for FSM Platform."""
+"""Domain cartridges live under domains/<cartridge_type>/."""

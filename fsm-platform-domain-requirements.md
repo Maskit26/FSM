@@ -967,9 +967,9 @@ Platform не интерпретирует бизнес-смысл таблиц;
 ---
 
 
-## 8. Модули fsm_core
+## 8. Модули fsm_platform
 
-Пакет `fsm_core/` — **единственный** runtime декларативного FSM. Его вызывает worker (и только worker) для async lifecycle. HTTP Query/Command в `fsm_core` не входят.
+Пакет `fsm_platform/` (в коде; ранее в черновиках — `fsm_core`) — **единственный** runtime декларативного FSM. Его вызывает worker (и только worker) для async lifecycle. HTTP Query/Command в `fsm_platform` не входят. Оболочка HTTP/worker/engines — пакет `fsm_host/` (не stdlib `platform`).
 
 ### 8.0. Состав пакета
 
