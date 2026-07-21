@@ -1,4 +1,4 @@
-"""Build domain context for guards/effects."""
+"""Сборка context для guards/effects процесса заказа."""
 
 from __future__ import annotations
 
@@ -8,6 +8,10 @@ from domains.courier import db_layer
 
 
 def build_order_context(session_domain, db, runtime_ctx, instance) -> dict[str, Any]:
+    """
+    Готовит context по entity_id инстанса (заказ).
+    Guards и effects читают из него данные заказа, не делая лишних запросов сами.
+    """
     order_id = int(instance["entity_id"])
     order = db_layer.get_order(session_domain, order_id)
     return {

@@ -1,7 +1,7 @@
 """
-fsm_platform — declarative FSM runtime (was conceptually fsm_core in the spec).
+fsm_platform — декларативный FSM runtime (в спецификации — fsm_core).
 
-Worker-only: no HTTP, no domain imports, no commit.
+Только для воркера: без HTTP, без импортов домена и без commit.
 """
 
 from .engine import run_instance

@@ -1,4 +1,4 @@
-"""Boot platform: engines + domain register_all."""
+"""Boot платформы: engines БД и регистрация доменов."""
 
 from __future__ import annotations
 
@@ -14,9 +14,8 @@ logger = logging.getLogger(__name__)
 
 def boot() -> None:
     """
-    1) Register domain engines from DOMAIN_DATABASE_URL + SERVICE_ID (dev)
-       and/or domain_services rows (status=active).
-    2) register_all from FSM_DOMAINS.
+    Поднимает domain engines (env + domain_services) и вызывает register_all доменов.
+    Вызывается при старте API и worker.
     """
     _register_engines_from_env()
     _register_engines_from_domain_services()
@@ -25,6 +24,7 @@ def boot() -> None:
 
 
 def _register_engines_from_env() -> None:
+    """Регистрирует один domain engine из SERVICE_ID + DOMAIN_DATABASE_URL (удобно для dev)."""
     service_id = os.environ.get("SERVICE_ID", "").strip()
     url = os.environ.get("DOMAIN_DATABASE_URL", "").strip()
     if service_id and url:
@@ -33,6 +33,7 @@ def _register_engines_from_env() -> None:
 
 
 def _register_engines_from_domain_services() -> None:
+    """Читает active строки domain_services и регистрирует их engines по db_secret_ref."""
     try:
         sp = platform_session()
     except Exception:
@@ -43,7 +44,6 @@ def _register_engines_from_domain_services() -> None:
         for row in rows:
             sid = str(row["service_id"])
             ref = str(row["db_secret_ref"])
-            # v1: db_secret_ref holds SQLAlchemy URL or env var name
             url = os.environ.get(ref, ref)
             if "://" not in url:
                 logger.warning("skip domain_services %s: not a URL and env missing", sid)

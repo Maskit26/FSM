@@ -1,7 +1,7 @@
 """
-FSM worker: claim instance → run_instance → dual-DB commit (§4.7 / §4.7.1).
+FSM worker: claim инстанса → run_instance → dual-DB commit.
 
-No SQL here — platform writes go through fsm_platform.db_layer.
+SQL нет — записи в platform идут через fsm_platform.db_layer.
 """
 
 from __future__ import annotations
@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def _failed_short_tx(instance: dict[str, Any], last_error: str) -> None:
-    """§4.7 FAILED notify in a separate short platform transaction."""
+    """
+    Короткая отдельная транзакция при FAILED: помечает инстанс и пишет событие.
+    Нужна, чтобы ошибка зафиксировалась даже после rollback основной работы.
+    """
     sp = platform_session()
     try:
         default_db_layer.mark_instance_failed(
@@ -48,7 +51,10 @@ def _enqueue_reconcile(
     instance: dict[str, Any],
     result: FsmResult,
 ) -> None:
-    """Domain committed, platform commit failed — §4.7.1."""
+    """
+    Domain уже закоммичен, а platform commit упал — кладём задачу reconcile.
+    Дальше отдельный процесс догоняет platform-состояние.
+    """
     payload = result.payload or {}
     sp = platform_session()
     try:
@@ -78,7 +84,10 @@ def _enqueue_reconcile(
 
 
 def process_one() -> bool:
-    """Claim and process one PENDING instance. Returns True if work was done."""
+    """
+    Берёт один PENDING-инстанс и прогоняет FSM до COMPLETED или FAILED.
+    Возвращает True, если была работа; False, если очередь пуста.
+    """
     sp = platform_session()
     instance: Optional[dict[str, Any]] = None
     sd = None
@@ -87,7 +96,7 @@ def process_one() -> bool:
         if instance is None:
             sp.rollback()
             return False
-        sp.commit()  # release claim lock; instance is PROCESSING
+        sp.commit()
     except Exception:
         sp.rollback()
         logger.exception("claim failed")
@@ -158,6 +167,7 @@ def process_one() -> bool:
 
 
 def run_loop(poll_seconds: float = 1.0) -> None:
+    """Бесконечный цикл воркера: process_one, при пустой очереди — sleep."""
     logger.info("fsm worker loop started")
     while True:
         worked = process_one()

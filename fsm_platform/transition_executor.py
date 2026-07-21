@@ -1,4 +1,4 @@
-"""Apply one transition: entity_fsm_state + fsm_transition_logs (platform only)."""
+"""Применение одного перехода: entity_fsm_state и fsm_transition_logs только в платформенной БД."""
 
 from __future__ import annotations
 
@@ -10,13 +10,19 @@ from .types import TransitionDef
 
 
 class TransitionApplyError(Exception):
+    """Ошибка применения перехода с нормативным кодом FsmErrorCodes. Пробрасывается TransitionRunner и преобразуется в FsmResult FAILED."""
+
     def __init__(self, code: str, message: str = "") -> None:
+        """Сохраняет code и формирует сообщение исключения. code используется в last_error экземпляра."""
         self.code = code
         super().__init__(message or code)
 
 
 class TransitionExecutor:
+    """Атомарно обновляет состояние сущности и пишет лог перехода в платформенной БД. Не выполняет guards и effects."""
+
     def __init__(self, db_layer: FsmDbLayer | None = None) -> None:
+        """Принимает слой БД или использует default_db_layer. Позволяет подменить персистентность в тестах."""
         self._db = db_layer or default_db_layer
 
     def apply(
@@ -32,11 +38,7 @@ class TransitionExecutor:
         instance_id: Optional[int] = None,
         allow_idempotent: bool = False,
     ) -> None:
-        """
-        1) Check current_state == from_state (or already to_state if allow_idempotent)
-        2) UPSERT current_state = to_state
-        3) INSERT fsm_transition_logs
-        """
+        """Проверяет from_state, upsert to_state и вставляет fsm_transition_logs. При allow_idempotent допускает повторное применение уже достигнутого to_state."""
         current = self._db.get_entity_state(
             session_platform, service_id, entity_type, entity_id
         )

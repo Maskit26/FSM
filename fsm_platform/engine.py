@@ -1,4 +1,4 @@
-"""Worker entry: resolve ProcessDef and run one TransitionRunner step."""
+"""Точка входа воркера: разрешение ProcessDef и один шаг TransitionRunner."""
 
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ def run_instance(
     transition_repository: Optional[TransitionRepository] = None,
     transition_executor: Optional[TransitionExecutor] = None,
 ) -> FsmResult:
+    """Запускает один шаг FSM для server_fsm_instances и возвращает FsmResult. Главная функция движка, вызываемая воркером после claim_pending_instance."""
     process_registry = process_registry or default_process_registry
     guard_registry = guard_registry or default_guard_registry
     effect_registry = effect_registry or default_effect_registry

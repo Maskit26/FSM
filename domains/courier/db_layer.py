@@ -1,23 +1,24 @@
-"""Courier domain SQL — session from Request Runtime / worker only."""
+"""SQL домена courier. Сессию передаёт Request Runtime или worker."""
 
 from __future__ import annotations
 
 import math
 import re
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 
 def _city_hint(address: str) -> str:
-    """First comma-separated segment: 'Москва, ул. Тверская, д. 1' → 'Москва'."""
+    """Достаёт город из начала адреса до первой запятой. Нужен для подбора постамата без геокодера."""
     return address.split(",")[0].strip()
 
 
 def _haversine_km(
     lat1: float, lon1: float, lat2: float, lon2: float
 ) -> float:
+    """Считает расстояние между двумя точками в километрах. Используется для выбора ближайшего постамата."""
     r = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -39,9 +40,8 @@ def find_nearest_free_cell(
     exclude_cell_id: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     """
-    Nearest locker with a free cell of cell_size.
-    Prefer geo distance when address lat/lng given and locker has coords;
-    else match by city hint + address text against lockers.location_address.
+    Ищет свободную ячейку нужного размера у ближайшего подходящего постамата.
+    При lat/lng предпочитает гео-дистанцию; иначе матчит город и текст адреса.
     """
     city = _city_hint(address)
     rows = session.execute(
@@ -129,6 +129,10 @@ def reserve_and_bind_cells(
     source_cell_id: int,
     dest_cell_id: int,
 ) -> None:
+    """
+    Резервирует две ячейки под заказ и пишет current_order_id.
+    Обе ячейки должны быть свободны, иначе ошибка.
+    """
     result = session.execute(
         text(
             """
@@ -150,7 +154,6 @@ def reserve_and_bind_cells(
         raise RuntimeError("failed to reserve both cells")
 
 
-
 def insert_order(
     session: Session,
     *,
@@ -165,6 +168,10 @@ def insert_order(
     source_cell_id: Optional[int] = None,
     dest_cell_id: Optional[int] = None,
 ) -> int:
+    """
+    Вставляет строку заказа со статусом order_created.
+    Возвращает id созданного заказа.
+    """
     result = session.execute(
         text(
             """
@@ -199,6 +206,7 @@ def insert_order(
 
 
 def update_order_status(session: Session, order_id: int, status: str) -> None:
+    """Обновляет бизнес-статус заказа в таблице orders. Нужен для синхронизации с FSM."""
     session.execute(
         text(
             """
@@ -212,6 +220,7 @@ def update_order_status(session: Session, order_id: int, status: str) -> None:
 
 
 def get_order(session: Session, order_id: int) -> Optional[dict[str, Any]]:
+    """Читает заказ по id. Возвращает dict или None, если не найден."""
     row = session.execute(
         text(
             """
@@ -231,6 +240,7 @@ def get_order(session: Session, order_id: int) -> Optional[dict[str, Any]]:
 def list_orders_for_client(
     session: Session, client_user_id: int, limit: int = 20
 ) -> list[dict[str, Any]]:
+    """Список заказов клиента (новые сверху). Ограничивается limit."""
     rows = session.execute(
         text(
             """
@@ -245,3 +255,158 @@ def list_orders_for_client(
         {"uid": client_user_id, "lim": limit},
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+def create_stage_order(
+    session: Session,
+    order_id: int,
+    leg: str,
+    *,
+    trip_id: Optional[int] = None,
+    courier_user_id: Optional[int] = None,
+) -> None:
+    """
+    Создаёт слот плеча в stage_orders (pickup или delivery).
+    Пока courier_user_id пуст — заказ доступен на бирже этого плеча.
+    """
+    session.execute(
+        text(
+            """
+            INSERT INTO stage_orders (trip_id, order_id, leg, courier_user_id)
+            VALUES (:trip_id, :order_id, :leg, :courier_user_id)
+            """
+        ),
+        {
+            "trip_id": trip_id,
+            "order_id": order_id,
+            "leg": leg,
+            "courier_user_id": courier_user_id,
+        },
+    )
+
+
+def get_user(session: Session, user_id: int) -> Optional[dict[str, Any]]:
+    """Читает пользователя (роль, город и т.д.). Нужен для биржи и авторизации актёра."""
+    row = session.execute(
+        text(
+            """
+            SELECT id, name, role_name, city, phone
+            FROM users WHERE id = :id
+            """
+        ),
+        {"id": user_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def list_exchange_pickup(
+    session: Session, courier_city: str
+) -> list[dict[str, Any]]:
+    """
+    Заказы на бирже pickup в городе курьера (клиент → постамат А).
+    Только свободные слоты stage_orders и pickup_type=courier.
+    """
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                o.id AS order_id,
+                o.status,
+                o.description,
+                o.parcel_type,
+                o.from_address,
+                o.to_address,
+                o.pickup_type,
+                o.delivery_type,
+                o.created_at,
+                l.location_address AS locker_address,
+                l.city AS locker_city,
+                lc.cell_code,
+                lc.cell_type AS cell_size
+            FROM orders o
+            JOIN stage_orders so
+                ON so.order_id = o.id AND so.leg = 'pickup'
+            JOIN locker_cells lc ON lc.id = o.source_cell_id
+            JOIN lockers l ON l.id = lc.locker_id
+            WHERE o.status = 'order_created'
+              AND o.pickup_type = 'courier'
+              AND so.courier_user_id IS NULL
+              AND l.city = :courier_city
+            ORDER BY o.created_at ASC
+            """
+        ),
+        {"courier_city": courier_city},
+    ).mappings().all()
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["leg"] = "pickup"
+        out.append(item)
+    return out
+
+
+def list_exchange_delivery(
+    session: Session, courier_city: str
+) -> list[dict[str, Any]]:
+    """
+    Заказы на бирже delivery в городе курьера (постамат Б → получатель).
+    Показываются после статуса order_parcel_confirmed_post2.
+    """
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                o.id AS order_id,
+                o.status,
+                o.description,
+                o.parcel_type,
+                o.from_address,
+                o.to_address,
+                o.pickup_type,
+                o.delivery_type,
+                o.created_at,
+                l.location_address AS locker_address,
+                l.city AS locker_city,
+                lc.cell_code,
+                lc.cell_type AS cell_size
+            FROM orders o
+            JOIN stage_orders so
+                ON so.order_id = o.id AND so.leg = 'delivery'
+            JOIN locker_cells lc ON lc.id = o.dest_cell_id
+            JOIN lockers l ON l.id = lc.locker_id
+            WHERE o.status = 'order_parcel_confirmed_post2'
+              AND o.delivery_type = 'courier'
+              AND so.courier_user_id IS NULL
+              AND l.city = :courier_city
+            ORDER BY o.created_at ASC
+            """
+        ),
+        {"courier_city": courier_city},
+    ).mappings().all()
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["leg"] = "delivery"
+        out.append(item)
+    return out
+
+
+def list_courier_exchange(
+    session: Session, courier_city: str
+) -> dict[str, Any]:
+    """
+    Собирает биржу города: pickup + delivery в одном результате.
+    Поле all удобно отдавать на фронт одним списком.
+    """
+    pickup = list_exchange_pickup(session, courier_city)
+    delivery = list_exchange_delivery(session, courier_city)
+    return {
+        "pickup": pickup,
+        "delivery": delivery,
+        "all": pickup + delivery,
+        "counts": {
+            "pickup": len(pickup),
+            "delivery": len(delivery),
+            "total": len(pickup) + len(delivery),
+        },
+    }

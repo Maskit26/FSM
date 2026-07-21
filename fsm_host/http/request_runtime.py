@@ -1,6 +1,6 @@
-"""HTTP request sessions + invoke/create bootstrap (§4.10 / §4.12).
+"""HTTP request runtime: сессии, invoke и bootstrap сущности.
 
-No SQL here — only fsm_platform.db_layer + session ownership.
+SQL здесь нет — только вызовы fsm_platform.db_layer и владение сессиями.
 """
 
 from __future__ import annotations
@@ -21,6 +21,10 @@ def run_operation(
     params: dict[str, Any],
     actor: dict[str, Any],
 ) -> dict[str, Any]:
+    """
+    Выполняет invoke: открывает domain/platform сессии, вызывает handler, коммитит.
+    Для create-command дополнительно пишет entity_fsm_state и опционально enqueue.
+    """
     sp = platform_session()
     sd = domain_session(service_id)
     try:
@@ -44,6 +48,10 @@ def _bootstrap_and_maybe_enqueue(
     service_id: str,
     result: dict[str, Any],
 ) -> None:
+    """
+    После create: создаёт начальный entity_fsm_state.
+    Если handler вернул enqueue.process_name — ставит задачу в server_fsm_instances.
+    """
     entity_type = str(result["entity_type"])
     entity_id = int(result["entity_id"])
     initial = result.get("initial_state")
@@ -81,6 +89,10 @@ def enqueue_instance(
     payload: Optional[dict[str, Any]] = None,
     requested_by_user_id: Optional[int] = None,
 ) -> dict[str, Any]:
+    """
+    Кладёт PENDING-инстанс FSM в очередь для уже существующей сущности.
+    Сущность должна уже иметь строку в entity_fsm_state.
+    """
     sp = platform_session()
     try:
         state = default_db_layer.get_entity_state(sp, service_id, entity_type, entity_id)
@@ -110,6 +122,10 @@ def enqueue_instance(
 
 
 def get_instance(service_id: str, instance_id: int) -> Optional[dict[str, Any]]:
+    """
+    Читает статус FSM-инстанса и текущий entity_fsm_state сущности.
+    Нужен для GET .../fsm/instances/{id}.
+    """
     sp = platform_session()
     try:
         data = default_db_layer.get_fsm_instance(sp, service_id, instance_id)

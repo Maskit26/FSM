@@ -1,4 +1,4 @@
-"""Official domain → platform write API (§4.13). No raw SQL — db_layer only."""
+"""Официальный API домена → platform side-effects. Без raw SQL."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ def schedule_timer(
     payload: Optional[dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
 ) -> int:
+    """Планирует таймер FSM на platform. По срабатыванию можно снова enqueue процесс."""
     return _schedule_timer(
         session_platform,
         service_id=service_id,
@@ -42,7 +43,10 @@ def notify(
     payload: Optional[dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
 ) -> int:
-    """INSERT platform_outbox (PENDING). HTTP only after commit via outbox_worker."""
+    """
+    Кладёт уведомление в platform_outbox (PENDING).
+    Реальная отправка HTTP — только после commit, outbox-worker’ом.
+    """
     return default_db_layer.insert_outbox(
         session_platform,
         service_id=service_id,
@@ -66,7 +70,10 @@ def emit_event(
     correlation_id: Optional[str] = None,
     client_request_id: Optional[str] = None,
 ) -> int:
-    """Sole writer of platform_events (via db_layer)."""
+    """
+    Пишет доменное/платформенное событие в platform_events.
+    Единая точка записи событий для SSE/аудита.
+    """
     return default_db_layer.insert_event(
         session_platform,
         service_id=service_id,

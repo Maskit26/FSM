@@ -1,8 +1,7 @@
 """
-Boot active domains: load package → register_all(service_id) → RAM registries.
+Загрузка активных доменов: импорт пакета → register_all(service_id) → RAM-реестры.
 
-v1: domains listed in FSM_DOMAINS env (comma-separated cartridge module paths)
-     plus optional Domain Registry rows (status=active) when DB is configured.
+v1: домены из FSM_DOMAINS (пути картриджей через запятую) и опционально строк Domain Registry (status=active) при настроенной БД.
 """
 
 from __future__ import annotations
@@ -17,9 +16,8 @@ logger = logging.getLogger(__name__)
 
 def _load_register_all(entry: str) -> Callable[[str], None]:
     """
-    entry formats:
-      domains.demo.processes:register_all
-      domains.demo
+    Загружает callable register_all из строки entry.
+    Форматы: domains.demo.processes:register_all или domains.demo (атрибут register_all по умолчанию).
     """
     if ":" in entry:
         module_name, attr = entry.split(":", 1)
@@ -34,9 +32,8 @@ def _load_register_all(entry: str) -> Callable[[str], None]:
 
 def bootstrap_from_env() -> None:
     """
-    FSM_DOMAINS example:
-      demo_svc=domains.demo.processes:register_all
-    Multiple entries separated by semicolon.
+    Читает FSM_DOMAINS и регистрирует домены в RAM-реестрах.
+    Пример: demo_svc=domains.demo.processes:register_all; несколько записей через точку с запятой.
     """
     raw = os.environ.get("FSM_DOMAINS", "").strip()
     if not raw:

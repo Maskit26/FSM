@@ -1,4 +1,4 @@
-"""SQL against platform DB only. Sessions are owned by worker / Request Runtime."""
+"""SQL-запросы только к платформенной БД. Сессии создаёт и владеет ими воркер или Request Runtime."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ SessionLike = Session | Connection
 
 
 class FsmDbLayer:
-    """Platform persistence: entity_fsm_state, fsm_transition_logs, fsm_timers, helpers."""
+    """Слой персистентности платформы: состояния сущностей, логи переходов, таймеры и вспомогательные таблицы."""
 
     # --- entity_fsm_state ---
 
@@ -26,6 +26,7 @@ class FsmDbLayer:
         entity_type: str,
         entity_id: int,
     ) -> Optional[str]:
+        """Возвращает текущее FSM-состояние сущности из entity_fsm_state. Используется перед переходом и при проверке согласованности."""
         row = session.execute(
             text(
                 """
@@ -52,6 +53,7 @@ class FsmDbLayer:
         entity_id: int,
         current_state: str,
     ) -> None:
+        """Создаёт или обновляет запись состояния сущности (INSERT … ON DUPLICATE KEY UPDATE). Вызывается после успешного применения перехода."""
         session.execute(
             text(
                 """
@@ -80,6 +82,7 @@ class FsmDbLayer:
         entity_id: int,
         current_state: str,
     ) -> None:
+        """Вставляет начальное состояние сущности без upsert. Применяется при первичной инициализации FSM для новой сущности."""
         session.execute(
             text(
                 """
@@ -113,6 +116,7 @@ class FsmDbLayer:
         instance_id: Optional[int] = None,
         user_id: Optional[int] = None,
     ) -> None:
+        """Записывает факт перехода в fsm_transition_logs для аудита и диагностики. Вызывается при каждом успешном apply без идемпотентности."""
         session.execute(
             text(
                 """
@@ -151,7 +155,7 @@ class FsmDbLayer:
         instance_id: int,
         user_id: Optional[int] = None,
     ) -> bool:
-        """INSERT ignore duplicate (instance_id, transition_id). Returns True if inserted."""
+        """Вставляет лог перехода с INSERT IGNORE по паре (instance_id, transition_id). Возвращает True, если запись создана; False при повторной обработке."""
         result = session.execute(
             text(
                 """
@@ -191,6 +195,7 @@ class FsmDbLayer:
         payload: Optional[dict[str, Any]] = None,
         idempotency_key: Optional[str] = None,
     ) -> int:
+        """Планирует отложенный запуск процесса в fsm_timers со статусом SCHEDULED. Возвращает id созданного таймера."""
         result = session.execute(
             text(
                 """
@@ -215,6 +220,7 @@ class FsmDbLayer:
         return int(result.lastrowid)
 
     def cancel_timer(self, session: SessionLike, timer_id: int) -> None:
+        """Отменяет запланированный таймер, если он ещё в статусе SCHEDULED. Используется при досрочном прекращении отложенного процесса."""
         session.execute(
             text(
                 """
@@ -239,6 +245,7 @@ class FsmDbLayer:
         payload: Optional[dict[str, Any]] = None,
         requested_by_user_id: Optional[int] = None,
     ) -> int:
+        """Создаёт новую запись server_fsm_instances со статусом PENDING. Воркер подхватит её для выполнения одного шага FSM."""
         result = session.execute(
             text(
                 """
@@ -268,6 +275,7 @@ class FsmDbLayer:
         service_id: str,
         instance_id: int,
     ) -> Optional[dict[str, Any]]:
+        """Загружает экземпляр FSM по id и service_id. Нужен для статуса, диагностики и повторной обработки."""
         row = session.execute(
             text(
                 """
@@ -285,6 +293,7 @@ class FsmDbLayer:
     def claim_pending_instance(
         self, session: SessionLike
     ) -> Optional[dict[str, Any]]:
+        """Атомарно захватывает старейший PENDING-экземпляр (FOR UPDATE SKIP LOCKED) и переводит в PROCESSING. Вызывается воркером при опросе очереди."""
         row = session.execute(
             text(
                 """
@@ -317,6 +326,7 @@ class FsmDbLayer:
     def mark_instance_completed(
         self, session: SessionLike, instance_id: int
     ) -> None:
+        """Помечает экземпляр COMPLETED и фиксирует время завершения. Вызывается после успешного шага TransitionRunner."""
         session.execute(
             text(
                 """
@@ -332,6 +342,7 @@ class FsmDbLayer:
     def mark_instance_failed(
         self, session: SessionLike, instance_id: int, last_error: str
     ) -> None:
+        """Помечает экземпляр FAILED, сохраняет last_error и увеличивает attempts. Применяется при ошибке контекста, guard, effect или apply."""
         session.execute(
             text(
                 """
@@ -361,6 +372,7 @@ class FsmDbLayer:
         transition_id: Optional[int],
         payload: Optional[dict[str, Any]] = None,
     ) -> None:
+        """Ставит задачу сверки платформы и домена в platform_reconcile_queue. Нужна для асинхронного восстановления после частичных сбоев."""
         session.execute(
             text(
                 """
@@ -403,6 +415,7 @@ class FsmDbLayer:
         payload: Optional[dict[str, Any]] = None,
         idempotency_key: Optional[str] = None,
     ) -> int:
+        """Добавляет исходящее сообщение в platform_outbox для надёжной доставки. Возвращает id записи outbox."""
         result = session.execute(
             text(
                 """
@@ -438,6 +451,7 @@ class FsmDbLayer:
         correlation_id: Optional[str] = None,
         client_request_id: Optional[str] = None,
     ) -> int:
+        """Записывает платформенное событие в platform_events для аудита и трассировки. Возвращает id созданного события."""
         result = session.execute(
             text(
                 """
@@ -467,6 +481,7 @@ class FsmDbLayer:
     def list_active_domain_services(
         self, session: SessionLike
     ) -> list[dict[str, Any]]:
+        """Возвращает список активных доменных сервисов из domain_services. Используется при bootstrap для регистрации картриджей из БД."""
         rows = session.execute(
             text(
                 """

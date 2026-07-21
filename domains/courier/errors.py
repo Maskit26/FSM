@@ -1,4 +1,4 @@
-"""Re-export platform DomainError for the courier cartridge."""
+"""Реэкспорт DomainError платформы для картриджа courier."""
 
 from fsm_platform.domain_errors import DomainError
 

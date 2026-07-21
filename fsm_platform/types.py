@@ -1,4 +1,4 @@
-"""Contracts between worker ↔ fsm_platform ↔ domain (no I/O)."""
+"""Контракты между воркером, fsm_platform и доменом (без I/O)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ EffectFunction = Callable[[Any, Any, dict[str, Any], InstanceDict, dict[str, Any
 
 @dataclass
 class FsmResult:
-    """Instance status for worker: COMPLETED | FAILED (WAITING unused in v1)."""
+    """Результат шага FSM для воркера: COMPLETED или FAILED (WAITING в v1 не используется)."""
 
     new_state: str
     last_error: Optional[str] = None
@@ -30,6 +30,8 @@ class FsmResult:
 
 @dataclass
 class GuardResult:
+    """Нормализованный ответ guard: допущен ли переход и причина отказа."""
+
     ok: bool
     reason: Optional[str] = None
     payload: Optional[dict[str, Any]] = None
@@ -37,6 +39,8 @@ class GuardResult:
 
 @dataclass
 class EffectResult:
+    """Нормализованный ответ effect после успешного apply перехода."""
+
     ok: bool = True
     error: Optional[str] = None
     payload: Optional[dict[str, Any]] = None
@@ -44,6 +48,8 @@ class EffectResult:
 
 @dataclass
 class ProcessDef:
+    """Декларация FSM-процесса: привязка к service_id, сущности, событию и context_builder."""
+
     service_id: str
     process_name: str
     entity_type: Optional[str] = None
@@ -53,11 +59,14 @@ class ProcessDef:
 
     @property
     def runtime_event_name(self) -> str:
+        """Возвращает имя события для поиска transition: event_name или process_name по умолчанию."""
         return self.event_name or self.process_name
 
 
 @dataclass
 class TransitionDef:
+    """Описание одного перехода из доменного графа FSM с guard и effect."""
+
     id: int
     entity_type: str
     from_state: str
@@ -71,10 +80,11 @@ class TransitionDef:
 
     @classmethod
     def from_row(cls, row: Any) -> TransitionDef:
-        """Build from mapping / Row with known keys."""
+        """Собирает TransitionDef из строки SQL (mapping или dict) с известными ключами."""
         data = dict(row) if not isinstance(row, dict) else row
 
         def _get(*keys: str, default: Any = None) -> Any:
+            """Возвращает первое непустое значение из row по списку ключей. Упрощает маппинг разных имён колонок SQL."""
             for k in keys:
                 if k in data and data[k] is not None:
                     return data[k]
@@ -106,6 +116,7 @@ class TransitionDef:
 
 
 def normalize_guard_result(value: Any) -> GuardResult:
+    """Приводит произвольный возврат guard к GuardResult. Поддерживает bool, tuple, dict и GuardResult."""
     if isinstance(value, GuardResult):
         return value
     if isinstance(value, bool):
@@ -124,6 +135,7 @@ def normalize_guard_result(value: Any) -> GuardResult:
 
 
 def normalize_effect_result(value: Any) -> EffectResult:
+    """Приводит произвольный возврат effect к EffectResult. Поддерживает bool, dict и EffectResult."""
     if isinstance(value, EffectResult):
         return value
     if isinstance(value, bool):

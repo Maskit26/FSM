@@ -1,11 +1,4 @@
-"""Sync Command handlers — no SQL here, only db_layer.
-
-create_order (frontend contract):
-  - actor.actor_id → client_user_id (auth; not a form field)
-  - from_address / to_address → nearest lockers + cell reserve; stored for routing
-  - cell_size, parcel_type, sender_delivery, recipient_delivery
-  - recipient_user_id optional (not a create form field)
-"""
+"""Синхронные Command-обработчики домена courier (без SQL — только db_layer)."""
 
 from __future__ import annotations
 
@@ -18,6 +11,7 @@ _VALID_CELL_SIZES = frozenset({"S", "M", "L", "P"})
 
 
 def _require_str(params: dict[str, Any], key: str) -> str:
+    """Проверяет, что параметр есть и не пустой. Возвращает строку без пробелов по краям."""
     value = params.get(key)
     if value is None or str(value).strip() == "":
         raise ValueError(f"{key} required")
@@ -25,12 +19,14 @@ def _require_str(params: dict[str, Any], key: str) -> str:
 
 
 def _delivery_to_type(raw: Any, *, field: str) -> str:
+    """Переводит sender/recipient_delivery в ENUM заказа. Ровно 'self' → self, иначе courier."""
     if raw is None or str(raw).strip() == "":
         raise ValueError(f"{field} required")
     return "self" if str(raw).strip() == "self" else "courier"
 
 
 def _opt_float(params: dict[str, Any], key: str) -> Optional[float]:
+    """Читает необязательную координату из params. Пустое значение даёт None."""
     raw = params.get(key)
     if raw is None or str(raw).strip() == "":
         return None
@@ -38,7 +34,10 @@ def _opt_float(params: dict[str, Any], key: str) -> Optional[float]:
 
 
 def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
-    # Auth identity — not a frontend form field
+    """
+    Создаёт заказ: ищет ячейки по адресам, резервирует их, пишет orders и stage_orders.
+    Клиент берётся из actor.actor_id; FSM назначения курьера здесь не запускается.
+    """
     try:
         client_user_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
@@ -107,6 +106,9 @@ def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) 
         dest_cell_id=dst_id,
     )
     db_layer.reserve_and_bind_cells(domain_session, order_id, src_id, dst_id)
+
+    db_layer.create_stage_order(domain_session, order_id, "pickup")
+    db_layer.create_stage_order(domain_session, order_id, "delivery")
 
     return {
         "entity_type": "order",

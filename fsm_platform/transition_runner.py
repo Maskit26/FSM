@@ -1,4 +1,4 @@
-"""One declarative FSM step: context → candidates → guards → apply → effect."""
+"""Один декларативный шаг FSM: контекст → кандидаты → guards → apply → effect."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 class TransitionRunner:
+    """Выполняет полный цикл одного перехода FSM для экземпляра процесса. Инкапсулирует выбор transition, guards, apply и effect."""
+
     def __init__(
         self,
         guard_registry: GuardRegistry,
@@ -32,6 +34,7 @@ class TransitionRunner:
         transition_repository: TransitionRepository,
         transition_executor: TransitionExecutor,
     ) -> None:
+        """Собирает runner из реестров, хранилища состояния и исполнителя переходов. Зависимости передаются снаружи для тестов и кастомизации."""
         self._guards = guard_registry
         self._effects = effect_registry
         self._state_store = state_store
@@ -47,6 +50,7 @@ class TransitionRunner:
         instance: InstanceDict,
         process_def: ProcessDef,
     ) -> FsmResult:
+        """Выполняет один шаг FSM и возвращает FsmResult с COMPLETED или FAILED. Вызывается воркером для каждого захваченного server_fsm_instances."""
         service_id = str(instance["service_id"])
         instance_id = instance.get("id")
 

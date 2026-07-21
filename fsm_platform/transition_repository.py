@@ -1,4 +1,4 @@
-"""Read candidate transitions from domain DB FSM graph."""
+"""Чтение кандидатов переходов из FSM-графа доменной БД."""
 
 from __future__ import annotations
 
@@ -9,11 +9,7 @@ from .types import TransitionDef
 
 
 class TransitionRepository:
-    """
-    Supports:
-    - target schema: fsm_events + event_id
-    - legacy courier schema: fsm_actions + action_id (event_name = action name)
-    """
+    """Загружает transitions из доменной БД. Поддерживает схему fsm_events и legacy fsm_actions."""
 
     def list_candidates(
         self,
@@ -22,6 +18,7 @@ class TransitionRepository:
         from_state: str,
         event_name: str,
     ) -> list[TransitionDef]:
+        """Возвращает кандидаты переходов, отсортированные по priority. TransitionRunner перебирает их и применяет guards."""
         if self._has_table(session_domain, "fsm_events"):
             sql = """
                 SELECT
@@ -83,7 +80,7 @@ class TransitionRepository:
         session_domain: SessionLike,
         entity_type: str,
     ) -> list[str]:
-        """Return initial state names. Legacy graph without is_initial → empty list."""
+        """Возвращает имена начальных состояний из fsm_states. Для legacy-графа без is_initial возвращает пустой список."""
         if not self._has_column(session_domain, "fsm_states", "is_initial"):
             return []
         if self._has_column(session_domain, "fsm_states", "entity_type"):
@@ -105,6 +102,7 @@ class TransitionRepository:
 
     @staticmethod
     def _has_table(session: SessionLike, table: str) -> bool:
+        """Проверяет наличие таблицы в текущей схеме БД. Выбирает SQL-запрос для fsm_events или legacy fsm_actions."""
         row = session.execute(
             text(
                 """
@@ -119,6 +117,7 @@ class TransitionRepository:
 
     @staticmethod
     def _has_column(session: SessionLike, table: str, column: str) -> bool:
+        """Проверяет наличие колонки в таблице через information_schema. Нужна для совместимости со старыми схемами графа."""
         row = session.execute(
             text(
                 """

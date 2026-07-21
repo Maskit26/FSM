@@ -1,9 +1,11 @@
-"""FSM error codes (normative names for last_error / diagnostics)."""
+"""Коды ошибок FSM (нормативные имена для last_error и диагностики)."""
 
 from __future__ import annotations
 
 
 class FsmErrorCodes:
+    """Набор строковых констант ошибок платформы FSM. Используются в last_error экземпляров и логах."""
+
     MISSING_PROCESS_NAME = "MISSING_PROCESS_NAME"
     UNKNOWN_PROCESS = "UNKNOWN_PROCESS"
     INVALID_STATE_RETURNED = "INVALID_STATE_RETURNED"
