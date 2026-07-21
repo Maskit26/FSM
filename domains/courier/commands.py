@@ -135,42 +135,119 @@ def take_courier_order(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Курьер берёт заказ с биржи: только ставит FSM order_assign_courier1 в очередь.
-    Все бизнес-проверки — в guard can_assign_courier1; запись курьера — в effect.
+    UX-обёртка «взять с биржи»: enqueue общего процесса assign_executor.
+    Цепочку (courier1 / courier2) выбирают guards по leg и текущему state.
+    """
+    return assign_executor(domain_session, params, actor)
+
+
+def assign_executor(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Общее назначение исполнителя (как старый assign_executor).
+    Для order: params.order_id + params.leg (pickup|delivery).
+    Дальше FSM-процесс assign_executor + guards/effects.
     """
     _ = domain_session
     try:
-        courier_id = int((actor or {}).get("actor_id") or 0)
+        executor_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("actor.actor_id required") from exc
-    if not courier_id:
+    if not executor_id:
         raise ValueError("actor.actor_id required")
 
-    order_id = int(params.get("order_id") or 0)
+    entity_type = str(params.get("entity_type") or "order").strip().lower()
+    if entity_type != "order":
+        raise ValueError("entity_type=trip (driver) not implemented yet")
+
+    order_id = int(params.get("order_id") or params.get("entity_id") or 0)
     if not order_id:
         raise ValueError("order_id required")
 
     leg = str(params.get("leg") or "pickup").strip().lower()
     if leg not in ("pickup", "delivery"):
         raise ValueError("leg must be pickup or delivery")
-    if leg == "delivery":
-        raise ValueError("leg=delivery (courier2) not implemented yet")
 
     return {
         "entity_type": "order",
         "entity_id": order_id,
         "enqueue": {
-            "process_name": "order_assign_courier1",
+            "process_name": "assign_executor",
             "payload": {
-                "leg": "pickup",
-                "courier_user_id": courier_id,
-                "source": "take_courier_order",
+                "leg": leg,
+                "executor_user_id": executor_id,
+                "courier_user_id": executor_id,
+                "source": "assign_executor",
             },
         },
         "data": {
             "order_id": order_id,
-            "leg": "pickup",
-            "courier_user_id": courier_id,
+            "leg": leg,
+            "executor_user_id": executor_id,
+            "status": "pending_fsm",
+        },
+    }
+
+
+def cancel_courier_order(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """UX: курьер отказался → remove_executor (заказ снова на бирже)."""
+    return remove_executor(domain_session, params, actor)
+
+
+def remove_executor(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Снятие исполнителя с заказа (как старый remove_executor).
+    params: order_id, leg; опционально executor_user_id (кого снять).
+    По умолчанию снимается actor (самоотказ курьера).
+    """
+    _ = domain_session
+    try:
+        actor_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not actor_id:
+        raise ValueError("actor.actor_id required")
+
+    entity_type = str(params.get("entity_type") or "order").strip().lower()
+    if entity_type != "order":
+        raise ValueError("entity_type=trip (driver) not implemented yet")
+
+    order_id = int(params.get("order_id") or params.get("entity_id") or 0)
+    if not order_id:
+        raise ValueError("order_id required")
+
+    leg = str(params.get("leg") or "pickup").strip().lower()
+    if leg not in ("pickup", "delivery"):
+        raise ValueError("leg must be pickup or delivery")
+
+    # кого снимаем: явно из params или сам actor (отказ курьера)
+    raw_target = params.get("executor_user_id") or params.get("courier_user_id")
+    if raw_target is not None and str(raw_target).strip() != "":
+        executor_id = int(raw_target)
+    else:
+        executor_id = actor_id
+
+    return {
+        "entity_type": "order",
+        "entity_id": order_id,
+        "enqueue": {
+            "process_name": "remove_executor",
+            "payload": {
+                "leg": leg,
+                "executor_user_id": executor_id,
+                "courier_user_id": executor_id,
+                "source": "remove_executor",
+            },
+        },
+        "data": {
+            "order_id": order_id,
+            "leg": leg,
+            "executor_user_id": executor_id,
             "status": "pending_fsm",
         },
     }

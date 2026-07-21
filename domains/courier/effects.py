@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 from fsm_platform.core.types import EffectResult
 
@@ -22,6 +22,19 @@ def _payload_dict(instance: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def _executor_id(instance: dict[str, Any]) -> Optional[int]:
+    """Id исполнителя из payload или actor_id."""
+    payload = _payload_dict(instance)
+    raw = (
+        payload.get("executor_user_id")
+        or payload.get("courier_user_id")
+        or instance.get("actor_id")
+    )
+    if raw is None or str(raw).strip() == "":
+        return None
+    return int(raw)
 
 
 def sync_order_status(session_domain, db, context, instance, effect_params) -> EffectResult:
@@ -43,31 +56,88 @@ def sync_order_status(session_domain, db, context, instance, effect_params) -> E
     return EffectResult(ok=True, payload={"order_id": order_id, "status": to_state})
 
 
-def assign_courier1_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
+def assign_executor_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
     """
-    После успешного apply: занимает stage_orders.pickup и пишет orders.status.
-    Если слот уже занят другим — effect падает (ALREADY_TAKEN).
+    Общий effect назначения исполнителя на order.
+    leg из payload / effect_params / context; to_state — из перехода.
     """
-    _ = db, context, effect_params
+    _ = db
     order_id = int(instance["entity_id"])
     payload = _payload_dict(instance)
-    courier_raw = payload.get("courier_user_id") or instance.get("actor_id")
-    if not courier_raw:
-        return EffectResult(ok=False, error="COURIER_ID_REQUIRED")
-    courier_id = int(courier_raw)
+    params = effect_params or {}
+    ctx = context or {}
+    leg = str(
+        payload.get("leg") or params.get("leg") or ctx.get("leg") or "pickup"
+    ).strip().lower()
+    if leg not in ("pickup", "delivery"):
+        return EffectResult(ok=False, error=f"INVALID_LEG:{leg}")
+
+    executor_id = ctx.get("executor_id") or _executor_id(instance)
+    if not executor_id:
+        return EffectResult(ok=False, error="EXECUTOR_ID_REQUIRED")
 
     claimed = db_layer.claim_stage_order(
-        session_domain, order_id, "pickup", courier_id
+        session_domain, order_id, leg, int(executor_id)
     )
     if not claimed:
         return EffectResult(ok=False, error="ALREADY_TAKEN")
 
-    db_layer.update_order_status(session_domain, order_id, "order_courier1_assigned")
+    to_state = ctx.get("to_state") or params.get("to_state")
+    if not to_state:
+        to_state = (
+            "order_courier1_assigned" if leg == "pickup" else "order_courier2_assigned"
+        )
+    db_layer.update_order_status(session_domain, order_id, str(to_state))
     return EffectResult(
         ok=True,
         payload={
             "order_id": order_id,
-            "status": "order_courier1_assigned",
-            "courier_user_id": courier_id,
+            "leg": leg,
+            "status": to_state,
+            "executor_user_id": int(executor_id),
+        },
+    )
+
+
+def remove_executor_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
+    """
+    Снимает исполнителя со stage_orders и пишет orders.status = to_state перехода.
+    Курьер снова видит заказ на бирже (для pickup → order_created).
+    """
+    _ = db
+    order_id = int(instance["entity_id"])
+    payload = _payload_dict(instance)
+    params = effect_params or {}
+    ctx = context or {}
+    leg = str(
+        payload.get("leg") or params.get("leg") or ctx.get("leg") or "pickup"
+    ).strip().lower()
+    if leg not in ("pickup", "delivery"):
+        return EffectResult(ok=False, error=f"INVALID_LEG:{leg}")
+
+    executor_id = ctx.get("executor_id") or _executor_id(instance)
+    if not executor_id:
+        return EffectResult(ok=False, error="EXECUTOR_ID_REQUIRED")
+
+    cleared = db_layer.clear_stage_courier(
+        session_domain,
+        order_id,
+        leg,
+        expected_courier_id=int(executor_id),
+    )
+    if not cleared:
+        return EffectResult(ok=False, error="CLEAR_STAGE_FAILED")
+
+    to_state = ctx.get("to_state") or params.get("to_state")
+    if not to_state:
+        to_state = "order_created" if leg == "pickup" else "order_arrived_at_post2"
+    db_layer.update_order_status(session_domain, order_id, str(to_state))
+    return EffectResult(
+        ok=True,
+        payload={
+            "order_id": order_id,
+            "leg": leg,
+            "status": to_state,
+            "executor_user_id": int(executor_id),
         },
     )

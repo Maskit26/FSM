@@ -10,10 +10,16 @@ from fsm_platform.core.registry import (
 )
 from fsm_platform.host.operations import default_operation_registry
 
-from domains.courier.commands import create_order, take_courier_order
+from domains.courier.commands import (
+    assign_executor,
+    cancel_courier_order,
+    create_order,
+    remove_executor,
+    take_courier_order,
+)
 from domains.courier.context import build_order_context
-from domains.courier.effects import assign_courier1_effect
-from domains.courier.guards import can_assign_courier1
+from domains.courier.effects import assign_executor_effect, remove_executor_effect
+from domains.courier.guards import can_assign_executor, can_remove_executor
 from domains.courier.queries import (
     list_client_orders,
     list_courier_exchange,
@@ -23,14 +29,24 @@ from domains.courier.queries import (
 
 def register_all(service_id: str) -> None:
     """
-    Подключает все операции и FSM-процессы домена к указанному service_id.
-    Вызывается один раз при boot платформы.
+    Подключает операции и FSM-процессы домена к service_id.
+    Назначение/снятие исполнителя — процессы assign_executor / remove_executor;
+    цепочки задаются guard_params на рёбрах графа.
     """
     default_operation_registry.register(
         service_id, "create_order", "command", create_order
     )
     default_operation_registry.register(
+        service_id, "assign_executor", "command", assign_executor
+    )
+    default_operation_registry.register(
         service_id, "take_courier_order", "command", take_courier_order
+    )
+    default_operation_registry.register(
+        service_id, "remove_executor", "command", remove_executor
+    )
+    default_operation_registry.register(
+        service_id, "cancel_courier_order", "command", cancel_courier_order
     )
     default_operation_registry.register(
         service_id, "list_client_orders", "query", list_client_orders
@@ -45,17 +61,33 @@ def register_all(service_id: str) -> None:
     default_process_registry.register(
         ProcessDef(
             service_id=service_id,
-            process_name="order_assign_courier1",
+            process_name="assign_executor",
             entity_type="order",
-            event_name="order_assign_courier1_to_order",
+            event_name="assign_executor",
+            context_builder=build_order_context,
+            initial_state="order_created",
+        )
+    )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
+            process_name="remove_executor",
+            entity_type="order",
+            event_name="remove_executor",
             context_builder=build_order_context,
             initial_state="order_created",
         )
     )
 
     default_guard_registry.register(
-        service_id, "can_assign_courier1", can_assign_courier1
+        service_id, "can_assign_executor", can_assign_executor
+    )
+    default_guard_registry.register(
+        service_id, "can_remove_executor", can_remove_executor
     )
     default_effect_registry.register(
-        service_id, "assign_courier1_effect", assign_courier1_effect
+        service_id, "assign_executor_effect", assign_executor_effect
+    )
+    default_effect_registry.register(
+        service_id, "remove_executor_effect", remove_executor_effect
     )

@@ -123,5 +123,7 @@ def test_courier_register_all_passes_ram_validator():
         session_domain=None,
     )
     assert report.ok, report.to_dict()
-    assert report.stats["operations"] == 5
-    assert report.stats["processes"] == 1
+    assert report.stats["operations"] == 8
+    assert report.stats["processes"] == 2
+    names = set(reg.default_process_registry.list_process_names("svc_courier_test"))
+    assert names == {"assign_executor", "remove_executor"}

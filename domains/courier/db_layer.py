@@ -327,6 +327,63 @@ def is_stage_slot_free(session: Session, order_id: int, leg: str) -> bool:
     return row[0] is None
 
 
+def get_stage_courier(
+    session: Session, order_id: int, leg: str
+) -> Optional[int]:
+    """Кто сейчас на слоте stage_orders для плеча. None если слота нет или пуст."""
+    row = session.execute(
+        text(
+            """
+            SELECT courier_user_id
+            FROM stage_orders
+            WHERE order_id = :oid AND leg = :leg
+            """
+        ),
+        {"oid": order_id, "leg": leg},
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def clear_stage_courier(
+    session: Session,
+    order_id: int,
+    leg: str,
+    *,
+    expected_courier_id: Optional[int] = None,
+) -> bool:
+    """
+    Обнуляет courier_user_id на плече.
+    Если expected_courier_id задан — снимает только если слот занят им (атомарно).
+    """
+    if expected_courier_id is not None:
+        result = session.execute(
+            text(
+                """
+                UPDATE stage_orders
+                SET courier_user_id = NULL
+                WHERE order_id = :oid
+                  AND leg = :leg
+                  AND courier_user_id = :cid
+                """
+            ),
+            {"oid": order_id, "leg": leg, "cid": int(expected_courier_id)},
+        )
+    else:
+        result = session.execute(
+            text(
+                """
+                UPDATE stage_orders
+                SET courier_user_id = NULL
+                WHERE order_id = :oid AND leg = :leg
+                """
+            ),
+            {"oid": order_id, "leg": leg},
+        )
+    return int(result.rowcount or 0) == 1
+
+
 def set_stage_courier(
     session: Session,
     order_id: int,

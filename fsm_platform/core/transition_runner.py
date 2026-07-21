@@ -196,6 +196,13 @@ class TransitionRunner:
 
         # 8. EFFECT
         effect_payload = None
+        domain_context = {
+            **(domain_context or {}),
+            "from_state": selected.from_state,
+            "to_state": selected.to_state,
+            "transition_id": selected.id,
+            "event_name": event_name,
+        }
         if selected.effect_name:
             effect_fn = self._effects.get(service_id, selected.effect_name)
             if effect_fn is None:
