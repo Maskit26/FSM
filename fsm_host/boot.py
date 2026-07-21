@@ -5,10 +5,9 @@ from __future__ import annotations
 import logging
 import os
 
-from sqlalchemy import text
-
 from domains.bootstrap import bootstrap_from_env
 from fsm_host.engines import platform_session, register_domain_engine
+from fsm_platform.db_layer import default_db_layer
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +39,7 @@ def _register_engines_from_domain_services() -> None:
         logger.warning("platform DB not available for domain_services boot")
         return
     try:
-        rows = sp.execute(
-            text(
-                """
-                SELECT service_id, db_secret_ref, status
-                FROM domain_services
-                WHERE status = 'active'
-                """
-            )
-        ).mappings().all()
+        rows = default_db_layer.list_active_domain_services(sp)
         for row in rows:
             sid = str(row["service_id"])
             ref = str(row["db_secret_ref"])

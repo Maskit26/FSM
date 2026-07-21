@@ -1,12 +1,12 @@
-"""HTTP request sessions + invoke/create bootstrap (§4.10 / §4.12)."""
+"""HTTP request sessions + invoke/create bootstrap (§4.10 / §4.12).
+
+No SQL here — only fsm_platform.db_layer + session ownership.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Callable, Optional
-
-from sqlalchemy import text
 
 from fsm_platform.db_layer import default_db_layer
 from fsm_host.engines import domain_session, platform_session
@@ -59,29 +59,17 @@ def _bootstrap_and_maybe_enqueue(
     enqueue = result.get("enqueue") or {}
     process_name = enqueue.get("process_name")
     if not process_name:
-        raise ValueError("invoke-create must enqueue (missing enqueue.process_name)")
+        return
 
-    payload = enqueue.get("payload") or {}
-    inst = sp.execute(
-        text(
-            """
-            INSERT INTO server_fsm_instances
-                (service_id, process_name, entity_type, entity_id, status,
-                 attempts, payload_json, created_at, updated_at)
-            VALUES
-                (:service_id, :process_name, :entity_type, :entity_id, 'PENDING',
-                 0, :payload_json, UTC_TIMESTAMP(), UTC_TIMESTAMP())
-            """
-        ),
-        {
-            "service_id": service_id,
-            "process_name": process_name,
-            "entity_type": entity_type,
-            "entity_id": entity_id,
-            "payload_json": json.dumps(payload),
-        },
+    instance_id = default_db_layer.insert_fsm_instance(
+        sp,
+        service_id=service_id,
+        process_name=str(process_name),
+        entity_type=entity_type,
+        entity_id=entity_id,
+        payload=enqueue.get("payload") or {},
     )
-    result["instance_id"] = int(inst.lastrowid)
+    result["instance_id"] = instance_id
 
 
 def enqueue_instance(
@@ -98,29 +86,16 @@ def enqueue_instance(
         state = default_db_layer.get_entity_state(sp, service_id, entity_type, entity_id)
         if state is None:
             raise LookupError("ENTITY_STATE_NOT_FOUND")
-        result = sp.execute(
-            text(
-                """
-                INSERT INTO server_fsm_instances
-                    (service_id, process_name, entity_type, entity_id, status,
-                     attempts, payload_json, requested_by_user_id,
-                     created_at, updated_at)
-                VALUES
-                    (:service_id, :process_name, :entity_type, :entity_id, 'PENDING',
-                     0, :payload_json, :uid, UTC_TIMESTAMP(), UTC_TIMESTAMP())
-                """
-            ),
-            {
-                "service_id": service_id,
-                "process_name": process_name,
-                "entity_type": entity_type,
-                "entity_id": entity_id,
-                "payload_json": json.dumps(payload or {}),
-                "uid": requested_by_user_id,
-            },
+        instance_id = default_db_layer.insert_fsm_instance(
+            sp,
+            service_id=service_id,
+            process_name=process_name,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            payload=payload or {},
+            requested_by_user_id=requested_by_user_id,
         )
         sp.commit()
-        instance_id = int(result.lastrowid)
         return {
             "instance_id": instance_id,
             "status": "PENDING",
@@ -137,26 +112,12 @@ def enqueue_instance(
 def get_instance(service_id: str, instance_id: int) -> Optional[dict[str, Any]]:
     sp = platform_session()
     try:
-        row = sp.execute(
-            text(
-                """
-                SELECT id, service_id, process_name, entity_type, entity_id,
-                       status, attempts, last_error, payload_json,
-                       created_at, started_at, finished_at
-                FROM server_fsm_instances
-                WHERE id = :id AND service_id = :service_id
-                """
-            ),
-            {"id": instance_id, "service_id": service_id},
-        ).mappings().first()
-        if row is None:
+        data = default_db_layer.get_fsm_instance(sp, service_id, instance_id)
+        if data is None:
             return None
-        data = dict(row)
-        # enrich with entity_fsm_state
-        st = default_db_layer.get_entity_state(
+        data["entity_fsm_state"] = default_db_layer.get_entity_state(
             sp, service_id, str(data["entity_type"]), int(data["entity_id"])
         )
-        data["entity_fsm_state"] = st
         return data
     finally:
         sp.close()

@@ -1,17 +1,17 @@
 """
 FSM worker: claim instance → run_instance → dual-DB commit (§4.7 / §4.7.1).
+
+No SQL here — platform writes go through fsm_platform.db_layer.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any, Optional
 
-from sqlalchemy import text
-
 from fsm_platform import run_instance
+from fsm_platform.db_layer import default_db_layer
 from fsm_platform.types import FsmResult
 from fsm_host import side_effects
 from fsm_host.engines import domain_session, platform_session
@@ -19,64 +19,12 @@ from fsm_host.engines import domain_session, platform_session
 logger = logging.getLogger(__name__)
 
 
-def _claim_one(session_platform) -> Optional[dict[str, Any]]:
-    row = session_platform.execute(
-        text(
-            """
-            SELECT id, service_id, process_name, entity_type, entity_id,
-                   status, attempts, payload_json, requested_by_user_id
-            FROM server_fsm_instances
-            WHERE status = 'PENDING'
-            ORDER BY id ASC
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-            """
-        )
-    ).mappings().first()
-    if row is None:
-        return None
-    session_platform.execute(
-        text(
-            """
-            UPDATE server_fsm_instances
-            SET status = 'PROCESSING', started_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP()
-            WHERE id = :id
-            """
-        ),
-        {"id": row["id"]},
-    )
-    return dict(row)
-
-
-def _mark_completed(session_platform, instance_id: int) -> None:
-    session_platform.execute(
-        text(
-            """
-            UPDATE server_fsm_instances
-            SET status = 'COMPLETED', finished_at = UTC_TIMESTAMP(),
-                updated_at = UTC_TIMESTAMP(), last_error = NULL
-            WHERE id = :id
-            """
-        ),
-        {"id": instance_id},
-    )
-
-
 def _failed_short_tx(instance: dict[str, Any], last_error: str) -> None:
     """§4.7 FAILED notify in a separate short platform transaction."""
     sp = platform_session()
     try:
-        sp.execute(
-            text(
-                """
-                UPDATE server_fsm_instances
-                SET status = 'FAILED', last_error = :err,
-                    finished_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP(),
-                    attempts = attempts + 1
-                WHERE id = :id
-                """
-            ),
-            {"id": instance["id"], "err": (last_error or "")[:2000]},
+        default_db_layer.mark_instance_failed(
+            sp, int(instance["id"]), last_error or ""
         )
         side_effects.emit_event(
             sp,
@@ -104,33 +52,17 @@ def _enqueue_reconcile(
     payload = result.payload or {}
     sp = platform_session()
     try:
-        sp.execute(
-            text(
-                """
-                INSERT INTO platform_reconcile_queue
-                    (service_id, instance_id, entity_type, entity_id,
-                     from_state, to_state, event_name, transition_id,
-                     payload_json, status, attempts, created_at, updated_at)
-                VALUES
-                    (:service_id, :instance_id, :entity_type, :entity_id,
-                     :from_state, :to_state, :event_name, :transition_id,
-                     :payload_json, 'PENDING', 0, UTC_TIMESTAMP(), UTC_TIMESTAMP())
-                ON DUPLICATE KEY UPDATE
-                    status = IF(status = 'DONE', status, 'PENDING'),
-                    updated_at = UTC_TIMESTAMP()
-                """
-            ),
-            {
-                "service_id": instance["service_id"],
-                "instance_id": instance["id"],
-                "entity_type": instance.get("entity_type"),
-                "entity_id": instance.get("entity_id"),
-                "from_state": payload.get("from_state"),
-                "to_state": payload.get("to_state"),
-                "event_name": payload.get("event_name"),
-                "transition_id": payload.get("transition_id"),
-                "payload_json": json.dumps(payload),
-            },
+        default_db_layer.enqueue_reconcile(
+            sp,
+            service_id=str(instance["service_id"]),
+            instance_id=int(instance["id"]),
+            entity_type=instance.get("entity_type"),
+            entity_id=instance.get("entity_id"),
+            from_state=payload.get("from_state"),
+            to_state=payload.get("to_state"),
+            event_name=payload.get("event_name"),
+            transition_id=payload.get("transition_id"),
+            payload=payload,
         )
         sp.commit()
         logger.error(
@@ -151,7 +83,7 @@ def process_one() -> bool:
     instance: Optional[dict[str, Any]] = None
     sd = None
     try:
-        instance = _claim_one(sp)
+        instance = default_db_layer.claim_pending_instance(sp)
         if instance is None:
             sp.rollback()
             return False
@@ -184,7 +116,7 @@ def process_one() -> bool:
                 entity_id=instance.get("entity_id"),
                 payload=result.payload,
             )
-            _mark_completed(sp, int(instance["id"]))
+            default_db_layer.mark_instance_completed(sp, int(instance["id"]))
             try:
                 sd.commit()
             except Exception:
@@ -205,7 +137,6 @@ def process_one() -> bool:
                 return True
             return True
 
-        # FAILED path: rollback both, then short tx
         sd.rollback()
         sp.rollback()
         _failed_short_tx(instance, result.last_error or "FAILED")

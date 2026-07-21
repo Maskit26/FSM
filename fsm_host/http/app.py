@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from fsm_host.boot import boot
 from fsm_host.http import request_runtime
 from fsm_host.operations import default_operation_registry
+from fsm_platform.domain_errors import DomainError
 from fsm_platform.registry import default_process_registry
 
 app = FastAPI(title="FSM Platform", version="0.1.0")
@@ -66,6 +67,11 @@ def invoke(service_id: str, body: InvokeBody) -> dict[str, Any]:
             body.params,
             body.actor.model_dump(),
         )
+    except DomainError as exc:
+        raise HTTPException(
+            409,
+            detail={"error_code": exc.code, "message": exc.message},
+        ) from exc
     except KeyError as exc:
         raise HTTPException(404, detail=str(exc)) from exc
     except ValueError as exc:
