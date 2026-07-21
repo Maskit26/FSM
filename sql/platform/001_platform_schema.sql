@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS server_fsm_instances (
     attempts             INT          NOT NULL DEFAULT 0,
     last_error           TEXT         NULL,
     payload_json         JSON         NULL,
-    requested_by_user_id BIGINT       NULL,
+    actor_id             BIGINT       NULL,
     created_at           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     started_at           DATETIME     NULL,

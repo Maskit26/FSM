@@ -14,6 +14,16 @@ from fsm_host.engines import domain_session, platform_session
 logger = logging.getLogger(__name__)
 
 
+def _actor_id_from_actor(actor: Optional[dict[str, Any]]) -> Optional[int]:
+    """Достаёт opaque actor_id из тела Public API. Не связан с именами колонок домена."""
+    if not actor:
+        return None
+    raw = actor.get("actor_id")
+    if raw is None or str(raw).strip() == "":
+        return None
+    return int(raw)
+
+
 def run_operation(
     service_id: str,
     handler: Callable,
@@ -30,7 +40,7 @@ def run_operation(
     try:
         result = handler(sd, params, actor)
         if kind == "command" and isinstance(result, dict) and result.get("entity_type"):
-            _bootstrap_and_maybe_enqueue(sp, service_id, result)
+            _bootstrap_and_maybe_enqueue(sp, service_id, result, actor=actor)
         sd.commit()
         sp.commit()
         return result if isinstance(result, dict) else {"data": result}
@@ -47,19 +57,23 @@ def _bootstrap_and_maybe_enqueue(
     sp,
     service_id: str,
     result: dict[str, Any],
+    *,
+    actor: Optional[dict[str, Any]] = None,
 ) -> None:
     """
-    После create: создаёт начальный entity_fsm_state.
-    Если handler вернул enqueue.process_name — ставит задачу в server_fsm_instances.
+    Для command с entity_type: при необходимости создаёт entity_fsm_state.
+    Если handler вернул enqueue.process_name — ставит задачу; actor_id берётся из HTTP actor.
     """
     entity_type = str(result["entity_type"])
     entity_id = int(result["entity_id"])
     initial = result.get("initial_state")
-    if not initial:
-        raise ValueError("initial_state required for create command (legacy graph)")
 
     existing = default_db_layer.get_entity_state(sp, service_id, entity_type, entity_id)
     if existing is None:
+        if not initial:
+            raise ValueError(
+                "initial_state required when entity_fsm_state is missing"
+            )
         default_db_layer.insert_entity_state_initial(
             sp, service_id, entity_type, entity_id, str(initial)
         )
@@ -76,6 +90,7 @@ def _bootstrap_and_maybe_enqueue(
         entity_type=entity_type,
         entity_id=entity_id,
         payload=enqueue.get("payload") or {},
+        actor_id=_actor_id_from_actor(actor),
     )
     result["instance_id"] = instance_id
 
@@ -87,7 +102,7 @@ def enqueue_instance(
     entity_type: str,
     entity_id: int,
     payload: Optional[dict[str, Any]] = None,
-    requested_by_user_id: Optional[int] = None,
+    actor_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Кладёт PENDING-инстанс FSM в очередь для уже существующей сущности.
@@ -105,7 +120,7 @@ def enqueue_instance(
             entity_type=entity_type,
             entity_id=entity_id,
             payload=payload or {},
-            requested_by_user_id=requested_by_user_id,
+            actor_id=actor_id,
         )
         sp.commit()
         return {

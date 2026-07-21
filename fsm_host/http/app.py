@@ -122,7 +122,7 @@ def enqueue(
             entity_type=body.entity_type,
             entity_id=body.entity_id,
             payload=body.payload,
-            requested_by_user_id=uid,
+            actor_id=uid,
         )
     except LookupError as exc:
         raise HTTPException(400, detail=str(exc)) from exc

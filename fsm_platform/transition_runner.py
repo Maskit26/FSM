@@ -73,7 +73,7 @@ class TransitionRunner:
         entity_type = process_def.entity_type or instance.get("entity_type")
         entity_id = instance.get("entity_id")
         event_name = process_def.runtime_event_name
-        user_id = instance.get("requested_by_user_id") or 0
+        user_id = instance.get("actor_id") or 0
 
         if not entity_type:
             return FsmResult(

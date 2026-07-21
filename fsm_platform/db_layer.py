@@ -243,19 +243,19 @@ class FsmDbLayer:
         entity_type: str,
         entity_id: int,
         payload: Optional[dict[str, Any]] = None,
-        requested_by_user_id: Optional[int] = None,
+        actor_id: Optional[int] = None,
     ) -> int:
-        """Создаёт новую запись server_fsm_instances со статусом PENDING. Воркер подхватит её для выполнения одного шага FSM."""
+        """Создаёт PENDING server_fsm_instances. actor_id — opaque id из Public API actor (не колонка домена)."""
         result = session.execute(
             text(
                 """
                 INSERT INTO server_fsm_instances
                     (service_id, process_name, entity_type, entity_id, status,
-                     attempts, payload_json, requested_by_user_id,
+                     attempts, payload_json, actor_id,
                      created_at, updated_at)
                 VALUES
                     (:service_id, :process_name, :entity_type, :entity_id, 'PENDING',
-                     0, :payload_json, :uid, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                     0, :payload_json, :actor_id, UTC_TIMESTAMP(), UTC_TIMESTAMP())
                 """
             ),
             {
@@ -264,7 +264,7 @@ class FsmDbLayer:
                 "entity_type": entity_type,
                 "entity_id": entity_id,
                 "payload_json": json.dumps(payload or {}),
-                "uid": requested_by_user_id,
+                "actor_id": actor_id,
             },
         )
         return int(result.lastrowid)
@@ -280,7 +280,7 @@ class FsmDbLayer:
             text(
                 """
                 SELECT id, service_id, process_name, entity_type, entity_id,
-                       status, attempts, last_error, payload_json,
+                       status, attempts, last_error, payload_json, actor_id,
                        created_at, started_at, finished_at
                 FROM server_fsm_instances
                 WHERE id = :id AND service_id = :service_id
@@ -298,7 +298,7 @@ class FsmDbLayer:
             text(
                 """
                 SELECT id, service_id, process_name, entity_type, entity_id,
-                       status, attempts, payload_json, requested_by_user_id
+                       status, attempts, payload_json, actor_id
                 FROM server_fsm_instances
                 WHERE status = 'PENDING'
                 ORDER BY id ASC

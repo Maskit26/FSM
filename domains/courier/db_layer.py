@@ -285,6 +285,83 @@ def create_stage_order(
     )
 
 
+def claim_stage_order(
+    session: Session,
+    order_id: int,
+    leg: str,
+    courier_user_id: int,
+) -> bool:
+    """
+    Атомарно занимает свободный слот биржи за курьером.
+    True только если строка была свободна и обновлена.
+    """
+    result = session.execute(
+        text(
+            """
+            UPDATE stage_orders
+            SET courier_user_id = :cid
+            WHERE order_id = :oid
+              AND leg = :leg
+              AND courier_user_id IS NULL
+            """
+        ),
+        {"cid": courier_user_id, "oid": order_id, "leg": leg},
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def is_stage_slot_free(session: Session, order_id: int, leg: str) -> bool:
+    """Read-only: свободен ли слот stage_orders для плеча (courier_user_id IS NULL)."""
+    row = session.execute(
+        text(
+            """
+            SELECT courier_user_id
+            FROM stage_orders
+            WHERE order_id = :oid AND leg = :leg
+            """
+        ),
+        {"oid": order_id, "leg": leg},
+    ).fetchone()
+    if row is None:
+        return False
+    return row[0] is None
+
+
+def set_stage_courier(
+    session: Session,
+    order_id: int,
+    leg: str,
+    courier_user_id: int,
+) -> None:
+    """Принудительно пишет courier_user_id в слот плеча (после успешного FSM)."""
+    session.execute(
+        text(
+            """
+            UPDATE stage_orders
+            SET courier_user_id = :cid
+            WHERE order_id = :oid AND leg = :leg
+            """
+        ),
+        {"cid": courier_user_id, "oid": order_id, "leg": leg},
+    )
+
+
+def get_locker_city_by_cell(session: Session, cell_id: int) -> Optional[str]:
+    """Город постамата по id ячейки. Нужен для проверки, что курьер из того же города."""
+    row = session.execute(
+        text(
+            """
+            SELECT l.city
+            FROM locker_cells lc
+            JOIN lockers l ON l.id = lc.locker_id
+            WHERE lc.id = :cell_id
+            """
+        ),
+        {"cell_id": cell_id},
+    ).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
 def get_user(session: Session, user_id: int) -> Optional[dict[str, Any]]:
     """Читает пользователя (роль, город и т.д.). Нужен для биржи и авторизации актёра."""
     row = session.execute(

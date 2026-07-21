@@ -129,3 +129,48 @@ def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) 
             "delivery_type": delivery_type,
         },
     }
+
+
+def take_courier_order(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Курьер берёт заказ с биржи: только ставит FSM order_assign_courier1 в очередь.
+    Все бизнес-проверки — в guard can_assign_courier1; запись курьера — в effect.
+    """
+    _ = domain_session
+    try:
+        courier_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not courier_id:
+        raise ValueError("actor.actor_id required")
+
+    order_id = int(params.get("order_id") or 0)
+    if not order_id:
+        raise ValueError("order_id required")
+
+    leg = str(params.get("leg") or "pickup").strip().lower()
+    if leg not in ("pickup", "delivery"):
+        raise ValueError("leg must be pickup or delivery")
+    if leg == "delivery":
+        raise ValueError("leg=delivery (courier2) not implemented yet")
+
+    return {
+        "entity_type": "order",
+        "entity_id": order_id,
+        "enqueue": {
+            "process_name": "order_assign_courier1",
+            "payload": {
+                "leg": "pickup",
+                "courier_user_id": courier_id,
+                "source": "take_courier_order",
+            },
+        },
+        "data": {
+            "order_id": order_id,
+            "leg": "pickup",
+            "courier_user_id": courier_id,
+            "status": "pending_fsm",
+        },
+    }
