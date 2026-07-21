@@ -39,6 +39,18 @@ class OperationRegistry:
             if sid == service_id
         ]
 
+    def items(self, service_id: str) -> list[dict[str, Any]]:
+        """Операции с handler'ами — для Domain Validator."""
+        return [
+            {
+                "operation": op,
+                "kind": meta["kind"],
+                "handler": meta["handler"],
+            }
+            for (sid, op), meta in sorted(self._ops.items())
+            if sid == service_id
+        ]
+
     def clear(self) -> None:
         """Полностью очищает реестр (тесты / hot-reload)."""
         self._ops.clear()

@@ -1,0 +1,25 @@
+# Картридж courier — метаданные для Domain Validator / Accept (§5, §7).
+cartridge_type: courier
+version: "0.1.0"
+entry: domains.courier.processes:register_all
+
+# registered_processes — сверять guards/effects только для зарегистрированных ProcessDef.
+# (полный граф courier legacy содержит много имён вне текущего Python-картриджа)
+graph_scope: registered_processes
+
+required_modules:
+  - processes
+  - commands
+  - queries
+  - guards
+  - effects
+  - context
+  - db_layer
+
+required_tables:
+  - orders
+  - stage_orders
+  - locker_cells
+  - lockers
+
+required_routines: []

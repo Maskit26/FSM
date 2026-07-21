@@ -40,6 +40,12 @@ class ProcessRegistry:
         """Возвращает все зарегистрированные ProcessDef. Используется при диагностике и перечислении картриджей."""
         return list(self._processes.values())
 
+    def list_for_service(self, service_id: str) -> list[ProcessDef]:
+        """ProcessDef одного service_id — для Domain Validator и catalog."""
+        return [
+            p for (sid, _), p in self._processes.items() if sid == service_id
+        ]
+
     def clear(self) -> None:
         """Очищает весь реестр процессов. Применяется в тестах и при hot-reload доменов."""
         self._processes.clear()
