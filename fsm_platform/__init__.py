@@ -1,31 +1,35 @@
 """
-fsm_platform — декларативный FSM runtime (в спецификации — fsm_core).
+FSM Platform — продукт целиком.
 
-Только для воркера: без HTTP, без импортов домена и без commit.
+- ``fsm_platform.core`` — декларативный FSM runtime (в спецификации — fsm_core):
+  без HTTP, без импортов домена, без commit.
+- ``fsm_platform.host`` — оболочка: engines, worker, boot, OperationRegistry, HTTP.
+
+Публичный API ядра реэкспортируется здесь для коротких импортов доменов:
+``from fsm_platform import ProcessDef``.
 """
 
-from .engine import run_instance
-from .errors import FsmErrorCodes
-from .registry import (
+from fsm_platform.core import (
     EffectRegistry,
+    EffectResult,
+    EntityStateStore,
+    FsmDbLayer,
+    FsmErrorCodes,
+    FsmResult,
     GuardRegistry,
+    GuardResult,
+    ProcessDef,
     ProcessRegistry,
+    TransitionDef,
+    TransitionExecutor,
+    TransitionRepository,
+    TransitionRunner,
+    cancel_timer,
     default_effect_registry,
     default_guard_registry,
     default_process_registry,
-)
-from .db_layer import FsmDbLayer
-from .state_store import EntityStateStore
-from .timers import cancel_timer, schedule_timer
-from .transition_executor import TransitionExecutor
-from .transition_repository import TransitionRepository
-from .transition_runner import TransitionRunner
-from .types import (
-    EffectResult,
-    FsmResult,
-    GuardResult,
-    ProcessDef,
-    TransitionDef,
+    run_instance,
+    schedule_timer,
 )
 
 __all__ = [

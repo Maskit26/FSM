@@ -11,8 +11,8 @@
 | §1–3 | видение, принципы, кто пишет в какую БД |
 | §4 | platform: компоненты, worker, HTTP, bootstrap |
 | §5 | картридж домена: структура, guards/effects/queries/db_layer |
-| §6 | контракт platform ↔ domain, Domain Registry, RAM-реестры |
-| §7 | Accept нового домена, Domain Validator |
+| §6 | контракт подключения картриджа: operations, ProcessDef, register_all, реестры |
+| §7 | Accept и Domain Validator: критерии, коды ошибок, отчёт |
 | §8 | модули `fsm_core`: файлы, алгоритмы, таблицы |
 | §9 | публичный API клиентов, channel adapters |
 | §10 | исходящие ответы клиенту: poll, SSE, outbox, webhooks |
@@ -56,13 +56,13 @@ Platform HTTP-слой (Gateway → Dispatcher → Request Runtime)
 6. **Картридж** — добавление домена = SQL seed + Python register + конфиг, без правки ядра platform.
 7. **Side effects наружу** — HTTP/push через `platform.notify` → `platform_outbox`; события — `platform.emit_event`; таймеры — `platform.schedule_timer` (после commit — outbox_worker).
 8. **Session только platform** — session к любой БД открывает worker (FSM) или Request Runtime (REST); домен session не создаёт.
-9. **Два db_layer** — `fsm_core/db_layer.py` только platform DB; `domains/<type>/db_layer.py` только domain DB.
+9. **Два db_layer** — `fsm_platform/core/db_layer.py` только platform DB; `domains/<type>/db_layer.py` только domain DB.
 10. **Домен только после валидации** — status `active` после Domain Validator; иначе REST/FSM для `service_id` не обслуживаются.
 11. **service_id ≠ cartridge_type** — тип картриджа может повторяться у разных заказчиков; runtime-ключ всегда уникальный `service_id`.
 12. **Один внешний контракт** — клиенты только `/v1/{service_id}/…` (§9–10). Pipeline §4.10 — внутренний, не публичный API.
 13. **`ProcessDef.service_id`** — одно имя поля/колонки: `service_id` (не `service`).
 14. **Outbox producer** — запись в `platform_outbox` только через `platform.notify` (и platform fan-out webhooks); не из сырого SQL домена и не из трёх независимых точек.
-15. **Accept без remote code exec в prod** — пакеты только из доверенного registry; произвольный zip→import в prod запрещён (§7.5).
+15. **Accept без remote code exec в prod** — пакеты только из доверенного registry; произвольный zip→import в prod запрещён (§7.10).
 
 ---
 
@@ -119,22 +119,22 @@ Platform **не** обязана:
 
 | Компонент | Путь (целевой) | Ответственность |
 |-----------|----------------|-----------------|
-| Runtime engine | `fsm_core/engine.py` | `run_instance` → ProcessDef → TransitionRunner (§8.4) |
-| Transition runner | `fsm_core/transition_runner.py` | context → candidates → guards → apply → effect (§8.5) |
-| FSM Registry | `fsm_core/registry.py` | Process/Guard/Effect в RAM, ключ с `service_id` (§8.3) |
-| Types / errors | `fsm_core/types.py`, `errors.py` | контракты, guard/effect params, коды (§8.2, §8.7) |
-| FSM db_layer | `fsm_core/db_layer.py` | SQL platform DB: state, logs, timers (§8.8) |
-| State store | `fsm_core/state_store.py` | API `entity_fsm_state` через db_layer (§8.9) |
-| Transition repository | `fsm_core/transition_repository.py` | SELECT candidates + params из domain DB (§8.10) |
-| Transition executor | `fsm_core/transition_executor.py` | apply state+log через db_layer (§8.11) |
-| Timers helper | `fsm_core/timers.py` | schedule/cancel → `fsm_timers` (§8.6) |
+| Runtime engine | `fsm_platform/core/engine.py` | `run_instance` → ProcessDef → TransitionRunner (§8.4) |
+| Transition runner | `fsm_platform/core/transition_runner.py` | context → candidates → guards → apply → effect (§8.5) |
+| FSM Registry | `fsm_platform/core/registry.py` | Process/Guard/Effect в RAM, ключ с `service_id` (§8.3) |
+| Types / errors | `fsm_platform/core/types.py`, `errors.py` | контракты, guard/effect params, коды (§8.2, §8.7) |
+| FSM db_layer | `fsm_platform/core/db_layer.py` | SQL platform DB: state, logs, timers (§8.8) |
+| State store | `fsm_platform/core/state_store.py` | API `entity_fsm_state` через db_layer (§8.9) |
+| Transition repository | `fsm_platform/core/transition_repository.py` | SELECT candidates + params из domain DB (§8.10) |
+| Transition executor | `fsm_platform/core/transition_executor.py` | apply state+log через db_layer (§8.11) |
+| Timers helper | `fsm_platform/core/timers.py` | schedule/cancel → `fsm_timers` (§8.6) |
 | Worker | `fsm_worker.py` | poll, claim, session, commit/rollback, mark FAILED |
 | Bootstrap | `domains/bootstrap.py` | загрузка доменов из Domain Registry / `FSM_DOMAINS` |
-| HTTP Gateway | `platform/http/gateway.py` (или `main.py`) | HTTP in/out, auth, status code, JSON |
-| Public API routes | `platform/http/*` | фиксированные `/v1/...` (§9); не наполняется доменом |
-| Operation Registry | `platform/http/operations.py` (или аналог) | RAM: `(service_id, operation) → handler, kind` (§6.4.1) |
-| Dispatcher | `platform/http/` (функция/класс) | Public API path → enqueue/invoke/… → Runtime / OperationRegistry |
-| Request Runtime | `platform/http/request_runtime.py` | session(s) на HTTP-запрос, вызов handler, commit/close |
+| HTTP Gateway | `fsm_platform/host/http/app.py` (или `main.py`) | HTTP in/out, auth, status code, JSON |
+| Public API routes | `fsm_platform/host/http/*` | фиксированные `/v1/...` (§9); не наполняется доменом |
+| Operation Registry | `fsm_platform/host/operations.py` (или аналог) | RAM: `(service_id, operation) → handler, kind` (§6.5.4) |
+| Dispatcher | `sm_platform/host/http/` (функция/класс) | Public API path → enqueue/invoke/… → Runtime / OperationRegistry |
+| Request Runtime | `fsm_platform/host/http/request_runtime.py` | session(s) на HTTP-запрос, вызов handler, commit/close |
 
 **Запрещено** в `fsm_core`:
 
@@ -181,7 +181,7 @@ Worker открывает `session_platform` + `session_domain`, владеет 
 | `fsm_transition_logs` | аудит FSM-переходов (единственная log-таблица; не `fsm_action_logs`) |
 | `fsm_timers` | отложенные события |
 | `entity_fsm_state` | `(service_id, entity_type, entity_id) → current_state` |
-| `domain_services` | Domain Registry + `db_secret_ref` (§6.3); boot → `engine_by_service_id` в RAM |
+| `domain_services` | Domain Registry + `db_secret_ref` (§6.4); boot → `engine_by_service_id` в RAM |
 | `idempotency_keys` | Idempotency-Key → результат enqueue/invoke (§4.14) |
 | `platform_outbox` | webhooks, channel push, external HTTP (§10) |
 | `platform_events` | события для SSE/подписок (§10) |
@@ -192,7 +192,7 @@ FSM-граф домена — в **domain DB**.
 
 ### 4.6. Применение перехода (TransitionExecutor)
 
-Единственный runtime-путь применения перехода — **`TransitionExecutor`** через `fsm_core/db_layer.py`:
+Единственный runtime-путь применения перехода — **`TransitionExecutor`** через `fsm_platform/core/db_layer.py`:
 
 - проверка `current_state == from_state`;
 - запись `entity_fsm_state` + INSERT `fsm_transition_logs`;
@@ -330,14 +330,14 @@ LOOP:
 
 ### 4.9. Валидация при старте
 
-Краткая форма полного Domain Validator (§7):
+Краткая форма полного Domain Validator (§7.3–7.8; коды ошибок — таблицы §7.4–7.8):
 
-1. Целостность пакета и `manifest` (`cartridge_type`).
-2. `register_all(service_id)` без ошибок; уникальность `(service_id, process_name)`.
+1. Целостность пакета и `manifest` (`cartridge_type`, `entry`).
+2. `register_all(service_id)` без ошибок; уникальность operations/processes; `kind` ∈ {query, command}.
 3. Connectivity к domain DB.
-4. Готовность SQL/ХП и FSM-графа в domain DB.
+4. Готовность SQL/ХП и FSM-графа в domain DB (включая initial states).
 5. Согласованность `guard_name` / `effect_name` (граф ↔ RAM registry).
-6. Нет orphan `entity_type` без ProcessDef (warning или fail — по политике).
+6. У каждого ProcessDef есть candidates в `fsm_transitions` (`entity_type` + `event_name`).
 
 Домен со статусом validation failed **не** обслуживает REST и FSM.
 
@@ -355,7 +355,7 @@ LOOP:
 
 | Роль | Путь | Ответственность |
 |------|------|-----------------|
-| Public API handlers | `platform/http/*` (§9.13) | `/v1/...`, auth, JSON |
+| Public API handlers | `fsm_platform/host/http/*` (§9.13) | `/v1/...`, auth, JSON |
 | Operation Registry | RAM | `(service_id, operation)` → handler, kind |
 | Request Runtime | `request_runtime.py` | sessions, commit/rollback (§4.10.1) |
 | Domain handler | `queries.py` / `commands.py` | use-case (без bootstrap state / без commit) |
@@ -407,29 +407,30 @@ ROLLBACK domain; ROLLBACK platform
 | Bare enqueue | state уже должен быть | нет строки → **400** `ENTITY_STATE_NOT_FOUND`, instance не создаётся |
 | Создание entity внутри первого effect | вне базового v1 | не использовать без отдельного расширения |
 
-**Владелец INSERT:** только Request Runtime (platform session). Command handler возвращает `{entity_type, entity_id}` (и опц. `initial_state` override); сам в `entity_fsm_state` не пишет.
+**Владелец INSERT:** только Request Runtime (platform session). Command handler возвращает `{entity_type, entity_id}` и **обычно** `initial_state`; сам в `entity_fsm_state` не пишет.
 
-**Алгоритм invoke-create + enqueue (норматив — всегда lifecycle):**
+**Алгоритм invoke-create / command с entity (норматив):**
 
-Параметры создания сущности приходят в JSON тела `POST .../invoke` как `params` (схема — контракт операции домена). Handler пишет их в staging/бизнес-таблицы domain DB; в `server_fsm_instances.payload_json` Runtime кладёт нужный срез для context (по политике домена / ProcessDef).
+Параметры создания сущности приходят в JSON тела `POST .../invoke` как `params`. Handler пишет их в staging/бизнес-таблицы domain DB.
 
 ```text
-1. handler (commands.py) ← params (JSON) → INSERT staging в domain DB → entity_id
-2. Runtime определяет initial_state:
-   a. если handler вернул initial_state — использовать его
-   b. иначе SELECT name FROM fsm_states (domain DB)
-        WHERE entity_type=:et AND is_initial=true
-   c. 0 строк → 400 NO_INITIAL_STATE
-      >1 строк → 400 AMBIGUOUS_INITIAL_STATE (Validator тоже fail при Accept)
-3. Runtime: INSERT entity_fsm_state(service_id, entity_type, entity_id, current_state=initial)
-4. Runtime: INSERT server_fsm_instances(PENDING) — **обязательно** для invoke-create
+1. handler (commands.py) ← params → INSERT в domain DB → entity_id
+2. Runtime определяет initial_state для entity_fsm_state:
+   a. если handler вернул initial_state — использовать его (предпочтительно; так делает courier create_order)
+   b. иначе если задан ProcessDef.initial_state для связанного процесса — использовать его
+   c. иначе опциональный fallback через repository: маркер стартового state в графе domain DB
+      (если маркера нет — fail: handler должен вернуть initial_state явно)
+   d. 0 кандидатов → 400 NO_INITIAL_STATE; >1 маркер в графе → 400 AMBIGUOUS_INITIAL_STATE
+3. Runtime: INSERT entity_fsm_state(...) только если строки ещё нет
+4. Если handler вернул enqueue.process_name — Runtime INSERT server_fsm_instances(PENDING)
+   (не обязательно для каждого create: create_order может только bootstrap state)
 5. COMMIT domain → COMMIT platform (§4.10.1)
-6. Ответ 200/202: entity_id + instance_id (+ status_url)
+6. Ответ 200/202: entity_id (+ instance_id, если был enqueue)
 ```
 
-Staging-only create без FSM — отдельная операция `kind=command` **без** ProcessDef/enqueue; не смешивать с invoke-create lifecycle.
+Staging-only create без FSM-state — отдельная операция без `entity_type` в ответе; не смешивать с bootstrap.
 
-**Validator (§7.4):** для каждого `entity_type` из ProcessDef / графа — ровно один `fsm_states.is_initial=true` (если домен использует invoke-create для этого типа).
+**Validator (§7.6):** для create-потока должен быть однозначный способ получить initial (явный `initial_state` в контракте операций / ProcessDef и/или один маркер в графе).
 
 ### 4.13. Platform side-effect API
 
@@ -648,328 +649,670 @@ Platform не навязывает единый lifecycle всем домена�
 1. Создать `domains/<name>/` по структуре §5.1, включая `manifest.yaml`.
 2. Написать SQL seed: `sql/fsm/` + `sql/domain/` (+ ХП домена при необходимости).
 3. Подготовить domain DB: накатить схему/граф/ХП **до** Accept в platform (v1: накат на стороне заказчика/devops).
-4. Зарегистрировать в `register_all()`: ProcessDef, guards, effects, OperationRegistry.
-5. Пройти Domain Validator (§7) → статус active.
+4. Зарегистрировать в `register_all()`: ProcessDef, guards, effects, OperationRegistry (§6.7).
+5. Пройти Domain Validator (§7) → статус active; разбор ошибок — §7.13.
 6. Smoke Command и Query после активации.
 
-Детали контракта вызова и валидации — §6–7.
+Полный контракт подключения (operations, kind, ProcessDef, имена графа) — §6; критерии Validator — §7.
 
 ---
 
-## 6. Контракт общения platform ↔ domain
+## 6. Контракт подключения домена к platform
 
-### 6.1. `service_id` и `cartridge_type`
+Этот раздел — **инструкция для разработчика другого домена** (taxi, cargo, …): что именно нужно отдать platform, в каком виде, и как это стыкуется с Public API и FSM.
+
+Читать вместе с §5 (структура картриджа) и §7 (кто и как проверяет контракт при Accept/boot).
+
+### 6.1. Зачем контракт и что он покрывает
+
+Platform не знает бизнес-логику courier/taxi. Домен становится видимым через **реестры** (operations + FSM). Важно не путать **два HTTP-входа** и **две фазы работы**:
+
+| Что | Кто вызывает | Назначение |
+|-----|--------------|------------|
+| **`POST …/invoke`** | обычный клиент (UI, канал, тесты) | единственный **продуктовый** вход: query и command, в т.ч. command, который **ставит FSM в очередь** (пример: `take_courier_order`) |
+| **`POST …/fsm/enqueue`** | platform / сервис / admin / таймеры / runtime-тесты | **сервисный** вход: положить instance в очередь **напрямую**, без domain operation |
+
+Итого: клиент «взять заказ» идёт в **invoke**, не в bare enqueue. Invoke **может** запускать FSM-шаг — через возврат `enqueue` из command; сам переход (guard → transition → effect) всё равно делает **worker**, не HTTP-handler. Подробнее про виды command — §6.5.2.
+
+Что домен регистрирует:
+
+| Реестр | Зачем |
+|--------|--------|
+| **OperationRegistry** | имена для `invoke` (`query` / `command`) |
+| **ProcessDef + Guard/Effect Registry** | имена для worker после того, как instance уже в очереди |
+| **граф в domain DB** | кандидаты переходов (`fsm_transitions` и связанные справочники) |
+
+Домен **не** объявляет свои HTTP-URL вида `/orders` или `/take`. Клиент ходит на фиксированные пути platform (§9) и указывает `operation` (invoke) или, для сервисного входа, `process_name` (enqueue).
+
+```text
+Клиент / канал
+      │
+      └─ invoke { operation } ──► OperationRegistry ──► queries.py / commands.py
+                │                      │
+                │                      ├─ query: только чтение → ответ
+                │                      └─ command: запись domain (± вернуть enqueue)
+                │                                      │
+                │                                      ▼
+                │                         INSERT server_fsm_instances (PENDING)
+                │                                      │
+Сервис / admin ─┴─ bare enqueue { process_name } ──────┤
+                                                       ▼
+                                              worker → fsm_core
+                                                       ├─ guard (RAM)
+                                                       ├─ transition (граф domain DB)
+                                                       └─ effect (RAM)
+```
+
+### 6.2. `service_id` и `cartridge_type`
 
 | Понятие | Пример | Смысл |
 |---------|--------|--------|
 | **cartridge_type** | `cargo`, `courier`, `taxi` | тип картриджа (код продукта); задаётся в `manifest.yaml` |
-| **service_id** | `svc_8f2c…` или `cargo_acme_01` | уникальный id **экземпляра** домена у заказчика в этой platform |
+| **service_id** | `svc_8f2c…` или `svc_courier_01` | уникальный id **экземпляра** домена у заказчика в этой platform |
 
 - Во всех runtime-ключах platform используется **`service_id`**: OperationRegistry, FSM Registry, `server_fsm_instances.service_id`, `entity_fsm_state`, connection к domain DB.
 - **`cartridge_type` не уникален**: два заказчика могут подключить тип `cargo`.
 - При Accept platform **генерирует** `service_id` и сохраняет в Domain Registry вместе с `cartridge_type`, package ref, DB secret.
-- URL/API: `/v1/{service_id}/…` (§9); tenant → `service_id` резолвится auth-слоем при необходимости.
-- Один и тот же код картриджа (`cartridge_type=cargo`) может обслуживать много `service_id` с разными domain DB.
+- URL/API: `/v1/{service_id}/…` (§9).
+- Один и тот же код картриджа может обслуживать много `service_id` с разными domain DB.
 
-### 6.2. Модель взаимодействия и где живут реестры
+Для автора картриджа: **не нужно знать и не нужно угадывать** будущий `service_id`. Его выдаёт platform при Accept и **передаёт аргументом** в `register_all(service_id)` при boot. В коде картриджа пишите только `register_*(service_id, …)` с этим параметром — без хардкода `"svc_courier_01"`. Один и тот же пакет могут вызвать с разными `service_id` (разные заказчики / DB). Подробнее — §6.7.1.
 
-Общение **in-process**, без отдельного сетевого RPC «platform → domain service».
+### 6.3. Модель взаимодействия (in-process)
 
-- Домен — Python-пакет в процессе API/worker **на сервере** (не в браузере).
-- **RAM** = память процесса API/worker на сервере platform. Браузер к реестрам не обращается.
-- Platform вызывает зарегистрированные функции домена и передаёт session.
-- Домен возвращает обычные Python-результаты (DTO, `GuardResult`, `EffectResult`) или бросает исключение.
-- Домен не открывает HTTP-порт и не пишет в platform DB сырым SQL; запись только через §4.13 (`notify` / `emit_event` / `schedule_timer`).
+Общение **внутри процесса** API/worker на сервере, без отдельного RPC «platform → domain microservice».
 
-**OperationRegistry и FSM Registry — не исходные файлы, которые дописываются годами.**  
-Это **runtime-структуры в RAM** процесса API/worker. Код `registry.py` — тонкая обёртка platform; размер файла не растёт от числа клиентов.
+- Домен — Python-пакет, импортируемый в процесс platform.
+- **RAM-реестры** = dict в памяти процесса. После рестарта строятся заново через `register_all`.
+- Platform вызывает зарегистрированные функции и передаёт уже открытую `domain_session`.
+- Домен возвращает Python-результаты (DTO, `GuardResult`, `EffectResult`) или бросает исключение.
+- Домен не открывает HTTP-порт и не пишет в platform DB сырым SQL; исходящие side effects — только через §4.13.
 
 ```text
-Boot (один раз при старте процесса API/worker на сервере):
-  Domain Registry (platform DB) → список active service_id
-  для каждого service_id:
-      load package (по cartridge_type / package ref)
-      open engine[service_id] → domain DB
-      register_all(service_id) → записи в RAM сервера:
-          OperationRegistry[(service_id, operation)] = {kind, handler}
-          FSM Registry[(service_id, process_name)] = ProcessDef
-          Guard/Effect Registry[service_id, name] = callable
+Boot:
+  Domain Registry (active) → load package → open domain DB
+  → register_all(service_id) → заполняет RAM-реестры
+  → Domain Validator (§7) → иначе domain не обслуживается
 
 Запрос:
-  Public API / invoke → OperationRegistry.get(service_id, operation)
-  Worker → ProcessRegistry.get(service_id, process_name)
-  → вызвать callable, передать domain_session для этого service_id
-  → если нет: 404 / UNKNOWN_PROCESS
+  invoke  → OperationRegistry.get(service_id, operation) → handler(...)
+  enqueue → ProcessRegistry.get(service_id, process_name) → worker → fsm_core
 ```
 
-После рестарта процесса RAM строится заново из Domain Registry + `register_all(service_id)`.
+### 6.4. Domain Registry (таблица в platform DB)
 
-```text
-Platform                              Domain cartridge
-────────                              ────────────────
-Domain Registry (DB) / boot
-  → load package (cartridge_type)
-  → open domain DB engine[service_id]
-  → register_all(service_id) ───────→  заполняет Operation/FSM Registry в RAM
-
-Request Runtime / Worker
-  → lookup RAM → call handler ──────→  domain function(session, …)
-  ← return DTO / Result ────────────   обычный return
-```
-
-### 6.3. Domain Registry (таблица в platform DB)
-
-Постоянный каталог **экземпляров** доменов. Не бизнес-схема courier/cargo и не список HTTP-handler'ов (handlers живут в RAM после boot).
-
-Имя таблицы условное, например `domain_services`.
+Постоянный каталог **экземпляров** доменов (не handlers и не бизнес-схема). Имя таблицы условное: `domain_services`.
 
 | Поле | Смысл |
 |------|--------|
-| `service_id` | PK; уникальный id экземпляра (`svc_8f2c…`) |
-| `cartridge_type` | тип картриджа: `cargo`, `courier`, `taxi` |
-| `version` | версия пакета картриджа |
+| `service_id` | PK; уникальный id экземпляра |
+| `cartridge_type` | тип пакета: `cargo`, `courier`, `taxi` |
+| `version` | версия пакета |
 | `package_ref` | путь/хранилище пакета |
-| `package_checksum` | контроль целостности пакета |
-| `db_secret_ref` | ссылка на URL/креды domain DB в secret store (не пароль в открытом виде) |
-| `pool_options_json` | опц. параметры пула для `engine_by_service_id` |
+| `package_checksum` | контроль целостности |
+| `db_secret_ref` | ссылка на URL/креды domain DB в secret store |
+| `pool_options_json` | опц. параметры пула |
 | `status` | `pending` \| `active` \| `failed` \| `disabled` |
-| `validation_report` | краткий результат Domain Validator |
-| `created_at` / `updated_at` | аудит |
-| `activated_by` | кто выполнил Accept |
+| `validation_report` | результат Domain Validator |
+| `created_at` / `updated_at` / `activated_by` | аудит |
 
-**Назначение:**
+**Не хранит:** тела Python-функций, SQL бизнес-таблиц, FSM-граф домена.
 
-- источник списка доменов после рестарта API/worker;
-- хранение `service_id` ↔ `cartridge_type` ↔ domain DB;
-- статус допуска к работе (`active` только после Validator);
-- аудит Accept / Upgrade / Disable.
-
-**Не хранит:** тела Python-функций, SQL бизнес-таблиц домена, FSM-граф домена.
-
-Accept в админ-UI = INSERT/UPDATE в Domain Registry + валидация + при успехе `status=active`.  
-Boot читает строки со `status=active` и для каждой вызывает загрузку пакета и `register_all(service_id)`.
-
-### 6.4. Как `registry.py` кладёт маппинг в RAM
-
-`registry.py` (и аналоги в `fsm_core/registry.py`) держит **модульные dict в памяти процесса сервера** и функции `register_*`. Это не запись в файл на диск.
-
-Упрощённая модель:
-
-```python
-# platform http / fsm_core registry — пустые dict при старте процесса
-# Публичные path (/v1/.../invoke, enqueue, …) — код platform, не register_route домена.
-
-_operations: dict[tuple[str, str], object] = {}
-# key = (service_id, operation) → {kind, handler}
-
-_processes: dict[tuple[str, str], ProcessDef] = {}
-# key = (service_id, process_name) → ProcessDef
-
-_guards: dict[tuple[str, str], object] = {}   # (service_id, guard_name) → callable
-_effects: dict[tuple[str, str], object] = {}  # (service_id, effect_name) → callable
-
-def register_operation(service_id, operation, kind, handler) -> None:
-    assert kind in ("query", "command")
-    _operations[(service_id, operation)] = {"kind": kind, "handler": handler}
-
-def register_process(process_def: ProcessDef) -> None:
-    key = (process_def.service_id, process_def.process_name)
-    _processes[key] = process_def
-```
-
-**Route Registry (platform-internal):** фиксированные handlers Public API §9 (`enqueue`, `invoke`, `instances`, `catalog`, `events/stream`, `webhooks`). Домен в него не пишет.
-
-#### 6.4.1. Контракт `OperationRegistry` (норматив)
-
-| Метод | Контракт |
-|-------|----------|
-| `register(service_id, operation, kind, handler)` | `kind` ∈ {`query`, `command`}; handler из `queries.py` / `commands.py` |
-| `get(service_id, operation) → {kind, handler} \| None` | lookup для `POST .../invoke` |
-| `list(service_id) → list[{operation, kind}]` | источник `GET .../catalog` |
-| `clear` / `unregister(service_id)` | тесты / Disable |
-
-`register_all(service_id)` **обязан** зарегистрировать: ProcessDef(+guards/effects) **и** все sync operations, которые видны в catalog/invoke.
-
-Домен при boot (передаёт **callable**, не путь к файлу):
-
-```python
-def register_all(service_id: str) -> None:
-    OperationRegistry.register(service_id, "list_entities", "query", list_entities)
-    OperationRegistry.register(service_id, "create_entity", "command", create_entity)
-    ProcessRegistry.register(ProcessDef(
-        service_id=service_id,
-        process_name="entity_creation",
-        entity_type="order_request",
-        event_name="order_create",
-        context_builder=build_context,
-    ))
-    GuardRegistry.register(service_id, "can_proceed", can_proceed)
-    EffectRegistry.register(service_id, "finalize", finalize)
-```
-
-```text
-POST /v1/{service_id}/invoke { "operation": "list_entities" }
-  → OperationRegistry → kind=query → queries.list_entities
-
-POST /v1/{service_id}/invoke { "operation": "create_entity" }
-  → OperationRegistry → kind=command → commands.create_entity
-
-FSM: service_id + process_name=entity_creation
-  → ProcessRegistry → run_instance (только worker)
-```
-
-**Итог:** RAM-реестры наполняются `register_*` во время `register_all(service_id)` при boot.
-
-### 6.5. Что регистрирует домен
-
-При `register_all(service_id)` домен передаёт platform только callable и метаданные:
-
-| Регистрация | Назначение |
-|-------------|------------|
-| Operation (`service_id`, operation, kind, handler) | sync invoke (§9); query→`queries.py`, command→`commands.py` |
-| `ProcessDef` (`service_id`, …) | async FSM job |
-| `guard_name` → функция | выбор transition |
-| `effect_name` → функция | побочные записи в domain DB после transition |
-| `context_builder` | сбор context для pipeline |
-
-Имена `guard_name` / `effect_name` в `fsm_transitions` (domain DB) **обязаны** совпадать с registry.
-
-### 6.6. Как передаётся запрос и ответ
-
-| Путь | Вызов | Ответ |
-|------|-------|-------|
-| REST Query/Command | Runtime вызывает domain handler `(domain_session, params, user_ctx)` | DTO → Gateway → JSON |
-| FSM | `fsm_core` вызывает context → guard → effect с session | `GuardResult` / `EffectResult`; статус instance пишет worker |
-
-Platform не парсит внутренности DTO домена для бизнес-логики. Для enrichment FSM-state использует только opaque `entity_type` / `entity_id` из ответа (если есть).
-
-### 6.7. Граница данных
-
-| Данные | Где | Кто пишет |
-|--------|-----|-----------|
-| instances, `entity_fsm_state`, logs, timers | platform DB | platform |
-| FSM-граф, бизнес-таблицы, ХП домена | domain DB | домен (seed/devops + effects/db_layer) |
-| Domain Registry (`service_id`, `cartridge_type`, version, package hash, DB secret, status) | platform DB / config | platform (Accept / bootstrap) |
-
-### 6.8. Связка сущностей (пример)
-
-```text
-server_fsm_instance (platform DB):
-  service_id=svc_courier_acme_01       # не cartridge_type
-  process_name=order_creation
-  entity_type=order_request
-  entity_id=348
-
-entity_fsm_state (platform DB):
-  (svc_courier_acme_01, order_request, 348) → request_fulfilled
-
-Domain Registry (platform DB):
-  service_id=svc_courier_acme_01, cartridge_type=courier, status=active
-
-fsm_transitions (domain DB этого service_id):
-  order_request: request_received --order_create--> request_fulfilled
-
-order_requests / orders (domain DB):
-  бизнес-данные; обновляются в effect через domain db_layer
-```
-
-Platform: HTTP-слой + процесс + FSM-state + log + Domain Registry.  
-Домен: граф FSM + бизнес-данные + handlers + db_layer + effects.
+Boot читает `status=active` и для каждой строки вызывает загрузку пакета + `register_all(service_id)`.
 
 ---
 
-## 7. Добавление нового домена и Domain Validator
+### 6.5. Поверхность A — Operations (sync invoke)
 
-### 7.1. Условия, при которых platform может работать с доменом
+#### 6.5.1. Что такое operation
 
-Домен допускается к работе только если одновременно:
+**Operation** — именованный sync use-case домена, который клиент вызывает через:
 
-1. Пакет картриджа (`cartridge_type`) установлен и проходит **проверку целостности пакета**.
-2. В Domain Registry сохранены уникальный **`service_id`**, `cartridge_type`, version, package checksum, secret domain DB.
-3. Domain DB доступна и проходит **проверку готовности SQL/ХП/графа**.
-4. Python RAM-registry согласован с FSM-графом в domain DB.
-5. Статус в Domain Registry = `active` (после успешного Accept / boot validation).
+```http
+POST /v1/{service_id}/invoke
+{ "operation": "<имя>", "params": { … }, "actor": { … } }
+```
 
-Иначе статус `failed` / `pending` — REST и FSM для этого `service_id` не обслуживаются.
+Имя operation — строка, которую домен сам выбирает при регистрации (например `create_order`, `list_courier_exchange`). Это **не** URL и не имя таблицы.
+
+Список всех operations сервиса отдаёт `GET /v1/{service_id}/catalog` — клиент и UI опираются на catalog, а не на хардкод.
+
+#### 6.5.2. Поле `kind`: зачем `query` и `command`
+
+При регистрации операции домен указывает **`kind`** — режим обработки в Request Runtime. Допустимы **только** два значения:
+
+| `kind` | Смысл | Типичный файл | Что делает **Request Runtime** (не handler) |
+|--------|--------|---------------|-----------------------------------------------|
+| `query` | чтение; без мутаций и без постановки FSM | `queries.py` | открывает sessions → вызывает handler → (опц.) enrichment FSM-state → **сам** COMMIT/ROLLBACK/close → ответ |
+| `command` | мутация и/или постановка FSM в очередь | `commands.py` | то же + idempotency; по ответу handler — bootstrap `entity_fsm_state` и/или INSERT PENDING instance (§4.12) |
+
+**Кто владеет сессией и commit:** только platform — **Request Runtime** на HTTP (`invoke` / bare `enqueue`) и **worker** на шаге FSM. Файлы `queries.py` / `commands.py` session **не** открывают и **не** коммитят: им передают уже открытую `domain_session`, они только вызывают `db_layer`.
+
+Почему нельзя «просто функцию без kind»:
+
+- Runtime по `kind` выбирает политику (idempotency для command, ожидания create/enqueue, форма ответа).
+- Catalog показывает клиенту, какая операция читающая, какая пишущая.
+- Validator отклоняет любое другое значение (`"action"`, `"mutation"`, …) — код `INVALID_OPERATION_KIND`.
+
+**Примеры (courier):**
+
+| operation | kind | Зачем |
+|-----------|------|--------|
+| `list_client_orders` | `query` | список заказов клиента; только SELECT |
+| `list_courier_exchange` | `query` | биржа свободных слотов |
+| `list_courier_orders` | `query` | взятые заказы курьера |
+| `create_order` | `command` | создать заказ в domain DB; вернуть `entity_type`/`entity_id`/`initial_state` (bootstrap state; FSM назначения здесь не обязателен) |
+| `take_courier_order` | `command` | **через invoke** поставить в очередь process `order_assign_courier1` (возврат `enqueue`); переход сделает worker |
+
+`kind=command` **не** означает «handler сам крутит FSM». Варианты ответа command:
+
+- staging-only: записать domain DB, вернуть DTO без `enqueue`;
+- bootstrap state: вернуть `{entity_type, entity_id, initial_state}` → Runtime пишет `entity_fsm_state` (§4.12);
+- start FSM: вернуть `{…, enqueue: {process_name, payload}}` → Runtime INSERT `server_fsm_instances` **PENDING**; дальше только worker.
+
+Query не ставит FSM-instance и в v1 не пишет бизнес-таблицы.
+
+**Почему нет гонки Runtime ↔ worker.** Это **две разные фазы**, не параллельная работа над одним переходом:
+
+```text
+1) HTTP (Request Runtime): handler (+ опц. bootstrap) + INSERT instance PENDING → COMMIT → ответ клиенту
+2) Worker позже: CLAIM PENDING → RUNNING → guard/transition/effect → COMPLETED/FAILED → свой COMMIT
+```
+
+Runtime не выполняет guard/effect. Worker не переписывает staging command'а в той же HTTP-транзакции. Гонка за «кто сделает transition» исключена статусом instance (`PENDING` → claim).
+
+#### 6.5.3. Handler: что платформа считает «вызываемым»
+
+**Handler** — обычная Python-функция (callable), которую домен передаёт в `OperationRegistry.register(...)`.
+
+Нормативные ожидания:
+
+1. Это **функция или bound method**, не строка с путём к файлу и не имя модуля.
+2. Сигнатура согласована с Request Runtime (см. реализацию host). Минимум логически: домен получает уже открытую **domain session**, `params` из JSON, контекст актора. Точная сигнатура — контракт host; домен не открывает session сам.
+3. Handler **не** коммитит транзакцию — COMMIT/ROLLBACK делает Runtime (§4.10.1).
+4. SQL только через domain `db_layer.py`, не сырой SQL внутри queries/commands.
+5. Для `kind=query` возвращает DTO (dict/list/dataclass), сериализуемый в JSON.
+6. Для `kind=command` возвращает DTO; при invoke-create lifecycle — обязательно включает `entity_type` и `entity_id` (и опц. `initial_state`), чтобы Runtime мог bootstrap + enqueue (§4.12).
+
+Validator проверяет не «бизнес правильный», а **техническую стыковку**: handler зарегистрирован, callable, `kind` допустим, имя уникально в рамках `service_id`.
+
+#### 6.5.4. Контракт `OperationRegistry` (API реестра)
+
+| Метод | Контракт |
+|-------|----------|
+| `register(service_id, operation, kind, handler)` | `kind` ∈ {`query`, `command`}; `operation` — непустая строка; `handler` — callable |
+| `get(service_id, operation) → {kind, handler} \| None` | lookup для invoke |
+| `list(service_id) → list[{operation, kind}]` | источник catalog |
+| `clear` / `unregister(service_id)` | тесты / Disable |
+
+Повторная регистрация того же `(service_id, operation)` при Accept/boot — **ошибка** (`DUPLICATE_OPERATION`), если политика реестра запрещает overwrite; в dev overwrite допустим только явно.
+
+#### 6.5.5. Путь запроса (что происходит после invoke)
+
+```text
+1. Auth → service_id
+2. OperationRegistry.get(service_id, operation)
+   нет записи → 404 UNKNOWN_OPERATION
+3. Request Runtime открывает session_platform + session_domain
+4. kind=query  → handler(queries) → db_layer read → DTO
+   kind=command → handler(commands) → db_layer write (± enqueue через Runtime)
+5. успех → COMMIT domain → COMMIT platform; ошибка → ROLLBACK обеих
+6. JSON 200 с data / ошибка envelope
+```
+
+Домен **не** парсит HTTP и **не** знает path `/v1/.../invoke`. Он знает только свою функцию и контракт `params`.
+
+---
+
+### 6.6. Поверхность B — FSM (граф + ProcessDef + guards/effects)
+
+#### 6.6.1. Разделение ролей
+
+| Артефакт | Где живёт | Роль |
+|----------|-----------|------|
+| Граф переходов (логические поля ниже) | **domain DB** | каталог рёбер: из какого state по какому event/action куда, с каким guard/effect |
+| `ProcessDef` | RAM после `register_all` | какой job для worker и какой event применить к сущности |
+| `guard_name` → функция | RAM GuardRegistry | условие выбора строки перехода |
+| `effect_name` → функция | RAM EffectRegistry | бизнес-запись в domain DB **после** SQL transition в platform |
+| `context_builder` | внутри ProcessDef | сбор context для guard/effect |
+| `server_fsm_instances` / `entity_fsm_state` / logs | **platform DB** | очередь, текущее состояние сущности, журнал |
+
+Логическая модель ребра (то, что читает `transition_repository`):
+
+```text
+entity_type, from_state, event_name (или эквивалент), to_state,
+priority, guard_name?, effect_name?
+```
+
+**Имена таблиц/колонок графа в domain DB** platform не навязывает как бизнес-словарь: доступ идёт через repository-адаптер. В живом courier-дампе исторически есть `fsm_actions` + `action_id`; целевой контракт v1 оперирует логическим `event_name`. Автору нового домена достаточно отдавать граф в форме, которую понимает repository (см. реализацию + seed эталона). Не путать с бизнес-колонками (`user_id` / `client_id`) — их platform **никогда** не читает.
+
+Важно: строки графа — **не** история заказов. История — в platform `fsm_transition_logs`.
+
+#### 6.6.2. `ProcessDef` — поля и смысл
+
+```python
+ProcessDef(
+    service_id=service_id,          # аргумент register_all (выдаёт platform), не хардкод
+    process_name="order_assign_courier1",  # имя job в очереди / catalog
+    entity_type="order",            # ключ entity_fsm_state и графа
+    event_name="order_assign_courier1_to_order",  # фильтр candidates в графе
+    context_builder=build_order_context,
+    initial_state="order_created",  # опц.: подсказка первого current_state (см. ниже)
+)
+```
+
+| Поле | Зачем разработчику домена |
+|------|---------------------------|
+| `process_name` | имя job в `server_fsm_instances`; его указывает command в `enqueue` или bare enqueue |
+| `entity_type` | связка instance ↔ `entity_fsm_state` ↔ граф |
+| `event_name` | фильтр candidates вместе с текущим `from_state` |
+| `context_builder` | callable: сбор context из domain DB |
+| `initial_state` | опциональная подсказка **первого** значения `entity_fsm_state.current_state` |
+
+**Что такое «начальное состояние» (без магии).** Когда сущность впервые появляется в platform, нужна строка в **platform** таблице `entity_fsm_state`: `(service_id, entity_type, entity_id) → current_state`. Откуда взять строку `current_state`:
+
+1. **Предпочтительно:** command при create возвращает `initial_state` в ответе (как `create_order` → `"order_created"`) — Request Runtime пишет её в `entity_fsm_state` (§4.12).
+2. **Опционально в ProcessDef:** то же имя как default для процессов этого типа.
+3. **Опциональный fallback в графе domain DB:** если в справочнике states у домена есть маркер «это стартовое» (в некоторых схемах колонка вроде `is_initial`) — Runtime/Validator могут прочитать его через repository. Если маркера нет — он **не обязателен**, пока create-command всегда отдаёт `initial_state` явно.
+
+Это **не** колонка platform DB и не статус instance (`PENDING`/`COMPLETED`). Это только первое бизнес-имя state сущности в FSM.
+
+Без `ProcessDef` worker не знает job → `UNKNOWN_PROCESS`.
+
+#### 6.6.3. Связь строк `fsm_transitions` с Python
+
+Каждая строка перехода в domain DB логически:
+
+```text
+(entity_type, from_state, event_name) + priority + guard_name? + effect_name? → to_state
+```
+
+Правила согласования имён (норматив):
+
+1. Если `guard_name` **не NULL** — в GuardRegistry для этого `service_id` **должна** быть функция с **точно таким же** именем строки (`can_assign_courier1` ↔ `can_assign_courier1`).
+2. Если `effect_name` **не NULL** — аналогично в EffectRegistry.
+3. `NULL` guard = unconditional candidate (§4.4); на один набор кандидатов — не больше одного NULL-guard.
+4. Имена в SQL и в `register(...)` — case-sensitive строки; опечатка = runtime `UNKNOWN_GUARD` / `UNKNOWN_EFFECT` и fail Validator при Accept.
+
+Переход **может** не иметь guard и/или effect (чистый сдвиг state + log). Тогда Python-регистрация для отсутствующих имён не нужна.
+
+#### 6.6.4. Сигнатуры guard / effect / context
+
+| Роль | Норматив возврата | Ограничения |
+|------|-------------------|-------------|
+| Guard | `GuardResult` (или bool/tuple — нормализуется platform) | read-only к домену; не пишет business; не коммитит |
+| Effect | `EffectResult` (или bool/dict) | пишет domain DB через db_layer; side effects наружу — `platform.*` (§4.13) |
+| Context builder | mapping/context | только сбор данных; session от worker |
+
+Точные аргументы `(session, db, context, instance, params)` — §5.4–5.6 и §8.2.
+
+#### 6.6.5. Как instance попадает к worker (invoke-command или bare enqueue)
+
+```text
+A) Продуктовый путь (норматив для UI):
+   invoke take_courier_order → Runtime INSERT PENDING → ответ {instance_id}
+B) Сервисный путь:
+   POST .../fsm/enqueue → Runtime INSERT PENDING (entity_fsm_state уже должна быть)
+
+Дальше одинаково:
+4. Worker claim PENDING → RUNNING
+5. context_builder → candidates из графа
+6. Guard routing (§4.4) → TransitionExecutor (platform DB) → effect (domain DB)
+7. COMPLETED / FAILED + logs
+```
+
+Command **не** выполняет transition в HTTP: только (опционально) ставит очередь. Guard/effect — только worker.
+
+---
+
+### 6.7. Единая точка подключения: `register_all(service_id)`
+
+#### 6.7.1. Обязанности entrypoint
+
+Каждый картридж обязан экспортировать функцию:
+
+```python
+def register_all(service_id: str) -> None:
+    ...
+```
+
+Указатель на неё — в `manifest.yaml` поле `entry` (например `domains.courier.processes:register_all`).
+
+`register_all` **обязан**:
+
+1. Зарегистрировать **все** operations, которые должны быть в catalog/invoke.
+2. Зарегистрировать **все** ProcessDef, по которым worker может забрать instance из очереди.
+3. Зарегистрировать **все** guards/effects, чьи имена встречаются в графе этого домена (непустые).
+4. Во всех `register_*` передать **тот же** `service_id`, что пришёл аргументом функции — его подставляет platform при boot/Accept. Разработчик картриджа **не выбирает** и **не хранит** этот id в исходниках.
+5. Не регистрировать HTTP routes / FastAPI router.
+6. Не открывать DB connection и не выполнять SQL (только заполнение RAM).
+
+Минимум содержимого: **хотя бы одна** Operation **или** один ProcessDef. Пустой `register_all` → fail Validator (`EMPTY_REGISTRATION`).
+
+#### 6.7.2. Пример полного `register_all` (courier, сокращённо)
+
+```python
+def register_all(service_id: str) -> None:
+    # --- Operations (sync) ---
+    OperationRegistry.register(service_id, "create_order", "command", create_order)
+    OperationRegistry.register(service_id, "take_courier_order", "command", take_courier_order)
+    OperationRegistry.register(service_id, "list_client_orders", "query", list_client_orders)
+    OperationRegistry.register(service_id, "list_courier_exchange", "query", list_courier_exchange)
+    OperationRegistry.register(service_id, "list_courier_orders", "query", list_courier_orders)
+
+    # --- FSM process ---
+    ProcessRegistry.register(ProcessDef(
+        service_id=service_id,
+        process_name="order_assign_courier1",
+        entity_type="order",
+        event_name="order_assign_courier1_to_order",
+        context_builder=build_order_context,
+        initial_state="order_created",
+    ))
+
+    # --- Имена = колонки fsm_transitions.guard_name / effect_name ---
+    GuardRegistry.register(service_id, "can_assign_courier1", can_assign_courier1)
+    EffectRegistry.register(service_id, "assign_courier1_effect", assign_courier1_effect)
+```
+
+Связка для разработчика:
+
+```text
+Клиент:  POST .../invoke { "operation": "take_courier_order", ... }
+  → command ставит enqueue process_name=order_assign_courier1
+
+Worker:  ProcessDef.event_name = order_assign_courier1_to_order
+  → SELECT candidates FROM fsm_transitions
+       WHERE entity_type='order' AND from_state=<current>
+         AND event_name='order_assign_courier1_to_order'
+  → guard can_assign_courier1 (из RAM)
+  → effect assign_courier1_effect (из RAM)
+```
+
+Если в SQL у перехода `guard_name='can_assign_courier1'`, а в Python зарегистрировали `"can_assign_courier"`, Validator и runtime считают это **разными** именами → домен не активируется / instance падает.
+
+#### 6.7.3. Модель RAM-реестров (упрощённо)
+
+```python
+_operations[(service_id, operation)] = {"kind": "query"|"command", "handler": callable}
+_processes[(service_id, process_name)] = ProcessDef
+_guards[(service_id, guard_name)] = callable
+_effects[(service_id, effect_name)] = callable
+```
+
+Публичные path (`/invoke`, `/fsm/enqueue`, …) — код platform; домен в Route Registry не пишет.
+
+---
+
+### 6.8. Как передаётся запрос и ответ
+
+| Путь | Вызов | Ответ |
+|------|-------|-------|
+| Invoke Query/Command | Runtime → domain handler `(domain_session, params, actor/…)` | DTO → JSON |
+| FSM | `fsm_core` → context → guard → effect | `GuardResult` / `EffectResult`; статус instance пишет worker |
+
+Platform **не** интерпретирует бизнес-поля DTO. Для enrichment FSM-state использует только opaque `entity_type` / `entity_id`, если handler их вернул.
+
+### 6.9. Граница данных
+
+| Данные | Где | Кто пишет |
+|--------|-----|-----------|
+| instances, `entity_fsm_state`, logs, timers, Domain Registry | platform DB | platform |
+| FSM-граф, бизнес-таблицы, ХП домена | domain DB | домен (seed/devops + effects/db_layer) |
+
+### 6.10. Связка сущностей (пример)
+
+```text
+server_fsm_instance (platform DB):
+  service_id=svc_courier_01
+  process_name=order_assign_courier1
+  entity_type=order
+  entity_id=1574
+
+entity_fsm_state (platform DB):
+  (svc_courier_01, order, 1574) → order_courier1_assigned
+
+Domain Registry:
+  service_id=svc_courier_01, cartridge_type=courier, status=active
+
+fsm_transitions (domain DB):
+  order: order_created --order_assign_courier1_to_order--> …
+  guard_name=can_assign_courier1, effect_name=assign_courier1_effect
+
+orders / stage_orders (domain DB):
+  бизнес-данные; обновляются в effect через domain db_layer
+```
+
+Platform: HTTP + очередь + FSM-state + log + Domain Registry.  
+Домен: граф + бизнес-данные + handlers + db_layer + effects.
+
+### 6.11. Чеклист автора картриджа (контракт)
+
+Перед Accept убедитесь:
+
+1. Есть `manifest.yaml` с `cartridge_type`, `version`, `entry` → `register_all`.
+2. Domain DB накатана: бизнес-схема + `fsm_states` / events / `fsm_transitions`.
+3. Каждая публичная операция — в `OperationRegistry` с корректным `kind`.
+4. Каждый enqueue-able процесс — в `ProcessDef` с существующими `entity_type` / `event_name` / `initial_state` (если задан).
+5. Каждый непустой `guard_name` / `effect_name` в графе зарегистрирован в RAM.
+6. Нет своей HTTP-регистрации путей; клиенты ходят только на `/v1/{service_id}/…`.
+7. SQL только в domain `db_layer`; handlers не коммитят.
+
+Дальше — Domain Validator (§7).
+
+---
+
+## 7. Accept нового домена и Domain Validator
+
+### 7.1. Условия, при которых platform обслуживает домен
+
+Домен допускается к REST/FSM **только если одновременно**:
+
+1. Пакет картриджа установлен и проходит проверку целостности (§7.4).
+2. В Domain Registry есть уникальный `service_id`, `cartridge_type`, version, checksum, secret domain DB.
+3. Domain DB доступна и проходит проверку готовности SQL/ХП/графа (§7.6).
+4. После `register_all` Python-реестры согласованы с графом и контрактом operations (§7.5, §7.7–7.8).
+5. `status = active` (после успешного Accept / boot validation).
+
+Иначе `failed` / `pending` / `disabled` — invoke и enqueue для этого `service_id` **не** обслуживаются.
 
 ### 7.2. Способы добавления
 
 | Способ | Действия |
 |--------|----------|
-| Ops / конфиг (**норматив prod v1**) | пакет из доверенного registry (git/image/`FSM_DOMAINS`), URL DB, выдача `service_id`, Validator, рестарт |
-| Админ-UI | Accept = привязка Domain DB + выбор **уже доверенного** `package_ref` / `cartridge_type` → validate → **сгенерировать service_id** → persist → restart |
+| Ops / конфиг (**норматив prod v1**) | пакет из доверенного registry, URL DB, выдача `service_id`, Validator, рестарт |
+| Админ-UI | Accept = Domain DB + доверенный `package_ref` → validate → сгенерировать `service_id` → persist → restart |
 
-Накат схемы domain DB в v1 — **на стороне заказчика** до Accept. Platform проверяет готовность, не накатывает DDL по умолчанию.
+Накат схемы domain DB в v1 — **на стороне заказчика/devops до Accept**. Platform проверяет готовность, DDL по умолчанию не накатывает.
 
-**Security Accept (норматив):** в **prod** запрещён upload произвольного zip с Python и немедленный `import` (remote code execution). Пакеты — только signed/checksummed из allowlist registry. Upload zip → import допустим **только** в dev/staging при явной конфигурации + allowlist расширений + checksum + изолированный import path (§7.5).
+**Security (норматив):** в prod запрещён upload произвольного zip с Python и немедленный `import`. Пакеты — signed/checksummed из allowlist. Zip→import только в dev/staging при явной конфигурации (§7.10).
 
-### 7.3. Domain Validator — целостность пакета
+### 7.3. Что такое Domain Validator
 
-Компонент platform (например `platform/domain_validator.py`), запускается на Accept и при каждом boot active-домена.
+**Domain Validator** — компонент platform (например `fsm_platform/host/domain_validator.py`), который отвечает на вопрос:
 
-**Пакет:**
+> «Можно ли безопасно активировать этот `service_id`: пакет, Python-регистрация и domain DB стыкуются так, что invoke и FSM не упадут на отсутствующих именах / битом графе?»
 
-- архив/дерево: размер, отсутствие path traversal (`..`), allowlist расширений;
-- обязателен `manifest.yaml`: `cartridge_type`, `version`, `entry` (`…:register_all`), required tables/routines;
-- `cartridge_type` — тип пакета; **`service_id` уникален** (выдаёт platform, не заказчик);
-- checksum пакета сохранён в Domain Registry;
-- обязательные модули на месте (`processes.py`, … по контракту картриджа);
-- `import` entrypoint и вызов `register_all(service_id)` без исключения;
-- после регистрации: есть ≥1 ProcessDef и/или ≥1 Operation;
-- `(service_id, process_name)` уникальны глобально в FSM Registry (RAM).
+Запускается:
 
-### 7.4. Domain Validator — готовность domain DB (SQL / ХП / граф)
+- при **Accept** (до `status=active`);
+- при **boot** каждого active-домена;
+- при **Upgrade** пакета.
+
+Результат пишется в `validation_report` Domain Registry. Любая проверка уровня **fail** → домен не активируется (или снимается с обслуживания на boot).
+
+Validator **не** проверяет бизнес-правильность (цены, SLA, «правильный ли nearest locker»). Он проверяет **стыковку контракта §6**.
+
+### 7.4. Проверки пакета (integrity)
+
+| Код | Условие fail | Что сделать автору домена |
+|-----|--------------|---------------------------|
+| `PACKAGE_PATH_INVALID` | path traversal / недопустимые расширения / размер | поправить поставку пакета |
+| `MANIFEST_MISSING` | нет `manifest.yaml` | добавить manifest |
+| `MANIFEST_INVALID` | нет `cartridge_type` / `version` / `entry` | заполнить обязательные поля |
+| `ENTRY_IMPORT_FAILED` | нельзя импортировать `entry` | исправить путь модуля / зависимости |
+| `REGISTER_ALL_FAILED` | `register_all(service_id)` бросил исключение | исправить код регистрации |
+| `CHECKSUM_MISMATCH` | checksum ≠ Domain Registry | переустановить пакет / обновить registry |
+| `REQUIRED_MODULE_MISSING` | нет обязательных модулей картриджа (§5.2) | добавить `processes.py`, `db_layer.py`, … |
+
+### 7.5. Проверки после `register_all` (RAM)
+
+| Код | Условие fail | Смысл |
+|-----|--------------|--------|
+| `EMPTY_REGISTRATION` | нет ни одной Operation и ни одного ProcessDef | картридж ничего не отдаёт platform |
+| `DUPLICATE_OPERATION` | два раза одно `(service_id, operation)` | оставить одно имя |
+| `DUPLICATE_PROCESS` | два раза одно `(service_id, process_name)` | оставить одно имя |
+| `INVALID_OPERATION_KIND` | `kind` не `query` и не `command` | исправить регистрацию |
+| `OPERATION_HANDLER_NOT_CALLABLE` | handler не callable | передавать функцию, не строку |
+| `PROCESS_FIELDS_MISSING` | у ProcessDef пустые `process_name` / `entity_type` / `event_name` / `context_builder` | заполнить поля |
+| `CONTEXT_BUILDER_NOT_CALLABLE` | `context_builder` не callable | передать функцию сборщика |
+| `GUARD_NOT_CALLABLE` / `EFFECT_NOT_CALLABLE` | зарегистрированное имя указывает не на callable | исправить register |
+| `SERVICE_ID_MISMATCH` | ProcessDef.service_id ≠ аргумент `register_all` | не хардкодить чужой id |
+
+Предупреждения (warning, политика v1 — не блокируют, но пишутся в отчёт):
+
+- operation зарегистрирована, но нигде не упомянута в smoke-списке manifest (опц.);
+- orphan guards/effects в RAM без строк в графе — см. §7.7.
+
+### 7.6. Проверки готовности domain DB
 
 По connection из Accept / env:
 
-1. **Connectivity** — connect + auth в timeout.
-2. **FSM-граф** — существуют таблицы `fsm_states`, `fsm_events`, `fsm_transitions` (или эквивалент контракта); в transitions есть строки для entity_type домена.
-3. **Согласованность граф ↔ Python** — каждый непустой `guard_name` / `effect_name` из transitions зарегистрирован в Guard/Effect Registry; лишние Python-имена — warning.
-4. **Default guards** — на каждый набор `(entity_type, from_state, event_name)` не более одного `guard_name IS NULL`; если есть — у него max `priority` в наборе (§4.4).
-5. **Initial states** — для каждого `entity_type` из ProcessDef: ровно один `fsm_states.is_initial=true` (если домен использует invoke-create для типа).
-6. **Бизнес-схема** — минимальный набор объектов из `manifest` (required tables / routines); отсутствие → fail.
-7. **ХП домена** (если указаны в manifest) — routines существуют и доступны пользователю DB.
-8. **Граница** — очередь FSM (`server_fsm_instances`) и `entity_fsm_state` живут в platform DB; domain DB не является их источником истины.
+| Код | Условие fail | Смысл |
+|-----|--------------|--------|
+| `DB_CONNECT_FAILED` | нет connect/auth в timeout | поправить URL/креды/сеть |
+| `FSM_TABLE_MISSING` | repository не видит обязательные объекты графа (states / transitions / event-или-action справочник) | накатить seed графа / поправить схему под adapter |
+| `REQUIRED_TABLE_MISSING` | таблицы из `manifest.required_tables` отсутствуют | накатить `sql/domain` |
+| `REQUIRED_ROUTINE_MISSING` | ХП из manifest отсутствуют / нет GRANT | создать routine / выдать права |
+| `NO_TRANSITIONS_FOR_ENTITY` | для `entity_type` из ProcessDef нет ни одной строки transitions | добавить граф |
+| `INITIAL_STATE_MISSING` | create-поток без явного `initial_state` в контракте и без однозначного маркера стартового state в графе | вернуть `initial_state` из command / задать ProcessDef / один маркер в графе |
+| `AMBIGUOUS_INITIAL_STATE` | больше одного маркера стартового state на entity_type | оставить ровно один |
+| `INITIAL_STATE_UNKNOWN` | указанный `initial_state` не найден среди имён states графа (если проверка доступна) | исправить имя или seed |
+| `EVENT_UNKNOWN` | `ProcessDef.event_name` не стыкуется с графом | согласовать seed и ProcessDef |
 
-Platform не интерпретирует бизнес-смысл таблиц; только наличие объектов и связность с registry.
+Граница (информативно / fail при нарушении политики):
 
-### 7.5. Поток Accept (админ-UI)
+- таблицы `server_fsm_instances` / `entity_fsm_state` **не** должны быть источником истины в domain DB.
 
-**Prod v1 (норматив):**
+### 7.7. Согласованность граф ↔ Python
+
+Это ключевая проверка «домен заведётся в runtime»:
+
+| Код | Условие | Уровень |
+|-----|---------|---------|
+| `UNKNOWN_GUARD_IN_GRAPH` | в `fsm_transitions.guard_name` непустая строка, которой нет в GuardRegistry(`service_id`) | **fail** |
+| `UNKNOWN_EFFECT_IN_GRAPH` | то же для `effect_name` / EffectRegistry | **fail** |
+| `ORPHAN_GUARD_IN_REGISTRY` | guard зарегистрирован в RAM, но ни разу не встречается в графе | warning |
+| `ORPHAN_EFFECT_IN_REGISTRY` | аналогично для effect | warning |
+| `AMBIGUOUS_DEFAULT_GUARD` | на набор `(entity_type, from_state, event_name)` больше одного `guard_name IS NULL` | **fail** |
+| `DEFAULT_GUARD_PRIORITY` | NULL-guard есть, но его `priority` не максимальный в наборе (§4.4) | **fail** |
+| `NO_CANDIDATES_FOR_PROCESS` | для ProcessDef нет ни одного перехода с его `entity_type` + `event_name` | **fail** (strict) |
+| `UNREACHABLE_PROCESS_EVENT` | event есть, но ни один `from_state` не стыкуется с возможными states entity | warning или fail по политике |
+
+Алгоритм сверки имён (норматив):
 
 ```text
-1. Выбрать package_ref из доверенного registry (cartridge_type, version, checksum уже известны)
-2. Domain DB URL → secret store (db_secret_ref)
-3. Platform генерирует service_id
-4. Persist Domain Registry: service_id, cartridge_type, version, checksum, secret_id, status=pending
-5. Domain Validator: пакет (из registry) + domain DB + register_all(service_id) + согласованность (§7.3–7.4)
-6. status=active | failed (+ отчёт в UI)
-7. Restart API/worker (v1) → boot: engine_by_service_id + RAM-реестры
-8. UI показывает service_id и результат валидации
+guards_in_graph = DISTINCT non-null guard_name FROM fsm_transitions
+effects_in_graph = DISTINCT non-null effect_name FROM fsm_transitions
+guards_in_ram   = GuardRegistry.names(service_id)
+effects_in_ram  = EffectRegistry.names(service_id)
+
+∀ g ∈ guards_in_graph:  g ∈ guards_in_ram  else UNKNOWN_GUARD_IN_GRAPH
+∀ e ∈ effects_in_graph: e ∈ effects_in_ram else UNKNOWN_EFFECT_IN_GRAPH
 ```
 
-**Dev/staging (опционально):** upload zip допускается только если `ACCEPT_ALLOW_ZIP_UPLOAD=true`, пакет проходит allowlist/checksum/path checks, entrypoint импортируется из изолированного каталога. В prod этот режим **выключен**.
+### 7.8. Проверки Operations (catalog / invoke)
 
-Каналы и публичный API клиентов — §9.
+| Код | Условие | Уровень |
+|-----|---------|---------|
+| `INVALID_OPERATION_NAME` | пустое имя / недопустимые символы (норматив: `[a-z][a-z0-9_]*`) | fail |
+| `INVALID_OPERATION_KIND` | не `query`\|`command` | fail |
+| `OPERATION_HANDLER_NOT_CALLABLE` | не callable | fail |
+| `CATALOG_EMPTY_WITH_ACTIVE` | active-домен без operations и без processes | fail (`EMPTY_REGISTRATION`) |
 
-**Запрещено:** Accept без успешного Validator; обслуживание `service_id` при `failed`; prod Accept с произвольным zip→import.
+Validator **не** обязан импортировать и «прогонять» handler с фейковыми params (это уже smoke/integration). Достаточно реестровой и схемной стыковки. Рекомендуемый post-Accept smoke (§5.9 п.6) — отдельно от Validator.
 
-### 7.6. Что хранит platform о домене
+### 7.9. Формат отчёта
 
-Схема полей Domain Registry — §6.3 (`domain_services`).  
-Кратко: `service_id`, `cartridge_type`, `version`, package ref/checksum, `db_secret_ref`, `status`, validation report, аудит.
+`validation_report` (JSON), минимум:
 
-### 7.7. Disable / Upgrade (минимум)
+```json
+{
+  "service_id": "svc_courier_01",
+  "cartridge_type": "courier",
+  "ok": false,
+  "checked_at": "2026-07-21T15:00:00Z",
+  "errors": [
+    {
+      "code": "UNKNOWN_GUARD_IN_GRAPH",
+      "message": "fsm_transitions.guard_name='can_assign_courier1' not in GuardRegistry",
+      "where": "fsm_transitions.id=130"
+    }
+  ],
+  "warnings": [
+    {
+      "code": "ORPHAN_EFFECT_IN_REGISTRY",
+      "message": "effect 'legacy_notify' registered but unused in graph"
+    }
+  ],
+  "stats": {
+    "operations": 5,
+    "processes": 1,
+    "guards": 1,
+    "effects": 1,
+    "transitions_scanned": 40
+  }
+}
+```
 
-- **Disable** — status=`disabled`, routes/FSM для `service_id` не принимаются; пакет и DB не удаляются.
-- **Upgrade** — новый пакет → Validator → смена version/checksum → restart; при fail остаётся предыдущий active.
+Правило активации: `ok=true` ⟺ `errors` пуст. Warnings не блокируют `active`, но видны в UI.
+
+### 7.10. Поток Accept (админ-UI / ops)
+
+**Prod v1:**
+
+```text
+1. Выбрать package_ref из доверенного registry
+2. Domain DB URL → secret store
+3. Platform генерирует service_id
+4. Persist Domain Registry: status=pending
+5. Domain Validator: пакет + import entry + register_all + DB + согласованность (§7.4–7.8)
+6. status=active | failed (+ validation_report)
+7. Restart API/worker (v1) → boot: engines + RAM + повторная валидация active
+8. UI показывает service_id и отчёт
+```
+
+**Dev/staging:** zip upload только при `ACCEPT_ALLOW_ZIP_UPLOAD=true` + allowlist/checksum/изолированный import. В prod выключен.
+
+**Запрещено:** Accept без успешного Validator; обслуживание при `failed`; prod zip→import.
+
+### 7.11. Что хранит platform о домене
+
+Схема — §6.4. Кратко: `service_id`, `cartridge_type`, version, package ref/checksum, `db_secret_ref`, `status`, `validation_report`, аудит.
+
+### 7.12. Disable / Upgrade (минимум)
+
+- **Disable** — `status=disabled`; invoke/enqueue не принимаются; пакет и DB не удаляются.
+- **Upgrade** — новый пакет → Validator → смена version/checksum → restart; при fail остаётся предыдущий `active`.
+
+### 7.13. Как читать Validator разработчику домена
+
+Типовой порядок починки после fail:
+
+1. `REGISTER_ALL_FAILED` / `ENTRY_IMPORT_FAILED` — сначала Python импорт и `register_all`.
+2. `DB_*` / `FSM_TABLE_*` / `REQUIRED_*` — накат SQL seed.
+3. `UNKNOWN_GUARD_IN_GRAPH` / `UNKNOWN_EFFECT_IN_GRAPH` — либо зарегистрировать имя в `register_all`, либо исправить опечатку в SQL.
+4. `NO_CANDIDATES_FOR_PROCESS` — согласовать `ProcessDef.event_name` / `entity_type` со строками `fsm_transitions`.
+5. `AMBIGUOUS_*` — поправить граф (одна initial, один NULL-default на набор).
+6. Повторить Accept / boot; смотреть `validation_report.errors`.
+
+Эталон живого картриджа: `domains/courier/processes.py` + SQL графа courier.
 
 ---
 
-
 ## 8. Модули fsm_platform
 
-Пакет `fsm_platform/` (в коде; ранее в черновиках — `fsm_core`) — **единственный** runtime декларативного FSM. Его вызывает worker (и только worker) для async lifecycle. HTTP Query/Command в `fsm_platform` не входят. Оболочка HTTP/worker/engines — пакет `fsm_host/` (не stdlib `platform`).
+Пакет `fsm_platform/` — продукт целиком: **`fsm_platform.core`** (в спецификации — `fsm_core`) — **единственный** runtime декларативного FSM; его вызывает worker (и только worker) для async lifecycle. HTTP Query/Command в `core` не входят. Оболочка HTTP/worker/engines — **`fsm_platform.host`**.
 
 ### 8.0. Состав пакета
 
@@ -991,7 +1334,7 @@ Platform не интерпретирует бизнес-смысл таблиц;
 
 | Канал | Модуль | БД |
 |-------|--------|-----|
-| Platform persistence | `fsm_core/db_layer.py` (+ state_store / executor / timers) | platform DB |
+| Platform persistence | `fsm_platform/core/db_layer.py` (+ state_store / executor / timers) | platform DB |
 | Domain graph read | `transition_repository.py` | domain DB (session от worker) |
 | Domain business R/W | domain `db_layer.py` в effects/handlers | domain DB |
 
@@ -1001,7 +1344,7 @@ Platform не интерпретирует бизнес-смысл таблиц;
 |-----------|-----|----------------------------|
 | `fsm_worker.py` | platform | session(s), claim instance, commit, вызывает `run_instance` |
 | Domain `register_all` | domains/ | наполняет `registry.py` |
-| platform/http | platform | Public API / OperationRegistry; не часть fsm_core |
+| sm_platform/host/http | platform | Public API / OperationRegistry; не часть fsm_core |
 | Domain Validator | platform | сверяет граф SQL с Guard/Effect Registry |
 
 ```text
@@ -1071,7 +1414,7 @@ Worker по `new_state` (§4.7):
 | `entity_type` | да (цель) | тип сущности FSM |
 | `event_name` | да (цель) | событие графа; если пусто — fallback `process_name` (`runtime_event_name`) |
 | `context_builder` | да для реальных процессов | `(session_domain, db, runtime_ctx, instance) → dict` |
-| `initial_state` | нет | опц. override для bootstrap (§4.12); иначе `fsm_states.is_initial` |
+| `initial_state` | нет | опц. подсказка первого `entity_fsm_state.current_state` (§4.12, §6.6.2); иначе — из ответа command или маркер в графе |
 
 Свойство `runtime_event_name` = `event_name or process_name`.
 
@@ -1195,7 +1538,7 @@ _effects: dict[(service_id, effect_name), EffectFunction]
 | `names(service_id=None) -> list[str]` | для Domain Validator |
 | `unregister(service_id)` | снять все имена домена |
 
-Пример наполнения — как в §6.4 (`GuardRegistry.register(service_id, "can_create_order", can_create_order)`).
+Пример наполнения — как в §6.7 (`GuardRegistry.register(service_id, "can_assign_courier1", can_assign_courier1)`).
 
 **Связь с БД (косвенная):** строки `fsm_transitions.guard_name` / `effect_name` в **domain DB** должны существовать в registry для этого `service_id`. Проверяет Domain Validator при Accept/boot; в runtime отсутствие → `UNKNOWN_GUARD` / `UNKNOWN_EFFECT`.
 
@@ -1556,7 +1899,7 @@ class FsmDbLayer:
 
 ### 8.9. `state_store.py`
 
-**Назначение:** узкий API текущего FSM-state. Читает/пишет только через `fsm_core/db_layer.py` → `entity_fsm_state`.
+**Назначение:** узкий API текущего FSM-state. Читает/пишет только через `fsm_platform/core/db_layer.py` → `entity_fsm_state`.
 
 #### 8.9.1. Интерфейс
 
@@ -1684,7 +2027,7 @@ class TransitionExecutor:
 
 #### 8.11.3. Ограничения
 
-- Только platform tables через `fsm_core/db_layer.py`.
+- Только platform tables через `fsm_platform/core/db_layer.py`.
 - Денормализованный бизнес-статус в domain DB — только в **effect** домена.
 - Реализация apply: SQL через db_layer или ХП только над platform tables — без знания schema домена.
 - Для §4.7.1: повтор apply при `current_state == to_state` и дубликат log `(instance_id, transition_id)` — идемпотентный успех (не ошибка).
@@ -1998,7 +2341,7 @@ Content-Type: application/json
 }
 ```
 
-Источник: ProcessRegistry + OperationRegistry в RAM (§6.4.1). После Accept UI/клиент опирается на catalog, а не на хардкод имён.
+Источник: ProcessRegistry + OperationRegistry в RAM (§6.5–6.7). После Accept UI/клиент опирается на catalog, а не на хардкод имён.
 
 ### 9.7. Auth и актор
 
@@ -2079,7 +2422,7 @@ message "/orders"
 | `/v1/.../catalog` | чтение ProcessRegistry + Operation Registry (RAM) |
 | `/v1/.../fsm/instances/{id}` | SELECT `server_fsm_instances` |
 
-OperationRegistry — единственный реестр sync handler'ов (§6.4.1). Публичные path фиксированы platform; домен path не регистрирует.
+OperationRegistry — единственный реестр sync handler'ов (§6.5). Публичные path фиксированы platform; домен path не регистрирует.
 
 ### 9.13. Модули platform (входящий контур)
 
@@ -2087,16 +2430,16 @@ OperationRegistry — единственный реестр sync handler'ов (�
 
 | Модуль (целевой путь) | Назначение |
 |-----------------------|------------|
-| `platform/http/gateway.py` | HTTP `/v1/...`: routing, status code, JSON in/out |
-| `platform/http/dispatcher.py` | lookup Operation Registry / ProcessRegistry |
-| `platform/http/request_runtime.py` | session(s) на invoke; вызов domain handler; commit/close |
-| `platform/http/enqueue.py` | `POST .../fsm/enqueue`: валидация process, INSERT instance |
-| `platform/http/instances.py` | `GET .../fsm/instances/{id}` |
-| `platform/http/catalog.py` | `GET .../catalog` из RAM-реестров |
-| `platform/http/invoke.py` | `POST .../invoke` → dispatcher → Request Runtime |
+| `fsm_platform/host/http/app.py` | HTTP `/v1/...`: routing, status code, JSON in/out |
+| `fsm_platform/host/http/app.py` | lookup Operation Registry / ProcessRegistry |
+| `fsm_platform/host/http/request_runtime.py` | session(s) на invoke; вызов domain handler; commit/close |
+| `fsm_platform/host/http/app.py` | `POST .../fsm/enqueue`: валидация process, INSERT instance |
+| `fsm_platform/host/http/app.py` | `GET .../fsm/instances/{id}` |
+| `fsm_platform/host/http/app.py` | `GET .../catalog` из RAM-реестров |
+| `fsm_platform/host/http/app.py` | `POST .../invoke` → dispatcher → Request Runtime |
 | `platform/auth/` | API key / JWT → `service_id`, scopes, `actor` |
 | `platform/idempotency/` | таблица `idempotency_keys` (§4.14) |
-| OperationRegistry | RAM §6.4.1; наполняет `register_all` (домен) |
+| OperationRegistry | RAM §6.5; наполняет `register_all` (домен) |
 | Public API routes | фиксированные path §9; код platform |
 | ProcessRegistry (`fsm_core`) | проверка `process_name` при enqueue |
 | Domain Registry | `service_id` active, connection domain DB |
@@ -2412,7 +2755,7 @@ External-интеграции (Core/ERP) — тот же `platform_outbox` с `c
 | `platform/outbox/worker.py` | доставка, retry, DEAD |
 | `platform/reconcile/worker.py` | докат platform из `platform_reconcile_queue` (§4.7.1) |
 | `platform/events.py` | реализация `platform.emit_event` → `platform_events` |
-| `platform/http/sse.py` | endpoint stream |
+| `fsm_platform/host/http/sse.py` | endpoint stream |
 | `platform/webhooks/registry.py` | subscriptions |
 | `channels/*/sender.py` | отправка в мессенджер из outbox |
 
@@ -2462,7 +2805,7 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 | `core_outbox` + `platform_outbox` | только `platform_outbox` |
 | Произвольный SQL домена в platform DB | только notify / emit_event / schedule_timer (§4.13) |
 | IF `entity_type` → выбор таблицы домена внутри `fsm_core` | opaque `entity_type`/`entity_id`; схему знает только домен |
-| Смешение SQL platform и domain в одном db_layer | `fsm_core/db_layer.py` + `domains/*/db_layer.py` |
+| Смешение SQL platform и domain в одном db_layer | `fsm_platform/core/db_layer.py` + `domains/*/db_layer.py` |
 | Хардкод внешних URL клиентов в обход Public API | только `/v1/{service_id}/…` (§9) |
 | Домен без Validator / без Domain Registry | Accept → Validator → `active` |
 | Python map `state → handler` вместо графа | declarative `fsm_transitions` + guards/effects |
@@ -2472,7 +2815,7 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 | `ProcessDef.service` / колонка `service` | только `service_id` |
 | `depends_on_outbox_id` / граф outbox | FSM + timers |
 | mode=wait → claim/run в HTTP | poll-in-request; claim только worker |
-| Prod Accept: произвольный zip→import | пакет из доверенного registry (§7.5) |
+| Prod Accept: произвольный zip→import | пакет из доверенного registry (§7.10) |
 | Несколько независимых outbox producer | только `platform.notify` + fan-out hook |
 | Fan-out FAILED в рабочей tx | short tx после ROLLBACK (§4.7) |
 | 2PC / повтор effect при platform commit fail | `platform_reconcile_queue` (§4.7.1) |
@@ -2503,7 +2846,7 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 - [ ] Bootstrap state §4.12; side-effect API §4.13.
 - [ ] Guard default §4.4; `list_candidates` через `session_domain` (engine этого `service_id`).
 - [ ] Bootstrap: active домены из Domain Registry / `FSM_DOMAINS` → `register_all`.
-- [ ] Domain Validator: пакет + SQL/ХП/граф + default-guard + OperationRegistry + согласованность.
+- [ ] Domain Validator §7: пакет + register_all + SQL/ХП/граф + default-guard + OperationRegistry + согласованность имён; отчёт с кодами.
 - [ ] Accept prod без zip-exec; `engine_by_service_id` из Domain Registry (§4.14).
 - [ ] Домен `failed`/`disabled` не обслуживает REST и FSM.
 - [ ] `idempotency_keys` + `webhook_subscriptions` (§4.14).
@@ -2524,13 +2867,13 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 ## 14. Критерии готовности домена
 
 - [ ] `manifest.yaml` + структура картриджа §5.1.
-- [ ] `register_all()` (ProcessDef + OperationRegistry + guards/effects).
+- [ ] `register_all()` по контракту §6.7 (ProcessDef + OperationRegistry + guards/effects).
 - [ ] Domain DB: FSM-граф + бизнес-схема (+ ХП по manifest) до Accept.
-- [ ] Все guard_name/effect_name из SQL зарегистрированы в Python.
+- [ ] Все guard_name/effect_name из SQL зарегистрированы в Python (§6.6.3 / §7.7).
 - [ ] Effects → domain db_layer; наружу только notify / emit_event / schedule_timer (§4.13).
 - [ ] `db_layer.py` — единственное место бизнес-SQL домена; session только аргумент.
-- [ ] Query → `queries.py`; sync Command → `commands.py`; operations в OperationRegistry.
-- [ ] Проходит Domain Validator → `active`.
+- [ ] Query → `queries.py`; sync Command → `commands.py`; у каждой operation корректный `kind` (§6.5.2).
+- [ ] Проходит Domain Validator → `active` (§7).
 - [ ] Smoke Command / Query после активации.
 
 ---
@@ -2541,27 +2884,28 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 |--------|----------|
 | Platform | FSM Platform: worker, fsm_core, HTTP-слой, platform DB, bootstrap, validator |
 | Domain / картридж | courier, taxi, cargo — SQL + Python + db_layer, своя domain DB |
-| Domain Registry | таблица platform DB (`domain_services`): каталог service_id / cartridge_type / status / DB / package; см. §6.3 |
-| Domain Validator | проверка целостности пакета и готовности domain DB (SQL/ХП/граф) |
+| Domain Registry | таблица platform DB (`domain_services`): каталог service_id / cartridge_type / status / DB / package; см. §6.4 |
+| Domain Validator | проверка стыковки пакета, `register_all`, domain DB и графа с RAM (§7); не бизнес-логика |
 | cartridge_type | тип картриджа (`cargo`, `courier`); не обязан быть уникальным |
 | service_id | уникальный id экземпляра домена; ключ runtime и Domain Registry |
-| Operation/FSM Registry | dict в RAM; наполняется `register_*` при boot; см. §6.4 |
+| Operation | именованный sync use-case (`invoke`); `kind` = `query`\|`command`; §6.5 |
+| Operation/FSM Registry | dict в RAM; наполняется `register_*` при boot; см. §6.5–6.7 |
 | platform.emit_event | единственный writer `platform_events`; §4.13 |
 | platform_reconcile_queue | докат platform после domain commit / platform fail; §4.7.1 |
 | manifest.yaml | метаданные картриджа: cartridge_type, version, entry, required objects |
-| ProcessDef | поля `service_id`, process_name, entity_type, event_name |
+| ProcessDef | поля `service_id`, process_name, entity_type, event_name; §6.6 |
 | Instance | строка `server_fsm_instances` — задача worker |
 | entity_type + entity_id | opaque указатель домена для platform |
 | SQL transition | TransitionExecutor → fsm_core db_layer |
 | Effect | доменный код после transition; запись через domain db_layer |
 | Domain db_layer | `domains/*/db_layer.py` — SQL domain DB; session от platform |
-| fsm_core db_layer | `fsm_core/db_layer.py` — SQL platform DB; §8.8 |
+| fsm_core db_layer | `fsm_platform/core/db_layer.py` — SQL platform DB; §8.8 |
 | guard_params / effect_params | JSON в `fsm_transitions`; аргументы guard/effect; §8.2.5 |
 | SQL seed | SQL картриджа для domain DB (накат до Accept в v1) |
 | Guard routing | выбор transition по priority и guards |
 | Gateway | HTTP in/out, auth, JSON; без бизнес-SQL |
 | Public API routes | фиксированные `/v1/...` в коде platform; §9 |
-| Operation Registry | RAM §6.4.1: `(service_id, operation) → handler, kind`; catalog/invoke |
+| Operation Registry | RAM §6.5: `(service_id, operation) → handler, kind`; catalog/invoke |
 | Dispatcher | Public API path → enqueue/invoke/… → Runtime / OperationRegistry |
 | Request Runtime | владелец session на REST-запрос; commit §4.10.1; bootstrap state §4.12 |
 | Domain handler | use-case домена (query/command entry); session только принимает |
@@ -2580,8 +2924,8 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 | outbox_worker | процесс отправки webhook/channel/external из outbox; §10.6 |
 | SSE | Server-Sent Events: поток событий к клиенту; §10.5 |
 | platform_events | журнал событий platform для SSE/подписок; §10.3 |
-| TransitionRunner | `fsm_core/transition_runner.py` — pipeline одного FSM-шага; §8.5 |
-| run_instance | `fsm_core/engine.py` — вход worker в FSM; §8.4 |
-| EntityStateStore | `fsm_core/state_store.py` — API state поверх db_layer; §8.9 |
-| TransitionRepository | `fsm_core/transition_repository.py` — candidates (+ params) из domain DB; §8.10 |
-| TransitionExecutor | `fsm_core/transition_executor.py` — apply через db_layer; §8.11 |
+| TransitionRunner | `fsm_platform/core/transition_runner.py` — pipeline одного FSM-шага; §8.5 |
+| run_instance | `fsm_platform/core/engine.py` — вход worker в FSM; §8.4 |
+| EntityStateStore | `fsm_platform/core/state_store.py` — API state поверх db_layer; §8.9 |
+| TransitionRepository | `fsm_platform/core/transition_repository.py` — candidates (+ params) из domain DB; §8.10 |
+| TransitionExecutor | `fsm_platform/core/transition_executor.py` — apply через db_layer; §8.11 |

@@ -6,8 +6,8 @@ import logging
 import os
 
 from domains.bootstrap import bootstrap_from_env
-from fsm_host.engines import platform_session, register_domain_engine
-from fsm_platform.db_layer import default_db_layer
+from fsm_platform.host.engines import platform_session, register_domain_engine
+from fsm_platform.core.db_layer import default_db_layer
 
 logger = logging.getLogger(__name__)
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from fsm_platform.types import GuardResult
+from fsm_platform.core.types import GuardResult
 
 from domains.courier import db_layer
 

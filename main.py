@@ -4,6 +4,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fsm_host.http.app import app  # noqa: E402
+from fsm_platform.host.http.app import app  # noqa: E402
 
 __all__ = ["app"]

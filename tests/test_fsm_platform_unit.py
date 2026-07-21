@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from fsm_platform.registry import GuardRegistry, ProcessRegistry
-from fsm_platform.types import (
+from fsm_platform.core.registry import GuardRegistry, ProcessRegistry
+from fsm_platform.core.types import (
     GuardResult,
     ProcessDef,
     normalize_effect_result,

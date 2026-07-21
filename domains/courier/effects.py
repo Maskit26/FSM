@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fsm_platform.types import EffectResult
+from fsm_platform.core.types import EffectResult
 
 from domains.courier import db_layer
 

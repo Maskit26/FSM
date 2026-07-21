@@ -16,8 +16,8 @@ logging.basicConfig(
 
 
 def main() -> None:
-    from fsm_host.boot import boot
-    from fsm_host.worker import run_loop
+    from fsm_platform.host.boot import boot
+    from fsm_platform.host.worker import run_loop
 
     boot()
     poll = float(os.environ.get("FSM_WORKER_POLL_SECONDS", "1"))

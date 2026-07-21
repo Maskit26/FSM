@@ -7,11 +7,11 @@ from typing import Any, Optional
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from fsm_host.boot import boot
-from fsm_host.http import request_runtime
-from fsm_host.operations import default_operation_registry
-from fsm_platform.domain_errors import DomainError
-from fsm_platform.registry import default_process_registry
+from fsm_platform.host.boot import boot
+from fsm_platform.host.http import request_runtime
+from fsm_platform.host.operations import default_operation_registry
+from fsm_platform.core.domain_errors import DomainError
+from fsm_platform.core.registry import default_process_registry
 
 app = FastAPI(title="FSM Platform", version="0.1.0")
 

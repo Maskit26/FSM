@@ -5,8 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from fsm_platform.db_layer import SessionLike, default_db_layer
-from fsm_platform.timers import schedule_timer as _schedule_timer
+from fsm_platform.core.db_layer import SessionLike, default_db_layer
+from fsm_platform.core.timers import schedule_timer as _schedule_timer
 
 
 def schedule_timer(

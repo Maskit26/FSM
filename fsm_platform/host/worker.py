@@ -1,7 +1,7 @@
 """
 FSM worker: claim инстанса → run_instance → dual-DB commit.
 
-SQL нет — записи в platform идут через fsm_platform.db_layer.
+SQL нет — записи в platform идут через fsm_platform.core.db_layer.
 """
 
 from __future__ import annotations
@@ -11,10 +11,10 @@ import time
 from typing import Any, Optional
 
 from fsm_platform import run_instance
-from fsm_platform.db_layer import default_db_layer
-from fsm_platform.types import FsmResult
-from fsm_host import side_effects
-from fsm_host.engines import domain_session, platform_session
+from fsm_platform.core.db_layer import default_db_layer
+from fsm_platform.core.types import FsmResult
+from fsm_platform.host import side_effects
+from fsm_platform.host.engines import domain_session, platform_session
 
 logger = logging.getLogger(__name__)
 

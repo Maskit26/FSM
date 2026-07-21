@@ -1,4 +1,4 @@
-"""Контракты между воркером, fsm_platform и доменом (без I/O)."""
+"""Контракты между воркером, fsm_platform.core и доменом (без I/O)."""
 
 from __future__ import annotations
 

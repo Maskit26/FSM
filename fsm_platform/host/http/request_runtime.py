@@ -1,6 +1,6 @@
 """HTTP request runtime: сессии, invoke и bootstrap сущности.
 
-SQL здесь нет — только вызовы fsm_platform.db_layer и владение сессиями.
+SQL здесь нет — только вызовы fsm_platform.core.db_layer и владение сессиями.
 """
 
 from __future__ import annotations
@@ -8,8 +8,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
-from fsm_platform.db_layer import default_db_layer
-from fsm_host.engines import domain_session, platform_session
+from fsm_platform.core.db_layer import default_db_layer
+from fsm_platform.host.engines import domain_session, platform_session
 
 logger = logging.getLogger(__name__)
 

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from fsm_platform import ProcessDef
-from fsm_platform.registry import (
+from fsm_platform.core.registry import (
     default_effect_registry,
     default_guard_registry,
     default_process_registry,
 )
-from fsm_host.operations import default_operation_registry
+from fsm_platform.host.operations import default_operation_registry
 
 from domains.courier.commands import create_order, take_courier_order
 from domains.courier.context import build_order_context
