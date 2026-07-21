@@ -487,3 +487,74 @@ def list_courier_exchange(
             "total": len(pickup) + len(delivery),
         },
     }
+
+
+# Терминальные статусы заказа → «архив» для курьера
+_COURIER_ARCHIVE_STATUSES = frozenset(
+    {
+        "order_completed",
+        "order_cancelled",
+        "order_courier_failed",
+        "order_reservation_expired",
+        "order_courier1_cancelled",
+        "order_courier2_cancelled",
+    }
+)
+
+
+def _courier_order_bucket(status: str) -> str:
+    return "archive" if status in _COURIER_ARCHIVE_STATUSES else "active"
+
+
+def list_orders_for_courier(
+    session: Session,
+    courier_user_id: int,
+    *,
+    status_filter: str = "all",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """
+    Заказы, уже взятые курьером (stage_orders.courier_user_id).
+    status_filter: active | archive | all — для вкладок на фронте.
+    """
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                o.id AS order_id,
+                o.status,
+                o.description,
+                o.parcel_type,
+                o.from_address,
+                o.to_address,
+                o.pickup_type,
+                o.delivery_type,
+                o.source_cell_id,
+                o.dest_cell_id,
+                o.created_at,
+                o.updated_at,
+                so.leg
+            FROM orders o
+            JOIN stage_orders so ON so.order_id = o.id
+            WHERE so.courier_user_id = :courier_id
+            ORDER BY o.updated_at DESC, o.id DESC
+            LIMIT :lim
+            """
+        ),
+        {"courier_id": courier_user_id, "lim": limit},
+    ).mappings().all()
+
+    filt = (status_filter or "all").strip().lower()
+    if filt not in ("active", "archive", "all"):
+        raise ValueError("filter must be active|archive|all")
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        status = str(item.get("status") or "")
+        bucket = _courier_order_bucket(status)
+        item["bucket"] = bucket
+        if filt != "all" and bucket != filt:
+            continue
+        out.append(item)
+    return out

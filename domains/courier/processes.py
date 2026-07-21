@@ -14,7 +14,11 @@ from domains.courier.commands import create_order, take_courier_order
 from domains.courier.context import build_order_context
 from domains.courier.effects import assign_courier1_effect
 from domains.courier.guards import can_assign_courier1
-from domains.courier.queries import list_client_orders, list_courier_exchange
+from domains.courier.queries import (
+    list_client_orders,
+    list_courier_exchange,
+    list_courier_orders,
+)
 
 
 def register_all(service_id: str) -> None:
@@ -33,6 +37,9 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "list_courier_exchange", "query", list_courier_exchange
+    )
+    default_operation_registry.register(
+        service_id, "list_courier_orders", "query", list_courier_orders
     )
 
     default_process_registry.register(

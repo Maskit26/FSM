@@ -59,3 +59,40 @@ def list_courier_exchange(
             "orders": exchange["all"],
         }
     }
+
+
+def list_courier_orders(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Заказы, которые курьер уже взял с биржи (по stage_orders).
+    params.filter: active | archive | all (по умолчанию all); на фронте — вкладки.
+    """
+    try:
+        courier_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not courier_id:
+        raise ValueError("actor.actor_id required")
+
+    user = db_layer.get_user(domain_session, courier_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"User {courier_id} not found")
+    if str(user.get("role_name") or "") != "courier":
+        raise DomainError("NOT_A_COURIER", "User is not a courier")
+
+    status_filter = str(params.get("filter") or "all").strip().lower()
+    limit = int(params.get("limit") or 50)
+    orders = db_layer.list_orders_for_courier(
+        domain_session,
+        courier_id,
+        status_filter=status_filter,
+        limit=limit,
+    )
+    return {
+        "data": {
+            "courier_id": courier_id,
+            "filter": status_filter,
+            "orders": orders,
+        }
+    }
