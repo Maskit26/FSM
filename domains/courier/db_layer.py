@@ -391,6 +391,24 @@ def get_stage_courier(
     return int(row[0])
 
 
+def get_stage_row(
+    session: Session, order_id: int, leg: str
+) -> Optional[dict[str, Any]]:
+    """Строка stage_orders для плеча (courier / driver reserve / trip)."""
+    row = session.execute(
+        text(
+            """
+            SELECT order_id, leg, trip_id, direction_id, courier_user_id,
+                   reservation_id, reserved_by_driver_id
+            FROM stage_orders
+            WHERE order_id = :oid AND leg = :leg
+            """
+        ),
+        {"oid": order_id, "leg": leg},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
 def clear_stage_courier(
     session: Session,
     order_id: int,
@@ -1070,3 +1088,353 @@ def bind_order_to_direction(session: Session, order_id: int) -> tuple[int, str]:
         delivery_locker_id,
     )
     return direction_id, ""
+
+
+def get_direction(session: Session, direction_id: int) -> Optional[dict[str, Any]]:
+    """Читает направление по id."""
+    row = session.execute(
+        text(
+            """
+            SELECT id, from_city, to_city, pickup_locker_id, delivery_locker_id,
+                   orders_available, orders_reserved
+            FROM directions
+            WHERE id = :id
+            """
+        ),
+        {"id": direction_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def list_directions_for_driver_exchange(
+    session: Session, city: str
+) -> list[dict[str, Any]]:
+    """Биржа водителя: направления из города с orders_available > 0."""
+    rows = session.execute(
+        text(
+            """
+            SELECT id, from_city, to_city, pickup_locker_id, delivery_locker_id,
+                   orders_available, orders_reserved
+            FROM directions
+            WHERE from_city = :city
+              AND orders_available > 0
+            ORDER BY id ASC
+            """
+        ),
+        {"city": city},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def reserve_orders_for_direction(
+    session: Session,
+    direction_id: int,
+    driver_user_id: int,
+    capacity: int,
+) -> tuple[int, int, datetime]:
+    """
+    Резерв до capacity заказов за водителем (как old reserve_orders_for_direction).
+    Returns (reservation_id, reserved_count, expires_at).
+    Raises ValueError with code-like message on business failure.
+    """
+    if capacity <= 0:
+        raise ValueError("INVALID_CAPACITY")
+
+    active_slots = session.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM driver_reservations
+            WHERE driver_user_id = :driver_user_id
+              AND direction_id = :direction_id
+              AND status IN ('reservation_active', 'reservation_loading')
+            """
+        ),
+        {"driver_user_id": driver_user_id, "direction_id": direction_id},
+    ).scalar()
+    if int(active_slots or 0) >= 3:
+        raise ValueError("LIMIT_EXCEEDED")
+
+    available = session.execute(
+        text(
+            """
+            SELECT COUNT(DISTINCT so.order_id)
+            FROM stage_orders so
+            WHERE so.direction_id = :direction_id
+              AND so.leg = 'pickup'
+              AND so.reserved_by_driver_id IS NULL
+              AND so.trip_id IS NULL
+            """
+        ),
+        {"direction_id": direction_id},
+    ).scalar()
+    if int(available or 0) == 0:
+        raise ValueError("NO_AVAILABLE_ORDERS")
+
+    expires_at = datetime.utcnow() + timedelta(minutes=30)
+    session.execute(
+        text(
+            """
+            INSERT INTO driver_reservations (
+                driver_user_id, direction_id, reserved_count,
+                requested_count, expires_at, status
+            ) VALUES (
+                :driver_user_id, :direction_id, 0,
+                :requested_count, :expires_at, 'reservation_active'
+            )
+            """
+        ),
+        {
+            "driver_user_id": driver_user_id,
+            "direction_id": direction_id,
+            "requested_count": capacity,
+            "expires_at": expires_at,
+        },
+    )
+    reservation_id = int(session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one())
+
+    order_rows = session.execute(
+        text(
+            f"""
+            SELECT DISTINCT so.order_id
+            FROM stage_orders so
+            WHERE so.direction_id = :direction_id
+              AND so.leg IN ('pickup', 'delivery')
+              AND so.reserved_by_driver_id IS NULL
+              AND so.trip_id IS NULL
+            ORDER BY so.order_id ASC
+            LIMIT {int(capacity)}
+            """
+        ),
+        {"direction_id": direction_id},
+    ).fetchall()
+    if not order_rows:
+        raise ValueError("RESERVATION_FAILED")
+
+    order_ids = [int(r[0]) for r in order_rows]
+    reserved_count = len(order_ids)
+    placeholders = ", ".join(f":order_{i}" for i in range(len(order_ids)))
+    params: dict[str, Any] = {
+        f"order_{i}": oid for i, oid in enumerate(order_ids)
+    }
+    params["driver_user_id"] = driver_user_id
+    params["reservation_id"] = reservation_id
+    params["direction_id"] = direction_id
+
+    session.execute(
+        text(
+            f"""
+            UPDATE stage_orders
+            SET reserved_by_driver_id = :driver_user_id,
+                reservation_id = :reservation_id
+            WHERE direction_id = :direction_id
+              AND order_id IN ({placeholders})
+              AND leg IN ('pickup', 'delivery')
+            """
+        ),
+        params,
+    )
+    session.execute(
+        text(
+            """
+            UPDATE driver_reservations
+            SET reserved_count = :count
+            WHERE id = :reservation_id
+            """
+        ),
+        {"count": reserved_count, "reservation_id": reservation_id},
+    )
+    recalculate_direction_counters(session, direction_id)
+    return reservation_id, reserved_count, expires_at
+
+
+def get_driver_reservation(
+    session: Session, reservation_id: int
+) -> Optional[dict[str, Any]]:
+    row = session.execute(
+        text(
+            """
+            SELECT id, driver_user_id, direction_id, reserved_count, requested_count,
+                   reserved_at, expires_at, status
+            FROM driver_reservations
+            WHERE id = :id
+            """
+        ),
+        {"id": reservation_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def start_driver_reservation_loading(
+    session: Session, reservation_id: int, driver_user_id: int
+) -> bool:
+    """reservation_active → reservation_loading (sync, без call_fsm_action)."""
+    result = session.execute(
+        text(
+            """
+            UPDATE driver_reservations
+            SET status = 'reservation_loading'
+            WHERE id = :id
+              AND driver_user_id = :driver_user_id
+              AND status = 'reservation_active'
+            """
+        ),
+        {"id": reservation_id, "driver_user_id": driver_user_id},
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def set_reservation_status(
+    session: Session, reservation_id: int, status: str
+) -> bool:
+    """Пишет driver_reservations.status (зеркало entity_fsm_state)."""
+    result = session.execute(
+        text(
+            """
+            UPDATE driver_reservations
+            SET status = :status
+            WHERE id = :id
+            """
+        ),
+        {"id": reservation_id, "status": status},
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def get_driver_loading_reservations(
+    session: Session, direction_id: int, driver_user_id: int
+) -> list[int]:
+    """Активные резервы водителя на направлении (active|loading)."""
+    rows = session.execute(
+        text(
+            """
+            SELECT id
+            FROM driver_reservations
+            WHERE direction_id = :direction_id
+              AND driver_user_id = :driver_user_id
+              AND status IN ('reservation_active', 'reservation_loading')
+            ORDER BY id ASC
+            """
+        ),
+        {"direction_id": direction_id, "driver_user_id": driver_user_id},
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def list_open_cells_for_driver_direction(
+    session: Session, direction_id: int, driver_user_id: int
+) -> list[int]:
+    """Ячейки pickup-заказов водителя в статусе locker_opened."""
+    rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT o.source_cell_id
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            JOIN locker_cells lc ON lc.id = o.source_cell_id
+            WHERE so.direction_id = :direction_id
+              AND so.leg = 'pickup'
+              AND so.reserved_by_driver_id = :driver_user_id
+              AND so.trip_id IS NULL
+              AND lc.status = 'locker_opened'
+            """
+        ),
+        {"direction_id": direction_id, "driver_user_id": driver_user_id},
+    ).fetchall()
+    return [int(r[0]) for r in rows if r[0] is not None]
+
+
+def get_picked_orders_by_driver_and_direction(
+    session: Session, direction_id: int, driver_user_id: int
+) -> list[int]:
+    """Заказы, которые водитель забрал (status after close pickup)."""
+    rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT so.order_id
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            WHERE so.direction_id = :direction_id
+              AND so.leg = 'pickup'
+              AND so.reserved_by_driver_id = :driver_user_id
+              AND so.trip_id IS NULL
+              AND o.status = 'order_picked_up_from_post1'
+            """
+        ),
+        {"direction_id": direction_id, "driver_user_id": driver_user_id},
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def release_unpicked_orders_by_driver_and_direction(
+    session: Session,
+    direction_id: int,
+    driver_user_id: int,
+    picked_order_ids: list[int],
+) -> int:
+    """Снять резерв с незабранных заказов, вернуть в пул направления."""
+    reserved = session.execute(
+        text(
+            """
+            SELECT DISTINCT so.order_id
+            FROM stage_orders so
+            WHERE so.direction_id = :direction_id
+              AND so.reserved_by_driver_id = :driver_user_id
+              AND so.leg = 'pickup'
+              AND so.trip_id IS NULL
+            """
+        ),
+        {"direction_id": direction_id, "driver_user_id": driver_user_id},
+    ).fetchall()
+    reserved_ids = [int(r[0]) for r in reserved]
+    picked = set(int(x) for x in picked_order_ids)
+    to_release = [oid for oid in reserved_ids if oid not in picked]
+    if not to_release:
+        return 0
+
+    placeholders = ", ".join(f":oid_{i}" for i in range(len(to_release)))
+    params: dict[str, Any] = {f"oid_{i}": oid for i, oid in enumerate(to_release)}
+    params["direction_id"] = direction_id
+    params["driver_user_id"] = driver_user_id
+    result = session.execute(
+        text(
+            f"""
+            UPDATE stage_orders
+            SET reserved_by_driver_id = NULL,
+                reservation_id = NULL
+            WHERE direction_id = :direction_id
+              AND reserved_by_driver_id = :driver_user_id
+              AND order_id IN ({placeholders})
+              AND leg IN ('pickup', 'delivery')
+            """
+        ),
+        params,
+    )
+    recalculate_direction_counters(session, direction_id)
+    return int(result.rowcount or 0)
+
+
+def complete_driver_reservations_loading(
+    session: Session, reservation_ids: list[int], driver_user_id: int
+) -> int:
+    """reservation_loading|active → reservation_completed для списка резервов."""
+    if not reservation_ids:
+        return 0
+    placeholders = ", ".join(f":rid_{i}" for i in range(len(reservation_ids)))
+    params: dict[str, Any] = {
+        f"rid_{i}": rid for i, rid in enumerate(reservation_ids)
+    }
+    params["driver_user_id"] = driver_user_id
+    result = session.execute(
+        text(
+            f"""
+            UPDATE driver_reservations
+            SET status = 'reservation_completed'
+            WHERE id IN ({placeholders})
+              AND driver_user_id = :driver_user_id
+              AND status IN ('reservation_active', 'reservation_loading')
+            """
+        ),
+        params,
+    )
+    return int(result.rowcount or 0)

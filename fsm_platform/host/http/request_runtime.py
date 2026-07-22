@@ -103,6 +103,46 @@ def _bootstrap_and_maybe_enqueue(
                 sp, service_id, str(r_type), r_id_int, str(r_initial)
             )
 
+    enqueues = result.get("enqueues")
+    if isinstance(enqueues, list) and enqueues:
+        instance_ids: list[int] = []
+        for item in enqueues:
+            if not isinstance(item, dict):
+                raise ValueError("enqueues items must be objects")
+            process_name = item.get("process_name")
+            if not process_name:
+                raise ValueError("enqueues[].process_name required")
+            e_type = str(item.get("entity_type") or entity_type)
+            e_id = int(item["entity_id"]) if item.get("entity_id") is not None else entity_id
+            e_initial = item.get("initial_state")
+            e_existing = default_db_layer.get_entity_state(
+                sp, service_id, e_type, e_id
+            )
+            if e_existing is None:
+                if not e_initial:
+                    raise ValueError(
+                        "enqueues[].initial_state required when "
+                        "entity_fsm_state is missing"
+                    )
+                default_db_layer.insert_entity_state_initial(
+                    sp, service_id, e_type, e_id, str(e_initial)
+                )
+            instance_ids.append(
+                default_db_layer.insert_fsm_instance(
+                    sp,
+                    service_id=service_id,
+                    process_name=str(process_name),
+                    entity_type=e_type,
+                    entity_id=e_id,
+                    payload=item.get("payload") or {},
+                    actor_id=_actor_id_from_actor(actor),
+                )
+            )
+        result["instance_ids"] = instance_ids
+        if instance_ids:
+            result["instance_id"] = instance_ids[0]
+        return
+
     enqueue = result.get("enqueue") or {}
     process_name = enqueue.get("process_name")
     if not process_name:

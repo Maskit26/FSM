@@ -181,6 +181,15 @@ def _match_locker_actor_edge(
                 ok=False,
                 reason=f"NOT_STAGE_OWNER:{stage_cid}!={actor_id}",
             )
+    elif stage_must_be == "driver_reserved":
+        reserved_by = ctx.get("reserved_by_driver_id")
+        if reserved_by is None:
+            return GuardResult(ok=False, reason="NOT_DRIVER_RESERVED")
+        if int(reserved_by) != int(actor_id):
+            return GuardResult(
+                ok=False,
+                reason=f"NOT_RESERVED_DRIVER:{reserved_by}!={actor_id}",
+            )
     elif stage_must_be not in ("", "any", "none"):
         return GuardResult(ok=False, reason=f"UNKNOWN_STAGE_RULE:{stage_must_be}")
 
@@ -297,6 +306,18 @@ _LOCKER_ACCESS_CODE_RULES: list[dict[str, Any]] = [
         ],
     },
     {
+        "leg": "pickup",
+        "user_role": "driver",
+        "stage_must_be": "driver_reserved",
+        "require_city": False,
+        "require_cell": True,
+        "require_pin": False,
+        "allowed_statuses": [
+            "order_parcel_confirmed",
+            "order_parcel_submitted",
+        ],
+    },
+    {
         "leg": "delivery",
         "user_role": "courier",
         "type_field": "delivery_type",
@@ -363,3 +384,54 @@ def can_request_locker_access_code(
         elif other is None:
             other = result
     return role_hit or other or GuardResult(ok=False, reason="NO_ACCESS_RULE_MATCHED")
+
+
+def can_start_loading(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """start_loading: driver владеет резервом в reservation_active."""
+    _ = db
+    _ = session_domain
+    _ = instance
+    return _match_reservation_edge(context, guard_params)
+
+
+def can_complete_loading(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """complete_loading: driver владеет резервом в reservation_loading."""
+    _ = db
+    _ = session_domain
+    _ = instance
+    return _match_reservation_edge(context, guard_params)
+
+
+def _match_reservation_edge(context, guard_params) -> GuardResult:
+    ctx = context or {}
+    params = guard_params or {}
+
+    actor_id = ctx.get("executor_id")
+    if not actor_id:
+        return GuardResult(ok=False, reason="ACTOR_ID_REQUIRED")
+
+    user = ctx.get("executor")
+    if user is None:
+        return GuardResult(ok=False, reason="USER_NOT_FOUND")
+
+    expected_role = params.get("user_role") or "driver"
+    if str(user.get("role_name") or "") != str(expected_role):
+        return GuardResult(ok=False, reason=f"ROLE_MISMATCH:{user.get('role_name')}")
+
+    reservation = ctx.get("reservation")
+    if reservation is None:
+        return GuardResult(ok=False, reason="RESERVATION_NOT_FOUND")
+
+    if int(reservation.get("driver_user_id") or 0) != int(actor_id):
+        return GuardResult(ok=False, reason="NOT_RESERVATION_OWNER")
+
+    required_status = params.get("required_status")
+    status = str(reservation.get("status") or "")
+    if required_status and status != str(required_status):
+        return GuardResult(ok=False, reason=f"INVALID_RESERVATION_STATUS:{status}")
+
+    return GuardResult(ok=True)

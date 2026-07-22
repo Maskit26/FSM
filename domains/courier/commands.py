@@ -464,3 +464,227 @@ def request_locker_access_code(
             "pin": pin,
         }
     }
+
+
+def reserve_direction_slot(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Водитель резервирует до capacity заказов из направления
+    (old direction_reserve_slot / reserve_orders_for_direction).
+    Sync: создаёт driver_reservations, без enqueue FSM.
+    params: direction_id, capacity.
+    """
+    try:
+        driver_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not driver_id:
+        raise ValueError("actor.actor_id required")
+
+    user = db_layer.get_user(domain_session, driver_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
+    if str(user.get("role_name") or "") != "driver":
+        raise DomainError("ROLE_NOT_ALLOWED", "only driver can reserve direction slot")
+
+    direction_id = int(params.get("direction_id") or params.get("entity_id") or 0)
+    if not direction_id:
+        raise ValueError("direction_id required")
+    try:
+        capacity = int(params.get("capacity") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("capacity required") from exc
+    if capacity <= 0:
+        raise DomainError("INVALID_CAPACITY", "capacity must be > 0")
+
+    direction = db_layer.get_direction(domain_session, direction_id)
+    if direction is None:
+        raise DomainError("DIRECTION_NOT_FOUND", f"direction {direction_id} not found")
+
+    driver_city = str(user.get("city") or "").strip()
+    from_city = str(direction.get("from_city") or "").strip()
+    if driver_city and from_city and driver_city != from_city:
+        raise DomainError(
+            "CITY_MISMATCH",
+            f"{driver_city}->{from_city}",
+        )
+
+    try:
+        reservation_id, reserved_count, expires_at = (
+            db_layer.reserve_orders_for_direction(
+                domain_session, direction_id, driver_id, capacity
+            )
+        )
+    except ValueError as exc:
+        code = str(exc)
+        raise DomainError(code, code) from exc
+
+    return {
+        "entity_type": "driver_reservations",
+        "entity_id": reservation_id,
+        "initial_state": "reservation_active",
+        "data": {
+            "reservation_id": reservation_id,
+            "direction_id": direction_id,
+            "driver_user_id": driver_id,
+            "requested_count": capacity,
+            "reserved_count": reserved_count,
+            "expires_at": expires_at.isoformat() + "Z",
+            "status": "reservation_active",
+        },
+    }
+
+
+def start_loading(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Водитель начинает погрузку: enqueue FSM start_loading на driver_reservations.
+    params: reservation_id.
+    """
+    try:
+        driver_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not driver_id:
+        raise ValueError("actor.actor_id required")
+
+    user = db_layer.get_user(domain_session, driver_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
+    if str(user.get("role_name") or "") != "driver":
+        raise DomainError("ROLE_NOT_ALLOWED", "only driver can start loading")
+
+    reservation_id = int(
+        params.get("reservation_id") or params.get("entity_id") or 0
+    )
+    if not reservation_id:
+        raise ValueError("reservation_id required")
+
+    reservation = db_layer.get_driver_reservation(domain_session, reservation_id)
+    if reservation is None:
+        raise DomainError("RESERVATION_NOT_FOUND", f"reservation {reservation_id}")
+    if int(reservation["driver_user_id"]) != driver_id:
+        raise DomainError("NOT_RESERVATION_OWNER", "reservation belongs to another driver")
+    if str(reservation.get("status") or "") != "reservation_active":
+        raise DomainError(
+            "INVALID_RESERVATION_STATUS",
+            f"status={reservation.get('status')}",
+        )
+
+    return {
+        "entity_type": "driver_reservations",
+        "entity_id": reservation_id,
+        "initial_state": "reservation_active",
+        "enqueue": {
+            "process_name": "start_loading",
+            "payload": {
+                "direction_id": int(reservation["direction_id"]),
+                "executor_user_id": driver_id,
+                "driver_user_id": driver_id,
+                "source": "start_loading",
+            },
+        },
+        "data": {
+            "reservation_id": reservation_id,
+            "direction_id": int(reservation["direction_id"]),
+            "driver_user_id": driver_id,
+            "status": "pending_fsm",
+        },
+    }
+
+
+def complete_loading(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Завершить погрузку по направлению: проверки + release unpicked sync,
+    затем enqueues[] complete_loading на каждый резерв (FSM + логи).
+    params: direction_id.
+    """
+    try:
+        driver_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not driver_id:
+        raise ValueError("actor.actor_id required")
+
+    user = db_layer.get_user(domain_session, driver_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
+    if str(user.get("role_name") or "") != "driver":
+        raise DomainError("ROLE_NOT_ALLOWED", "only driver can complete loading")
+
+    direction_id = int(params.get("direction_id") or params.get("entity_id") or 0)
+    if not direction_id:
+        raise ValueError("direction_id required")
+
+    direction = db_layer.get_direction(domain_session, direction_id)
+    if direction is None:
+        raise DomainError("DIRECTION_NOT_FOUND", f"direction {direction_id}")
+
+    open_cells = db_layer.list_open_cells_for_driver_direction(
+        domain_session, direction_id, driver_id
+    )
+    if open_cells:
+        raise DomainError(
+            "OPEN_CELLS_DETECTED",
+            f"cells still open: {open_cells}",
+        )
+
+    reservation_ids = db_layer.get_driver_loading_reservations(
+        domain_session, direction_id, driver_id
+    )
+    # complete FSM edge is from reservation_loading only
+    loading_ids = [
+        rid
+        for rid in reservation_ids
+        if str(
+            (db_layer.get_driver_reservation(domain_session, rid) or {}).get("status")
+            or ""
+        )
+        == "reservation_loading"
+    ]
+    if not loading_ids:
+        raise DomainError(
+            "NO_LOADING_RESERVATIONS",
+            "no reservations in reservation_loading",
+        )
+
+    picked = db_layer.get_picked_orders_by_driver_and_direction(
+        domain_session, direction_id, driver_id
+    )
+    if not picked:
+        raise DomainError("NO_PICKED_ORDERS", "no orders picked up from post1")
+
+    released = db_layer.release_unpicked_orders_by_driver_and_direction(
+        domain_session, direction_id, driver_id, picked
+    )
+
+    return {
+        "entity_type": "driver_reservations",
+        "entity_id": loading_ids[0],
+        "enqueues": [
+            {
+                "entity_type": "driver_reservations",
+                "entity_id": rid,
+                "process_name": "complete_loading",
+                "payload": {
+                    "direction_id": direction_id,
+                    "executor_user_id": driver_id,
+                    "driver_user_id": driver_id,
+                    "source": "complete_loading",
+                },
+            }
+            for rid in loading_ids
+        ],
+        "data": {
+            "direction_id": direction_id,
+            "driver_user_id": driver_id,
+            "reservation_ids": loading_ids,
+            "picked_order_ids": picked,
+            "released_rows": released,
+            "status": "pending_fsm",
+        },
+    }

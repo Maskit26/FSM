@@ -222,3 +222,33 @@ def sync_locker_cell_status(
         ok=True,
         payload={"cell_id": int(cell_id), "cell_status": str(to_state)},
     )
+
+
+def sync_reservation_status(
+    session_domain, db, context, instance, effect_params
+) -> EffectResult:
+    """Зеркало driver_reservations.status = to_state после FSM apply."""
+    _ = db
+    ctx = context or {}
+    params = effect_params or {}
+    reservation_id = int(
+        ctx.get("applied_entity_id")
+        or ctx.get("reservation_id")
+        or instance["entity_id"]
+    )
+    to_state = ctx.get("to_state") or params.get("to_state")
+    if not to_state:
+        return EffectResult(ok=False, error="TO_STATE_REQUIRED")
+    ok = db_layer.set_reservation_status(
+        session_domain, reservation_id, str(to_state)
+    )
+    if not ok:
+        return EffectResult(ok=False, error="SYNC_RESERVATION_STATUS_FAILED")
+    return EffectResult(
+        ok=True,
+        payload={
+            "reservation_id": reservation_id,
+            "status": str(to_state),
+            "direction_id": ctx.get("direction_id"),
+        },
+    )

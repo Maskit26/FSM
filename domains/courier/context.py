@@ -69,6 +69,18 @@ def build_order_context(session_domain, db, runtime_ctx, instance) -> dict[str, 
         if leg in ("pickup", "delivery")
         else None
     )
+    stage = (
+        db_layer.get_stage_row(session_domain, order_id, leg)
+        if leg in ("pickup", "delivery")
+        else None
+    )
+    reserved_by_driver_id = None
+    reservation_id = None
+    if stage is not None:
+        if stage.get("reserved_by_driver_id") is not None:
+            reserved_by_driver_id = int(stage["reserved_by_driver_id"])
+        if stage.get("reservation_id") is not None:
+            reservation_id = int(stage["reservation_id"])
     cell_status = (
         db_layer.get_cell_status(session_domain, int(cell_id)) if cell_id else None
     )
@@ -87,7 +99,44 @@ def build_order_context(session_domain, db, runtime_ctx, instance) -> dict[str, 
         "cell_status": cell_status,
         "locker_city": locker_city,
         "stage_courier_id": stage_courier_id,
+        "stage": stage,
+        "reserved_by_driver_id": reserved_by_driver_id,
+        "reservation_id": reservation_id,
         "pin": pin,
+        "runtime_ctx": runtime_ctx,
+    }
+
+
+def build_reservation_context(session_domain, db, runtime_ctx, instance) -> dict[str, Any]:
+    """Context для процессов driver_reservations (start/complete loading)."""
+    _ = db
+    reservation_id = int(instance["entity_id"])
+    payload = _payload_dict(instance)
+
+    executor_raw = (
+        payload.get("executor_user_id")
+        or payload.get("driver_user_id")
+        or instance.get("actor_id")
+    )
+    executor_id: Optional[int] = None
+    if executor_raw is not None and str(executor_raw).strip() != "":
+        executor_id = int(executor_raw)
+
+    reservation = db_layer.get_driver_reservation(session_domain, reservation_id)
+    executor = (
+        db_layer.get_user(session_domain, executor_id) if executor_id else None
+    )
+    direction_id = None
+    if reservation is not None and reservation.get("direction_id") is not None:
+        direction_id = int(reservation["direction_id"])
+
+    return {
+        "reservation": reservation,
+        "reservation_id": reservation_id,
+        "direction_id": direction_id,
+        "payload": payload,
+        "executor_id": executor_id,
+        "executor": executor,
         "runtime_ctx": runtime_ctx,
     }
 

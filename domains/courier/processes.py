@@ -14,30 +14,37 @@ from domains.courier.commands import (
     assign_executor,
     cancel_courier_order,
     close_cell,
+    complete_loading,
     create_order,
     open_cell,
     remove_executor,
     request_locker_access_code,
+    reserve_direction_slot,
+    start_loading,
     take_courier_order,
 )
-from domains.courier.context import build_order_context
+from domains.courier.context import build_order_context, build_reservation_context
 from domains.courier.effects import (
     assign_executor_effect,
     close_cell_effect,
     open_cell_effect,
     remove_executor_effect,
     sync_locker_cell_status,
+    sync_reservation_status,
 )
 from domains.courier.guards import (
     can_assign_executor,
     can_close_cell,
+    can_complete_loading,
     can_open_cell,
     can_remove_executor,
+    can_start_loading,
 )
 from domains.courier.queries import (
     list_client_orders,
     list_courier_exchange,
     list_courier_orders,
+    list_driver_exchange,
     view_locker_access_code,
 )
 
@@ -76,6 +83,15 @@ def register_all(service_id: str) -> None:
         request_locker_access_code,
     )
     default_operation_registry.register(
+        service_id, "reserve_direction_slot", "command", reserve_direction_slot
+    )
+    default_operation_registry.register(
+        service_id, "start_loading", "command", start_loading
+    )
+    default_operation_registry.register(
+        service_id, "complete_loading", "command", complete_loading
+    )
+    default_operation_registry.register(
         service_id, "list_client_orders", "query", list_client_orders
     )
     default_operation_registry.register(
@@ -83,6 +99,9 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "list_courier_orders", "query", list_courier_orders
+    )
+    default_operation_registry.register(
+        service_id, "list_driver_exchange", "query", list_driver_exchange
     )
     default_operation_registry.register(
         service_id, "view_locker_access_code", "query", view_locker_access_code
@@ -128,6 +147,26 @@ def register_all(service_id: str) -> None:
             initial_state="order_created",
         )
     )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
+            process_name="start_loading",
+            entity_type="driver_reservations",
+            event_name="start_loading",
+            context_builder=build_reservation_context,
+            initial_state="reservation_active",
+        )
+    )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
+            process_name="complete_loading",
+            entity_type="driver_reservations",
+            event_name="complete_loading",
+            context_builder=build_reservation_context,
+            initial_state="reservation_active",
+        )
+    )
 
     default_guard_registry.register(
         service_id, "can_assign_executor", can_assign_executor
@@ -137,6 +176,12 @@ def register_all(service_id: str) -> None:
     )
     default_guard_registry.register(service_id, "can_open_cell", can_open_cell)
     default_guard_registry.register(service_id, "can_close_cell", can_close_cell)
+    default_guard_registry.register(
+        service_id, "can_start_loading", can_start_loading
+    )
+    default_guard_registry.register(
+        service_id, "can_complete_loading", can_complete_loading
+    )
     default_effect_registry.register(
         service_id, "assign_executor_effect", assign_executor_effect
     )
@@ -151,5 +196,8 @@ def register_all(service_id: str) -> None:
     )
     default_effect_registry.register(
         service_id, "sync_locker_cell_status", sync_locker_cell_status
+    )
+    default_effect_registry.register(
+        service_id, "sync_reservation_status", sync_reservation_status
     )
 

@@ -148,3 +148,37 @@ def view_locker_access_code(
             "pin": pin,
         }
     }
+
+
+def list_driver_exchange(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Биржа водителя: направления из города водителя с свободными заказами.
+    """
+    _ = params
+    try:
+        driver_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not driver_id:
+        raise ValueError("actor.actor_id required")
+
+    user = db_layer.get_user(domain_session, driver_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"User {driver_id} not found")
+    if str(user.get("role_name") or "") != "driver":
+        raise DomainError("NOT_A_DRIVER", "User is not a driver")
+
+    city = str(user.get("city") or "").strip()
+    if not city:
+        raise DomainError("DRIVER_CITY_REQUIRED", "У водителя не указан город")
+
+    directions = db_layer.list_directions_for_driver_exchange(domain_session, city)
+    return {
+        "data": {
+            "driver_id": driver_id,
+            "city": city,
+            "directions": directions,
+        }
+    }
