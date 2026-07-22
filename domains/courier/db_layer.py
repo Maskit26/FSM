@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from typing import Any, Optional, Tuple
 
 from sqlalchemy import text
@@ -784,3 +785,115 @@ def validate_access_code(
         return False, "ACCESS_CODE_INVALID"
 
     return True, ""
+
+
+def count_recent_access_code_requests(
+    session: Session, order_id: int, leg: str, minutes: int = 15
+) -> int:
+    """Сколько токенов создано за последние minutes по order+leg."""
+    cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+    result = session.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM cell_access_tokens
+            WHERE order_id = :order_id
+              AND leg = :leg
+              AND created_at > :cutoff
+            """
+        ),
+        {"order_id": order_id, "leg": leg, "cutoff": cutoff},
+    ).scalar()
+    return int(result or 0)
+
+
+def generate_and_store_access_token(
+    session: Session,
+    order_id: int,
+    leg: str,
+    cell_id: int,
+    actor_user_id: int,
+    *,
+    expires_minutes: int = 15,
+) -> tuple[str, int, datetime]:
+    """
+    Генерирует 6-значный PIN, пишет cell_access_tokens.
+    pin_encrypted — plaintext для view (тест); сверка open_cell идёт по pin_hash.
+    """
+    session.execute(
+        text(
+            """
+            UPDATE cell_access_tokens
+            SET status = 'REVOKED'
+            WHERE order_id = :order_id
+              AND leg = :leg
+              AND actor_user_id = :actor_user_id
+              AND status = 'ACTIVE'
+            """
+        ),
+        {
+            "order_id": order_id,
+            "leg": leg,
+            "actor_user_id": actor_user_id,
+        },
+    )
+
+    pin = f"{secrets.randbelow(900000) + 100000:06d}"
+    pin_hash = hashlib.sha256(f"{pin}{order_id}{cell_id}".encode()).hexdigest()
+    expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
+
+    result = session.execute(
+        text(
+            """
+            INSERT INTO cell_access_tokens (
+                order_id, leg, cell_id, actor_user_id,
+                pin_hash, pin_encrypted, expires_at
+            ) VALUES (
+                :order_id, :leg, :cell_id, :actor_user_id,
+                :pin_hash, :pin_encrypted, :expires_at
+            )
+            """
+        ),
+        {
+            "order_id": order_id,
+            "leg": leg,
+            "cell_id": cell_id,
+            "actor_user_id": actor_user_id,
+            "pin_hash": pin_hash,
+            "pin_encrypted": pin,
+            "expires_at": expires_at,
+        },
+    )
+    token_id = int(result.lastrowid)
+    return pin, token_id, expires_at
+
+
+def get_access_token_pin(
+    session: Session, order_id: int, leg: str, user_id: int
+) -> Optional[str]:
+    """Читает plaintext PIN активного неистёкшего токена (для view / теста)."""
+    row = session.execute(
+        text(
+            """
+            SELECT pin_encrypted, expires_at, status
+            FROM cell_access_tokens
+            WHERE order_id = :order_id
+              AND leg = :leg
+              AND actor_user_id = :user_id
+              AND status = 'ACTIVE'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"order_id": order_id, "leg": leg, "user_id": user_id},
+    ).fetchone()
+    if not row:
+        return None
+    pin, expires_at, status = row
+    if str(status) != "ACTIVE":
+        return None
+    if expires_at is not None and expires_at < datetime.utcnow():
+        return None
+    if pin is None or str(pin).strip() == "":
+        return None
+    return str(pin).strip()

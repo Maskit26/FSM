@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from fsm_platform.core.types import GuardResult
 
@@ -92,33 +92,13 @@ def _match_executor_edge(
     return GuardResult(ok=True)
 
 
-def can_assign_executor(
-    session_domain, db, context, instance, guard_params
-) -> GuardResult:
-    """Назначение исполнителя: context ↔ guard_params (обычно stage_must_be=free)."""
-    _ = db
-    return _match_executor_edge(session_domain, context, instance, guard_params)
-
-
-def can_remove_executor(
-    session_domain, db, context, instance, guard_params
+def _match_locker_actor_edge(
+    session_domain, context, instance, guard_params
 ) -> GuardResult:
     """
-    Снятие исполнителя: те же ключи params, обычно stage_must_be=owned
-    и required_status=order_courier*_assigned.
+    Context ↔ params для open_cell / request|view PIN.
+    Роль, ownership, status, cell, PIN — только из context + params.
     """
-    _ = db
-    return _match_executor_edge(session_domain, context, instance, guard_params)
-
-
-def can_open_cell(
-    session_domain, db, context, instance, guard_params
-) -> GuardResult:
-    """
-    Открытие ячейки: role/leg/status/type + ownership + PIN + статус ячейки.
-    Правила на ребре (guard_params).
-    """
-    _ = db
     ctx = context or {}
     params = guard_params or {}
 
@@ -160,12 +140,14 @@ def can_open_cell(
     if order is None:
         return GuardResult(ok=False, reason="ORDER_NOT_FOUND")
 
+    allowed_statuses = params.get("allowed_statuses")
     required_status = params.get("required_status")
-    if required_status and str(order.get("status") or "") != str(required_status):
-        return GuardResult(
-            ok=False,
-            reason=f"ORDER_NOT_AVAILABLE:{order.get('status')}",
-        )
+    status = str(order.get("status") or "")
+    if allowed_statuses is not None:
+        if status not in {str(s) for s in allowed_statuses}:
+            return GuardResult(ok=False, reason=f"ORDER_NOT_AVAILABLE:{status}")
+    elif required_status and status != str(required_status):
+        return GuardResult(ok=False, reason=f"ORDER_NOT_AVAILABLE:{status}")
 
     type_field = params.get("type_field")
     type_value = params.get("type_value")
@@ -202,18 +184,15 @@ def can_open_cell(
     elif stage_must_be not in ("", "any", "none"):
         return GuardResult(ok=False, reason=f"UNKNOWN_STAGE_RULE:{stage_must_be}")
 
-    allowed = params.get("allowed_cell_statuses")
-    if allowed is None:
-        allowed = ["locker_reserved", "locker_occupied"]
-    if allowed:
-        cell_status = ctx.get("cell_status")
-        if cell_status not in set(allowed):
+    allowed_cells = params.get("allowed_cell_statuses")
+    if allowed_cells is not None:
+        if ctx.get("cell_status") not in set(allowed_cells):
             return GuardResult(
                 ok=False,
-                reason=f"CELL_STATUS:{cell_status}",
+                reason=f"CELL_STATUS:{ctx.get('cell_status')}",
             )
 
-    if params.get("require_pin", True):
+    if params.get("require_pin", False):
         pin = ctx.get("pin")
         if not pin:
             return GuardResult(ok=False, reason="MISSING_PIN")
@@ -229,3 +208,132 @@ def can_open_cell(
             return GuardResult(ok=False, reason=err or "INVALID_ACCESS_CODE")
 
     return GuardResult(ok=True)
+
+
+def can_assign_executor(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """Назначение исполнителя: context ↔ guard_params (обычно stage_must_be=free)."""
+    _ = db
+    return _match_executor_edge(session_domain, context, instance, guard_params)
+
+
+def can_remove_executor(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """
+    Снятие исполнителя: те же ключи params, обычно stage_must_be=owned
+    и required_status=order_courier*_assigned.
+    """
+    _ = db
+    return _match_executor_edge(session_domain, context, instance, guard_params)
+
+
+def can_open_cell(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """Открытие ячейки: params с ребра (+ PIN / cell status по умолчанию)."""
+    _ = db
+    params = dict(guard_params or {})
+    if "require_pin" not in params:
+        params["require_pin"] = True
+    if "allowed_cell_statuses" not in params:
+        params["allowed_cell_statuses"] = ["locker_reserved", "locker_occupied"]
+    if "stage_must_be" not in params:
+        params["stage_must_be"] = "none"
+    return _match_locker_actor_edge(session_domain, context, instance, params)
+
+
+# Декларативные правила выдачи/просмотра PIN (аналог рёбер графа для sync-ops).
+_LOCKER_ACCESS_CODE_RULES: list[dict[str, Any]] = [
+    {
+        "leg": "pickup",
+        "user_role": "client",
+        "actor_field": "client_user_id",
+        "type_field": "pickup_type",
+        "type_value": "self",
+        "stage_must_be": "none",
+        "require_city": True,
+        "require_cell": True,
+        "require_pin": False,
+        "allowed_statuses": [
+            "order_created",
+            "order_courier1_assigned",
+            "order_parcel_confirmed",
+        ],
+    },
+    {
+        "leg": "pickup",
+        "user_role": "courier",
+        "type_field": "pickup_type",
+        "type_value": "courier",
+        "stage_must_be": "owned",
+        "require_city": True,
+        "require_cell": True,
+        "require_pin": False,
+        "allowed_statuses": [
+            "order_created",
+            "order_courier1_assigned",
+            "order_parcel_confirmed",
+        ],
+    },
+    {
+        "leg": "delivery",
+        "user_role": "courier",
+        "type_field": "delivery_type",
+        "type_value": "courier",
+        "stage_must_be": "owned",
+        "require_city": True,
+        "require_cell": True,
+        "require_pin": False,
+        "allowed_statuses": [
+            "order_in_transit_to_post2",
+            "order_courier2_assigned",
+            "order_courier2_parcel_delivered",
+            "order_parcel_confirmed_post2",
+        ],
+    },
+    {
+        "leg": "delivery",
+        "user_role": "recipient",
+        "actor_field": "recipient_user_id",
+        "stage_must_be": "none",
+        "require_city": True,
+        "require_cell": True,
+        "require_pin": False,
+        "allowed_statuses": [
+            "order_in_transit_to_post2",
+            "order_courier2_assigned",
+            "order_courier2_parcel_delivered",
+            "order_parcel_confirmed_post2",
+        ],
+    },
+]
+
+
+def can_request_locker_access_code(
+    session_domain, db, context, instance, guard_params=None
+) -> GuardResult:
+    """
+    Выдача/просмотр PIN: первый подходящий rule по context.leg + role.
+    Без if/elif по роли в command — только context ↔ declarative rules.
+    """
+    _ = db
+    if guard_params:
+        return _match_locker_actor_edge(
+            session_domain, context, instance, guard_params
+        )
+
+    ctx = context or {}
+    leg = str(ctx.get("leg") or "").strip().lower()
+    last: Optional[GuardResult] = None
+    for rule in _LOCKER_ACCESS_CODE_RULES:
+        if rule.get("leg") and str(rule["leg"]) != leg:
+            continue
+        result = _match_locker_actor_edge(
+            session_domain, context, instance, rule
+        )
+        if result.ok:
+            return result
+        last = result
+    return last or GuardResult(ok=False, reason="NO_ACCESS_RULE_MATCHED")

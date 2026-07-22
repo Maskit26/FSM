@@ -90,3 +90,30 @@ def build_order_context(session_domain, db, runtime_ctx, instance) -> dict[str, 
         "pin": pin,
         "runtime_ctx": runtime_ctx,
     }
+
+
+def build_invoke_order_context(
+    session_domain,
+    *,
+    order_id: int,
+    actor_id: int,
+    payload: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Context для sync invoke: тот же builder, что у FSM.
+    payload — любые поля запроса (leg, pin, …); actor → executor_user_id.
+    Не привязан к конкретной операции.
+    """
+    merged: dict[str, Any] = dict(payload or {})
+    merged.setdefault("executor_user_id", actor_id)
+    merged.setdefault("courier_user_id", actor_id)
+    if not str(merged.get("leg") or "").strip():
+        merged["leg"] = "pickup"
+
+    instance: dict[str, Any] = {
+        "entity_id": order_id,
+        "actor_id": actor_id,
+        "payload_json": merged,
+    }
+    ctx = build_order_context(session_domain, None, {}, instance)
+    return ctx, instance

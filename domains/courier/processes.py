@@ -16,6 +16,7 @@ from domains.courier.commands import (
     create_order,
     open_cell,
     remove_executor,
+    request_locker_access_code,
     take_courier_order,
 )
 from domains.courier.context import build_order_context
@@ -34,6 +35,7 @@ from domains.courier.queries import (
     list_client_orders,
     list_courier_exchange,
     list_courier_orders,
+    view_locker_access_code,
 )
 
 
@@ -62,6 +64,12 @@ def register_all(service_id: str) -> None:
         service_id, "open_cell", "command", open_cell
     )
     default_operation_registry.register(
+        service_id,
+        "request_locker_access_code",
+        "command",
+        request_locker_access_code,
+    )
+    default_operation_registry.register(
         service_id, "list_client_orders", "query", list_client_orders
     )
     default_operation_registry.register(
@@ -69,6 +77,9 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "list_courier_orders", "query", list_courier_orders
+    )
+    default_operation_registry.register(
+        service_id, "view_locker_access_code", "query", view_locker_access_code
     )
 
     default_process_registry.register(

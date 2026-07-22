@@ -96,3 +96,55 @@ def list_courier_orders(
             "orders": orders,
         }
     }
+
+
+def view_locker_access_code(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    «Посмотреть PIN»: context → те же guard-rules → pin_encrypted.
+    """
+    from domains.courier.context import build_invoke_order_context
+    from domains.courier.guards import can_request_locker_access_code
+
+    try:
+        actor_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not actor_id:
+        raise ValueError("actor.actor_id required")
+
+    order_id = int(params.get("order_id") or params.get("entity_id") or 0)
+    if not order_id:
+        raise ValueError("order_id required")
+
+    leg = str(params.get("leg") or "pickup").strip().lower()
+    if leg not in ("pickup", "delivery"):
+        raise ValueError("leg must be pickup or delivery")
+
+    ctx, instance = build_invoke_order_context(
+        domain_session,
+        order_id=order_id,
+        actor_id=actor_id,
+        payload={"leg": leg},
+    )
+    gate = can_request_locker_access_code(
+        domain_session, None, ctx, instance, None
+    )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_AUTHORIZED", gate.reason or "denied")
+
+    pin = db_layer.get_access_token_pin(domain_session, order_id, leg, actor_id)
+    if not pin:
+        raise DomainError(
+            "CODE_NOT_FOUND_OR_EXPIRED",
+            "active PIN not found or expired",
+        )
+
+    return {
+        "data": {
+            "order_id": order_id,
+            "leg": leg,
+            "pin": pin,
+        }
+    }

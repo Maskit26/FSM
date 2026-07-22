@@ -332,3 +332,69 @@ def open_cell(
             "status": "pending_fsm",
         },
     }
+
+
+def request_locker_access_code(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    «Получить PIN»: context → guard-rules → INSERT cell_access_tokens.
+    """
+    from domains.courier.context import build_invoke_order_context
+    from domains.courier.guards import can_request_locker_access_code
+
+    try:
+        actor_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not actor_id:
+        raise ValueError("actor.actor_id required")
+
+    order_id = int(params.get("order_id") or params.get("entity_id") or 0)
+    if not order_id:
+        raise ValueError("order_id required")
+
+    leg = str(params.get("leg") or "pickup").strip().lower()
+    if leg not in ("pickup", "delivery"):
+        raise ValueError("leg must be pickup or delivery")
+    expires_minutes = int(params.get("expires_minutes") or 15)
+
+    ctx, instance = build_invoke_order_context(
+        domain_session,
+        order_id=order_id,
+        actor_id=actor_id,
+        payload={"leg": leg},
+    )
+    gate = can_request_locker_access_code(
+        domain_session, None, ctx, instance, None
+    )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_AUTHORIZED", gate.reason or "denied")
+
+    cell_id = int(ctx["cell_id"])
+    recent = db_layer.count_recent_access_code_requests(
+        domain_session, order_id, leg, minutes=15
+    )
+    if recent >= 3:
+        raise DomainError("TOO_MANY_CODE_REQUESTS", "too many PIN requests")
+
+    pin, token_id, expires_at = db_layer.generate_and_store_access_token(
+        domain_session,
+        order_id,
+        leg,
+        cell_id,
+        actor_id,
+        expires_minutes=expires_minutes,
+    )
+
+    return {
+        "data": {
+            "order_id": order_id,
+            "leg": leg,
+            "cell_id": cell_id,
+            "token_id": token_id,
+            "expires_at": expires_at.isoformat() + "Z",
+            "status": "issued",
+            "pin": pin,
+        }
+    }
