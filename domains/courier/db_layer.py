@@ -464,6 +464,17 @@ def get_locker_city_by_cell(session: Session, cell_id: int) -> Optional[str]:
     return str(row[0]) if row and row[0] else None
 
 
+def get_locker_id_by_cell(session: Session, cell_id: int) -> Optional[int]:
+    """locker_id постамата по id ячейки."""
+    row = session.execute(
+        text("SELECT locker_id FROM locker_cells WHERE id = :cell_id"),
+        {"cell_id": cell_id},
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
 def get_user(session: Session, user_id: int) -> Optional[dict[str, Any]]:
     """Читает пользователя (роль, город и т.д.). Нужен для биржи и авторизации актёра."""
     row = session.execute(
@@ -897,3 +908,165 @@ def get_access_token_pin(
     if pin is None or str(pin).strip() == "":
         return None
     return str(pin).strip()
+
+
+def get_or_create_direction(
+    session: Session,
+    from_city: str,
+    to_city: str,
+    pickup_locker_id: int,
+    delivery_locker_id: int,
+) -> int:
+    """Находит или создаёт directions по (cities + lockers)."""
+    existing = session.execute(
+        text(
+            """
+            SELECT id FROM directions
+            WHERE from_city = :from_city
+              AND to_city = :to_city
+              AND pickup_locker_id = :pickup_locker_id
+              AND delivery_locker_id = :delivery_locker_id
+            """
+        ),
+        {
+            "from_city": from_city,
+            "to_city": to_city,
+            "pickup_locker_id": pickup_locker_id,
+            "delivery_locker_id": delivery_locker_id,
+        },
+    ).fetchone()
+    if existing:
+        return int(existing[0])
+
+    session.execute(
+        text(
+            """
+            INSERT INTO directions (
+                from_city, to_city, pickup_locker_id, delivery_locker_id,
+                orders_reserved, orders_available
+            ) VALUES (
+                :from_city, :to_city, :pickup_locker_id, :delivery_locker_id,
+                0, 0
+            )
+            """
+        ),
+        {
+            "from_city": from_city,
+            "to_city": to_city,
+            "pickup_locker_id": pickup_locker_id,
+            "delivery_locker_id": delivery_locker_id,
+        },
+    )
+    return int(session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one())
+
+
+def recalculate_direction_counters(session: Session, direction_id: int) -> None:
+    """Пересчёт orders_available / orders_reserved из stage_orders."""
+    available = session.execute(
+        text(
+            """
+            SELECT COUNT(DISTINCT order_id)
+            FROM stage_orders
+            WHERE direction_id = :direction_id
+              AND leg = 'pickup'
+              AND reservation_id IS NULL
+              AND trip_id IS NULL
+            """
+        ),
+        {"direction_id": direction_id},
+    ).scalar()
+    reserved = session.execute(
+        text(
+            """
+            SELECT COUNT(DISTINCT order_id)
+            FROM stage_orders
+            WHERE direction_id = :direction_id
+              AND leg = 'pickup'
+              AND reservation_id IS NOT NULL
+              AND trip_id IS NULL
+            """
+        ),
+        {"direction_id": direction_id},
+    ).scalar()
+    session.execute(
+        text(
+            """
+            UPDATE directions
+            SET orders_available = :available,
+                orders_reserved = :reserved
+            WHERE id = :direction_id
+            """
+        ),
+        {
+            "available": int(available or 0),
+            "reserved": int(reserved or 0),
+            "direction_id": direction_id,
+        },
+    )
+
+
+def assign_order_to_direction(
+    session: Session,
+    order_id: int,
+    from_city: str,
+    to_city: str,
+    pickup_locker_id: int,
+    delivery_locker_id: int,
+) -> int:
+    """
+    get_or_create direction + stage_orders.direction_id на pickup/delivery.
+    Возвращает direction_id.
+    """
+    direction_id = get_or_create_direction(
+        session, from_city, to_city, pickup_locker_id, delivery_locker_id
+    )
+    session.execute(
+        text(
+            """
+            UPDATE stage_orders
+            SET direction_id = :direction_id
+            WHERE order_id = :order_id
+              AND leg IN ('pickup', 'delivery')
+            """
+        ),
+        {"direction_id": direction_id, "order_id": order_id},
+    )
+    recalculate_direction_counters(session, direction_id)
+    return direction_id
+
+
+def bind_order_to_direction(session: Session, order_id: int) -> tuple[int, str]:
+    """
+    Как старый bind_order_to_trip: после order_parcel_confirmed
+    привязать заказ к directions (создать если нет).
+    Returns (direction_id, error). error='' при успехе.
+    """
+    order = get_order(session, order_id)
+    if order is None:
+        return 0, "ORDER_NOT_FOUND"
+    if str(order.get("status") or "") != "order_parcel_confirmed":
+        return 0, "ORDER_NOT_CONFIRMED"
+
+    source_cell_id = order.get("source_cell_id")
+    dest_cell_id = order.get("dest_cell_id")
+    if not source_cell_id or not dest_cell_id:
+        return 0, "CELLS_MISSING"
+
+    pickup_locker_id = get_locker_id_by_cell(session, int(source_cell_id))
+    delivery_locker_id = get_locker_id_by_cell(session, int(dest_cell_id))
+    from_city = get_locker_city_by_cell(session, int(source_cell_id))
+    to_city = get_locker_city_by_cell(session, int(dest_cell_id))
+    if not pickup_locker_id or not delivery_locker_id:
+        return 0, "LOCKER_MISSING"
+    if not from_city or not to_city:
+        return 0, "CITY_MISSING"
+
+    direction_id = assign_order_to_direction(
+        session,
+        order_id,
+        from_city,
+        to_city,
+        pickup_locker_id,
+        delivery_locker_id,
+    )
+    return direction_id, ""

@@ -174,6 +174,31 @@ def open_cell_effect(session_domain, db, context, instance, effect_params) -> Ef
     )
 
 
+def close_cell_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
+    """
+    Primary effect close_cell: orders.status = to_state.
+    После order_parcel_confirmed (pickup confirm) — bind к directions
+    (как старый bind_order_to_trip).
+    Ячейку двигает companion locker_close_* (+ sync_locker_cell_status).
+    """
+    result = open_cell_effect(session_domain, db, context, instance, effect_params)
+    if not result.ok:
+        return result
+
+    to_state = str((result.payload or {}).get("status") or "")
+    if to_state != "order_parcel_confirmed":
+        return result
+
+    order_id = int(instance["entity_id"])
+    direction_id, err = db_layer.bind_order_to_direction(session_domain, order_id)
+    if err:
+        return EffectResult(ok=False, error=f"BIND_DIRECTION:{err}")
+
+    payload = dict(result.payload or {})
+    payload["direction_id"] = direction_id
+    return EffectResult(ok=True, payload=payload)
+
+
 def sync_locker_cell_status(
     session_domain, db, context, instance, effect_params
 ) -> EffectResult:

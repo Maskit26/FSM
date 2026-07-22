@@ -334,6 +334,72 @@ def open_cell(
     }
 
 
+def close_cell(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Закрытие ячейки (как старый close_cell).
+    params: order_id, leg. PIN не нужен.
+    Цепочку (client / courier pickup|delivery) выбирают guards.
+    """
+    try:
+        actor_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not actor_id:
+        raise ValueError("actor.actor_id required")
+
+    entity_type = str(params.get("entity_type") or "order").strip().lower()
+    if entity_type != "order":
+        raise ValueError("entity_type=locker (driver) not implemented yet")
+
+    order_id = int(params.get("order_id") or params.get("entity_id") or 0)
+    if not order_id:
+        raise ValueError("order_id required")
+
+    leg = str(params.get("leg") or "pickup").strip().lower()
+    if leg not in ("pickup", "delivery"):
+        raise ValueError("leg must be pickup or delivery")
+
+    order = db_layer.get_order(domain_session, order_id)
+    if order is None:
+        raise DomainError("ORDER_NOT_FOUND", f"order {order_id} not found")
+    cell_id = (
+        order.get("dest_cell_id") if leg == "delivery" else order.get("source_cell_id")
+    )
+    if not cell_id:
+        raise DomainError("CELL_MISSING", f"no cell for order {order_id} leg={leg}")
+    cell_id = int(cell_id)
+    cell_status = db_layer.get_cell_status(domain_session, cell_id) or "locker_opened"
+
+    return {
+        "entity_type": "order",
+        "entity_id": order_id,
+        "related_entities": [
+            {
+                "entity_type": "locker",
+                "entity_id": cell_id,
+                "initial_state": str(cell_status),
+            }
+        ],
+        "enqueue": {
+            "process_name": "close_cell",
+            "payload": {
+                "leg": leg,
+                "executor_user_id": actor_id,
+                "courier_user_id": actor_id,
+                "source": "close_cell",
+            },
+        },
+        "data": {
+            "order_id": order_id,
+            "leg": leg,
+            "cell_id": cell_id,
+            "status": "pending_fsm",
+        },
+    }
+
+
 def request_locker_access_code(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:

@@ -13,6 +13,7 @@ from fsm_platform.host.operations import default_operation_registry
 from domains.courier.commands import (
     assign_executor,
     cancel_courier_order,
+    close_cell,
     create_order,
     open_cell,
     remove_executor,
@@ -22,12 +23,14 @@ from domains.courier.commands import (
 from domains.courier.context import build_order_context
 from domains.courier.effects import (
     assign_executor_effect,
+    close_cell_effect,
     open_cell_effect,
     remove_executor_effect,
     sync_locker_cell_status,
 )
 from domains.courier.guards import (
     can_assign_executor,
+    can_close_cell,
     can_open_cell,
     can_remove_executor,
 )
@@ -42,7 +45,7 @@ from domains.courier.queries import (
 def register_all(service_id: str) -> None:
     """
     Подключает операции и FSM-процессы домена к service_id.
-    Назначение/снятие/открытие — процессы assign/remove/open_cell;
+    Назначение/снятие/открытие/закрытие — процессы assign/remove/open/close_cell;
     цепочки задаются guard_params на рёбрах графа.
     """
     default_operation_registry.register(
@@ -62,6 +65,9 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "open_cell", "command", open_cell
+    )
+    default_operation_registry.register(
+        service_id, "close_cell", "command", close_cell
     )
     default_operation_registry.register(
         service_id,
@@ -112,6 +118,16 @@ def register_all(service_id: str) -> None:
             initial_state="order_created",
         )
     )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
+            process_name="close_cell",
+            entity_type="order",
+            event_name="close_cell",
+            context_builder=build_order_context,
+            initial_state="order_created",
+        )
+    )
 
     default_guard_registry.register(
         service_id, "can_assign_executor", can_assign_executor
@@ -120,6 +136,7 @@ def register_all(service_id: str) -> None:
         service_id, "can_remove_executor", can_remove_executor
     )
     default_guard_registry.register(service_id, "can_open_cell", can_open_cell)
+    default_guard_registry.register(service_id, "can_close_cell", can_close_cell)
     default_effect_registry.register(
         service_id, "assign_executor_effect", assign_executor_effect
     )
@@ -128,6 +145,9 @@ def register_all(service_id: str) -> None:
     )
     default_effect_registry.register(
         service_id, "open_cell_effect", open_cell_effect
+    )
+    default_effect_registry.register(
+        service_id, "close_cell_effect", close_cell_effect
     )
     default_effect_registry.register(
         service_id, "sync_locker_cell_status", sync_locker_cell_status

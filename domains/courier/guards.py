@@ -96,7 +96,7 @@ def _match_locker_actor_edge(
     session_domain, context, instance, guard_params
 ) -> GuardResult:
     """
-    Context ↔ params для open_cell / request|view PIN.
+    Context ↔ params для open/close_cell / request|view PIN.
     Роль, ownership, status, cell, PIN — только из context + params.
     """
     ctx = context or {}
@@ -126,10 +126,10 @@ def _match_locker_actor_edge(
 
     if params.get("require_city", True):
         actor_city = ctx.get("executor_city")
-        if not actor_city:
-            return GuardResult(ok=False, reason="ACTOR_CITY_REQUIRED")
         locker_city = ctx.get("locker_city")
-        if not locker_city or locker_city != actor_city:
+        # Как old check_user_access: режем только явный mismatch.
+        # Пустой city у актёра не блокирует (сиды/удалённый client).
+        if actor_city and locker_city and actor_city != locker_city:
             return GuardResult(
                 ok=False,
                 reason=f"CITY_MISMATCH:{actor_city}->{locker_city}",
@@ -244,6 +244,24 @@ def can_open_cell(
     return _match_locker_actor_edge(session_domain, context, instance, params)
 
 
+def can_close_cell(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """Закрытие ячейки: как open, но без PIN; ячейка обычно locker_opened."""
+    _ = db
+    params = dict(guard_params or {})
+    if "require_pin" not in params:
+        params["require_pin"] = False
+    if "allowed_cell_statuses" not in params:
+        params["allowed_cell_statuses"] = [
+            "locker_opened",
+            "locker_parcel_confirmed",
+        ]
+    if "stage_must_be" not in params:
+        params["stage_must_be"] = "none"
+    return _match_locker_actor_edge(session_domain, context, instance, params)
+
+
 # Декларативные правила выдачи/просмотра PIN (аналог рёбер графа для sync-ops).
 _LOCKER_ACCESS_CODE_RULES: list[dict[str, Any]] = [
     {
@@ -253,7 +271,8 @@ _LOCKER_ACCESS_CODE_RULES: list[dict[str, Any]] = [
         "type_field": "pickup_type",
         "type_value": "self",
         "stage_must_be": "none",
-        "require_city": True,
+        # PIN можно запросить удалённо (как в old: пустой city не режет geo)
+        "require_city": False,
         "require_cell": True,
         "require_pin": False,
         "allowed_statuses": [
@@ -298,7 +317,7 @@ _LOCKER_ACCESS_CODE_RULES: list[dict[str, Any]] = [
         "user_role": "recipient",
         "actor_field": "recipient_user_id",
         "stage_must_be": "none",
-        "require_city": True,
+        "require_city": False,
         "require_cell": True,
         "require_pin": False,
         "allowed_statuses": [
@@ -326,7 +345,9 @@ def can_request_locker_access_code(
 
     ctx = context or {}
     leg = str(ctx.get("leg") or "").strip().lower()
-    last: Optional[GuardResult] = None
+    actor_role = str(((ctx.get("executor") or {}).get("role_name")) or "")
+    role_hit: Optional[GuardResult] = None
+    other: Optional[GuardResult] = None
     for rule in _LOCKER_ACCESS_CODE_RULES:
         if rule.get("leg") and str(rule["leg"]) != leg:
             continue
@@ -335,5 +356,10 @@ def can_request_locker_access_code(
         )
         if result.ok:
             return result
-        last = result
-    return last or GuardResult(ok=False, reason="NO_ACCESS_RULE_MATCHED")
+        expected = str(rule.get("user_role") or "")
+        if expected and actor_role and expected == actor_role:
+            if role_hit is None:
+                role_hit = result
+        elif other is None:
+            other = result
+    return role_hit or other or GuardResult(ok=False, reason="NO_ACCESS_RULE_MATCHED")
