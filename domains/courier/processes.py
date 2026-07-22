@@ -14,12 +14,21 @@ from domains.courier.commands import (
     assign_executor,
     cancel_courier_order,
     create_order,
+    open_cell,
     remove_executor,
     take_courier_order,
 )
 from domains.courier.context import build_order_context
-from domains.courier.effects import assign_executor_effect, remove_executor_effect
-from domains.courier.guards import can_assign_executor, can_remove_executor
+from domains.courier.effects import (
+    assign_executor_effect,
+    open_cell_effect,
+    remove_executor_effect,
+)
+from domains.courier.guards import (
+    can_assign_executor,
+    can_open_cell,
+    can_remove_executor,
+)
 from domains.courier.queries import (
     list_client_orders,
     list_courier_exchange,
@@ -30,7 +39,7 @@ from domains.courier.queries import (
 def register_all(service_id: str) -> None:
     """
     Подключает операции и FSM-процессы домена к service_id.
-    Назначение/снятие исполнителя — процессы assign_executor / remove_executor;
+    Назначение/снятие/открытие — процессы assign/remove/open_cell;
     цепочки задаются guard_params на рёбрах графа.
     """
     default_operation_registry.register(
@@ -47,6 +56,9 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "cancel_courier_order", "command", cancel_courier_order
+    )
+    default_operation_registry.register(
+        service_id, "open_cell", "command", open_cell
     )
     default_operation_registry.register(
         service_id, "list_client_orders", "query", list_client_orders
@@ -78,6 +90,16 @@ def register_all(service_id: str) -> None:
             initial_state="order_created",
         )
     )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
+            process_name="open_cell",
+            entity_type="order",
+            event_name="open_cell",
+            context_builder=build_order_context,
+            initial_state="order_created",
+        )
+    )
 
     default_guard_registry.register(
         service_id, "can_assign_executor", can_assign_executor
@@ -85,9 +107,14 @@ def register_all(service_id: str) -> None:
     default_guard_registry.register(
         service_id, "can_remove_executor", can_remove_executor
     )
+    default_guard_registry.register(service_id, "can_open_cell", can_open_cell)
     default_effect_registry.register(
         service_id, "assign_executor_effect", assign_executor_effect
     )
     default_effect_registry.register(
         service_id, "remove_executor_effect", remove_executor_effect
     )
+    default_effect_registry.register(
+        service_id, "open_cell_effect", open_cell_effect
+    )
+

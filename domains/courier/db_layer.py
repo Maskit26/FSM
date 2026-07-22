@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, Optional, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -615,3 +617,112 @@ def list_orders_for_courier(
             continue
         out.append(item)
     return out
+
+
+def get_cell_status(session: Session, cell_id: int) -> Optional[str]:
+    """Текущий status ячейки (locker_reserved / locker_opened / …)."""
+    row = session.execute(
+        text("SELECT status FROM locker_cells WHERE id = :id"),
+        {"id": cell_id},
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0])
+
+
+def open_locker_cell(
+    session: Session,
+    cell_id: int,
+    *,
+    order_id: Optional[int] = None,
+) -> bool:
+    """
+    Атомарно: locker_reserved|locker_occupied → locker_opened.
+    Если order_id задан — только ячейка этого заказа.
+    """
+    if order_id is not None:
+        result = session.execute(
+            text(
+                """
+                UPDATE locker_cells
+                SET status = 'locker_opened',
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :cell_id
+                  AND current_order_id = :order_id
+                  AND status IN ('locker_reserved', 'locker_occupied')
+                """
+            ),
+            {"cell_id": cell_id, "order_id": order_id},
+        )
+    else:
+        result = session.execute(
+            text(
+                """
+                UPDATE locker_cells
+                SET status = 'locker_opened',
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :cell_id
+                  AND status IN ('locker_reserved', 'locker_occupied')
+                """
+            ),
+            {"cell_id": cell_id},
+        )
+    return int(result.rowcount or 0) == 1
+
+
+def validate_access_code(
+    session: Session,
+    order_id: int,
+    leg: str,
+    user_id: int,
+    pin: str,
+    cell_id: int,
+) -> Tuple[bool, str]:
+    """
+    Проверка PIN из cell_access_tokens (как старый validate_access_code).
+    Hash: SHA256(f\"{pin}{order_id}{cell_id}\").
+    """
+    row = session.execute(
+        text(
+            """
+            SELECT id, pin_hash, status, expires_at, cell_id
+            FROM cell_access_tokens
+            WHERE order_id = :order_id
+              AND leg = :leg
+              AND actor_user_id = :user_id
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"order_id": order_id, "leg": leg, "user_id": user_id},
+    ).fetchone()
+    if not row:
+        return False, "ACCESS_CODE_NOT_FOUND"
+
+    token_id, stored_pin_hash, token_status, expires_at, token_cell_id = row
+    if str(token_status) != "ACTIVE":
+        return False, f"ACCESS_CODE_NOT_ACTIVE:{token_status}"
+
+    if expires_at is not None and expires_at < datetime.utcnow():
+        return False, "ACCESS_CODE_EXPIRED"
+
+    if int(token_cell_id) != int(cell_id):
+        return False, "ACCESS_CODE_WRONG_CELL"
+
+    expected_hash = hashlib.sha256(
+        f"{pin}{order_id}{cell_id}".encode()
+    ).hexdigest()
+    if expected_hash != stored_pin_hash:
+        session.execute(
+            text(
+                """
+                UPDATE cell_access_tokens
+                SET failed_attempts = failed_attempts + 1
+                WHERE id = :token_id
+                """
+            ),
+            {"token_id": token_id},
+        )
+        return False, "ACCESS_CODE_INVALID"
+
+    return True, ""

@@ -21,5 +21,7 @@ required_tables:
   - stage_orders
   - locker_cells
   - lockers
+  - cell_access_tokens
+  - users
 
 required_routines: []

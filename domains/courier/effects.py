@@ -141,3 +141,44 @@ def remove_executor_effect(session_domain, db, context, instance, effect_params)
             "executor_user_id": int(executor_id),
         },
     )
+
+
+def open_cell_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
+    """
+    Открывает ячейку (locker_* → locker_opened) и пишет orders.status = to_state.
+    """
+    _ = db
+    order_id = int(instance["entity_id"])
+    payload = _payload_dict(instance)
+    params = effect_params or {}
+    ctx = context or {}
+    leg = str(
+        payload.get("leg") or params.get("leg") or ctx.get("leg") or "pickup"
+    ).strip().lower()
+    if leg not in ("pickup", "delivery"):
+        return EffectResult(ok=False, error=f"INVALID_LEG:{leg}")
+
+    cell_id = ctx.get("cell_id")
+    if not cell_id:
+        return EffectResult(ok=False, error="CELL_MISSING")
+
+    opened = db_layer.open_locker_cell(
+        session_domain, int(cell_id), order_id=order_id
+    )
+    if not opened:
+        return EffectResult(ok=False, error="OPEN_LOCKER_FAILED")
+
+    to_state = ctx.get("to_state") or params.get("to_state")
+    if not to_state:
+        return EffectResult(ok=False, error="TO_STATE_REQUIRED")
+    db_layer.update_order_status(session_domain, order_id, str(to_state))
+    return EffectResult(
+        ok=True,
+        payload={
+            "order_id": order_id,
+            "leg": leg,
+            "cell_id": int(cell_id),
+            "status": to_state,
+            "cell_status": "locker_opened",
+        },
+    )

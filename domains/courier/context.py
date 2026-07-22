@@ -69,6 +69,11 @@ def build_order_context(session_domain, db, runtime_ctx, instance) -> dict[str, 
         if leg in ("pickup", "delivery")
         else None
     )
+    cell_status = (
+        db_layer.get_cell_status(session_domain, int(cell_id)) if cell_id else None
+    )
+    pin_raw = payload.get("pin")
+    pin = str(pin_raw).strip() if pin_raw is not None and str(pin_raw).strip() else None
 
     return {
         "order": order,
@@ -79,7 +84,9 @@ def build_order_context(session_domain, db, runtime_ctx, instance) -> dict[str, 
         "executor": executor,
         "executor_city": executor_city,
         "cell_id": int(cell_id) if cell_id else None,
+        "cell_status": cell_status,
         "locker_city": locker_city,
         "stage_courier_id": stage_courier_id,
+        "pin": pin,
         "runtime_ctx": runtime_ctx,
     }

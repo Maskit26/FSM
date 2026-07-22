@@ -63,6 +63,7 @@ Platform HTTP-слой (Gateway → Dispatcher → Request Runtime)
 13. **`ProcessDef.service_id`** — одно имя поля/колонки: `service_id` (не `service`).
 14. **Outbox producer** — запись в `platform_outbox` только через `platform.notify` (и platform fan-out webhooks); не из сырого SQL домена и не из трёх независимых точек.
 15. **Accept без remote code exec в prod** — пакеты только из доверенного registry; произвольный zip→import в prod запрещён (§7.10).
+16. **Multi-entity companions** — один process-step может двигать несколько сущностей: после primary (`ProcessDef.entity_type`) TransitionRunner по очереди выполняет companions из `effect_params` выбранного primary-ребра. Каждый companion — полный pipeline `candidates → guards → apply → effect` по своему `entity_type` / `event_name`; `entity_id` берётся из context по `entity_id_key`. Fail любого companion → FAILED всего шага (rollback dual-tx у worker). Оркестрацию делает runner, не Python-effect. Подробности §4.3, §8.5.
 
 ---
 
@@ -150,15 +151,28 @@ Worker открывает `session_platform` + `session_domain`, владеет 
 1. Worker открывает session_platform + session_domain
 2. claim server_fsm_instance → PROCESSING
 3. ProcessRegistry: service_id + process_name → ProcessDef
-4. context_builder → domain context
-5. state_store.get → entity_fsm_state
-6. transition_repository.list_candidates (domain DB)
-7. ORDER BY priority ASC, id ASC; unique priority; NULL-guard = unconditional
-8. guards → первый ok=true (NULL считается ok)
-9. TransitionExecutor.apply → entity_fsm_state + fsm_transition_logs
-10. effect → domain DB; side effects — platform.notify / emit_event / schedule_timer (§4.13)
-11. instance COMPLETED/FAILED; commit по §4.7
+4. context_builder → domain context (один раз на process-step)
+5. PRIMARY entity (ProcessDef.entity_type / instance.entity_id / event_name):
+   state_store.get → candidates → guards → TransitionExecutor.apply → effect
+6. COMPANIONS (если есть) — из effect_params.companions выбранного primary-ребра,
+   по порядку; для каждого:
+   entity_id = context[entity_id_key]
+   state_store.get → candidates → guards → apply → effect
+   (тот же domain context; после каждого apply в context пишутся
+    from_state/to_state/applied_entity_*)
+7. instance COMPLETED/FAILED; commit по §4.7
 ```
+
+**Companions (нормативно):**
+
+- Объявляются **только** в `effect_params` primary-ребра графа, ключ `companions` (list).
+- Элемент: `{ "entity_type", "event_name", "entity_id_key" }` — все обязательны.
+- `entity_id_key` — ключ в domain context (например `cell_id`, `driver_id`); не колонка instance.
+- Companion **не** создаёт второй `server_fsm_instances`; это продолжение того же `run`.
+- У companion-сущности уже должна быть строка в `entity_fsm_state` (bootstrap Request Runtime / command).
+- Ключ `companions` **не** передаётся в Python-effect (runner снимает его перед вызовом).
+- Fail на любом companion → `COMPANION_FAILED` (или более точный код вложенной ошибки) → instance FAILED; worker откатывает **обе** БД, включая уже применённый primary.
+- Цепочки через новый enqueue / `schedule_timer` остаются валидны для **отложенной** оркестрации; companions — для **синхронного** multi-entity в одном шаге (open_cell order+locker, taxi order+driver+client).
 
 ### 4.4. Guard routing
 
@@ -1635,7 +1649,7 @@ def run_instance(
 
 ### 8.5. `transition_runner.py`
 
-**Назначение:** исполнить **ровно один** декларативный переход: выбрать transition по графу и guards, применить FSM-state, выполнить effect.
+**Назначение:** исполнить **один process-step**: primary entity-transition (ProcessDef), затем опционально **companions** из `effect_params` выбранного primary-ребра. Каждый entity — полный pipeline candidates → guards → apply → effect (§4.3, §2 #16).
 
 Класс: `TransitionRunner`.
 
@@ -1665,71 +1679,61 @@ class TransitionRunner:
    Если process_def.context_builder задан:
      domain_context = context_builder(session_domain, db, runtime_ctx, instance)
    Иначе domain_context = {}
-   Ошибка builder → FAILED (CONTEXT_BUILD_FAILED) или проброс по политике
+   Ошибка builder → FAILED (CONTEXT_BUILD_FAILED)
 
-2. ИДЕНТИФИКАТОРЫ
+2. PRIMARY IDENTIFIERS
    entity_type = process_def.entity_type or instance["entity_type"]
    entity_id = instance["entity_id"]
    event_name = process_def.runtime_event_name
-   user_id = instance.get("requested_by_user_id") or 0
+   user_id = instance.get("actor_id") or 0
    Если нет entity_type → FAILED MISSING_ENTITY_TYPE
    Если entity_id is None → FAILED MISSING_ENTITY_ID
 
-3. CURRENT STATE
-   current_state = state_store.get(session_platform, service_id, entity_type, entity_id)
-   Если None → FAILED ENTITY_STATE_NOT_FOUND: {entity_type}/{entity_id}
+3. PRIMARY ENTITY STEP (см. подпроцесс ENTITY_STEP ниже)
+   role=primary, entity_type/entity_id/event_name из п.2
+   Ошибка → FAILED с кодом шага
 
-4. CANDIDATES
-   rows = transition_repository.list_candidates(
-       session_domain, entity_type, current_state, event_name
-   )
-   candidates = [TransitionDef.from_row(r) for r in rows]
-   Если пусто → FAILED NO_CANDIDATE_TRANSITIONS: {entity_type}/{current_state}/{event_name}
+4. COMPANIONS
+   companions = selected_primary.effect_params.get("companions") or []
+   Если companions не list → FAILED INVALID_COMPANION
+   Для каждого spec по порядку (index = 0..n-1):
+     Если spec не object или нет entity_type/event_name/entity_id_key
+       → FAILED INVALID_COMPANION
+     entity_id = domain_context[entity_id_key]
+     Если нет / не int → FAILED COMPANION_ENTITY_ID_MISSING
+     ENTITY_STEP(role=companion[index], entity_type, entity_id, event_name из spec)
+     Ошибка → FAILED COMPANION_FAILED: index=… {inner}
+     domain_context обновляется после каждого успешного шага
 
-5. PRIORITY
-   ORDER BY priority ASC, id ASC (из SQL).
-   Если два candidate с одинаковым priority → FAILED AMBIGUOUS_TRANSITION: …/priority=N
-
-6. SELECT (guards) — §4.4
-   selected = None; last_reason = None
-   Для каждого candidate в порядке ASC:
-     Если guard_name is NULL/пустой → selected = candidate; break   # unconditional
-     guard_fn = guard_registry.get(service_id, guard_name)
-     Если нет → FAILED UNKNOWN_GUARD: {guard_name}
-     result = normalize(guard_fn(session_domain, db, domain_context, instance, guard_params))
-     Если result.ok → selected = candidate; break
-     Иначе last_reason = result.reason; log warning; продолжить
-   Если selected is None → FAILED NO_GUARD_MATCHED (+ last_reason); без retry
-
-7. SQL TRANSITION (platform only)
-   transition_executor.apply(
-       session_platform,
-       service_id=service_id,
-       entity_type=entity_type,
-       entity_id=entity_id,
-       transition=selected,
-       event_name=event_name,
-       user_id=user_id,
-   )
-   # пишет entity_fsm_state + log; НЕ трогает orders/…
-
-8. EFFECT
-   Если selected.effect_name:
-     effect_fn = effect_registry.get(service_id, effect_name)
-     Если нет → FAILED UNKNOWN_EFFECT
-     effect_result = normalize(effect_fn(session_domain, db, domain_context, instance, effect_params))
-     Если не ok → FAILED EFFECT_FAILED / effect_result.error
-     # effect: domain DB через domain db_layer; notify/timers через session_platform API
-
-9. SUCCESS
+5. SUCCESS
    return FsmResult(
      new_state="COMPLETED",
      attempts_increment=1,
      payload={
        "transition_id", "from_state", "to_state", "event_name",
-       "effect": effect_payload
+       "entity_type", "entity_id",
+       "effect": primary_effect_payload,
+       "companions": [ { index, entity_type, entity_id, transition_id,
+                         from_state, to_state, event_name, effect }, … ]
      }
    )
+```
+
+**Подпроцесс `ENTITY_STEP`** (primary и каждый companion):
+
+```text
+A. current_state = state_store.get(…, entity_type, entity_id)
+   None → ENTITY_STATE_NOT_FOUND
+B. candidates = list_candidates(entity_type, current_state, event_name)
+   пусто → NO_CANDIDATE_TRANSITIONS
+C. unique priority; иначе AMBIGUOUS_TRANSITION
+D. SELECT guards (§4.4) → selected; иначе NO_GUARD_MATCHED / UNKNOWN_GUARD
+E. transition_executor.apply(… entity_type, entity_id, selected …)
+F. domain_context |= { from_state, to_state, transition_id, event_name,
+                       applied_entity_type, applied_entity_id }
+G. Если selected.effect_name:
+     effect_params_call = effect_params без ключа "companions"
+     effect_fn(…, effect_params_call); не ok → EFFECT_FAILED / UNKNOWN_EFFECT
 ```
 
 #### 8.5.3. Коды `last_error` (зафиксировать в `errors.py`)
@@ -1745,7 +1749,10 @@ class TransitionRunner:
 | `NO_GUARD_MATCHED` | все guards false |
 | `UNKNOWN_EFFECT` | effect_name нет в registry |
 | `EFFECT_FAILED` | effect вернул ok=false |
-| `TRANSITION_APPLY_FAILED` | executor/SQL ошибка |
+| `TRANSITION_APPLY_FAILED` / `APPLY_FAILED` | executor/SQL ошибка |
+| `INVALID_COMPANION` | битый `effect_params.companions` |
+| `COMPANION_ENTITY_ID_MISSING` | нет / невалидный `context[entity_id_key]` |
+| `COMPANION_FAILED` | ошибка pipeline companion (внутри — исходный код) |
 
 #### 8.5.4. БД (через зависимости, не сырой SQL в runner)
 
@@ -1762,7 +1769,10 @@ class TransitionRunner:
 - прямой SQL;
 - commit;
 - обновление `server_fsm_instances`;
-- UPDATE business tables (только effect домена).
+- UPDATE business tables (только effect домена);
+- вызов companion-переходов из Python-effect в обход runner (только `effect_params.companions`).
+
+Допускается: цикл companions после primary (§8.5.2) — это часть нормативного алгоритма, не обход.
 
 ---
 
@@ -2818,6 +2828,8 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 | Prod Accept: произвольный zip→import | пакет из доверенного registry (§7.10) |
 | Несколько независимых outbox producer | только `platform.notify` + fan-out hook |
 | Fan-out FAILED в рабочей tx | short tx после ROLLBACK (§4.7) |
+| Multi-entity каскад вручную из Python-effect (`call_fsm` / сырой UPDATE чужого графа) | `effect_params.companions` + TransitionRunner (§2 #16, §4.3, §8.5) |
+| Второй `server_fsm_instances` только чтобы синхронно сдвинуть связанную сущность в том же бизнес-шаге | companions в том же `run` |
 | 2PC / повтор effect при platform commit fail | `platform_reconcile_queue` (§4.7.1) |
 | Домен регистрирует HTTP `(method, path)` | только OperationRegistry + FSM |
 | Сырой INSERT `platform_events` | только `platform.emit_event` |
@@ -2924,7 +2936,8 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 | outbox_worker | процесс отправки webhook/channel/external из outbox; §10.6 |
 | SSE | Server-Sent Events: поток событий к клиенту; §10.5 |
 | platform_events | журнал событий platform для SSE/подписок; §10.3 |
-| TransitionRunner | `fsm_platform/core/transition_runner.py` — pipeline одного FSM-шага; §8.5 |
+| TransitionRunner | `fsm_platform/core/transition_runner.py` — pipeline process-step (primary + companions); §8.5 |
+| companions | список в `effect_params` primary-ребра: синхронные secondary entity-transitions в том же `run`; §2 #16, §4.3 |
 | run_instance | `fsm_platform/core/engine.py` — вход worker в FSM; §8.4 |
 | EntityStateStore | `fsm_platform/core/state_store.py` — API state поверх db_layer; §8.9 |
 | TransitionRepository | `fsm_platform/core/transition_repository.py` — candidates (+ params) из domain DB; §8.10 |

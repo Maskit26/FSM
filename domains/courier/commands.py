@@ -251,3 +251,57 @@ def remove_executor(
             "status": "pending_fsm",
         },
     }
+
+
+def open_cell(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Открытие ячейки (как старый open_cell).
+    params: order_id, leg, pin.
+    Цепочку (client / courier pickup|delivery) выбирают guards.
+    """
+    _ = domain_session
+    try:
+        actor_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not actor_id:
+        raise ValueError("actor.actor_id required")
+
+    entity_type = str(params.get("entity_type") or "order").strip().lower()
+    if entity_type != "order":
+        raise ValueError("entity_type=locker (driver) not implemented yet")
+
+    order_id = int(params.get("order_id") or params.get("entity_id") or 0)
+    if not order_id:
+        raise ValueError("order_id required")
+
+    leg = str(params.get("leg") or "pickup").strip().lower()
+    if leg not in ("pickup", "delivery"):
+        raise ValueError("leg must be pickup or delivery")
+
+    pin = params.get("pin")
+    if pin is None or str(pin).strip() == "":
+        raise ValueError("pin required")
+    pin = str(pin).strip()
+
+    return {
+        "entity_type": "order",
+        "entity_id": order_id,
+        "enqueue": {
+            "process_name": "open_cell",
+            "payload": {
+                "leg": leg,
+                "pin": pin,
+                "executor_user_id": actor_id,
+                "courier_user_id": actor_id,
+                "source": "open_cell",
+            },
+        },
+        "data": {
+            "order_id": order_id,
+            "leg": leg,
+            "status": "pending_fsm",
+        },
+    }
