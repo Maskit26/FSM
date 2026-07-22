@@ -145,7 +145,8 @@ def remove_executor_effect(session_domain, db, context, instance, effect_params)
 
 def open_cell_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
     """
-    Открывает ячейку (locker_* → locker_opened) и пишет orders.status = to_state.
+    Primary effect open_cell: только orders.status = to_state.
+    Ячейку двигает companion locker_open_locker (+ sync_locker_cell_status).
     """
     _ = db
     order_id = int(instance["entity_id"])
@@ -158,16 +159,6 @@ def open_cell_effect(session_domain, db, context, instance, effect_params) -> Ef
     if leg not in ("pickup", "delivery"):
         return EffectResult(ok=False, error=f"INVALID_LEG:{leg}")
 
-    cell_id = ctx.get("cell_id")
-    if not cell_id:
-        return EffectResult(ok=False, error="CELL_MISSING")
-
-    opened = db_layer.open_locker_cell(
-        session_domain, int(cell_id), order_id=order_id
-    )
-    if not opened:
-        return EffectResult(ok=False, error="OPEN_LOCKER_FAILED")
-
     to_state = ctx.get("to_state") or params.get("to_state")
     if not to_state:
         return EffectResult(ok=False, error="TO_STATE_REQUIRED")
@@ -177,8 +168,32 @@ def open_cell_effect(session_domain, db, context, instance, effect_params) -> Ef
         payload={
             "order_id": order_id,
             "leg": leg,
-            "cell_id": int(cell_id),
+            "cell_id": ctx.get("cell_id"),
             "status": to_state,
-            "cell_status": "locker_opened",
         },
+    )
+
+
+def sync_locker_cell_status(
+    session_domain, db, context, instance, effect_params
+) -> EffectResult:
+    """
+    Companion effect: зеркало locker_cells.status = to_state перехода locker.
+    """
+    _ = db
+    _ = instance
+    _ = effect_params
+    ctx = context or {}
+    cell_id = ctx.get("applied_entity_id") or ctx.get("cell_id")
+    to_state = ctx.get("to_state")
+    if not cell_id:
+        return EffectResult(ok=False, error="CELL_MISSING")
+    if not to_state:
+        return EffectResult(ok=False, error="TO_STATE_REQUIRED")
+    ok = db_layer.set_cell_status(session_domain, int(cell_id), str(to_state))
+    if not ok:
+        return EffectResult(ok=False, error="SYNC_LOCKER_STATUS_FAILED")
+    return EffectResult(
+        ok=True,
+        payload={"cell_id": int(cell_id), "cell_status": str(to_state)},
     )

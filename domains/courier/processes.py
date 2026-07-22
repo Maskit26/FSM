@@ -23,6 +23,7 @@ from domains.courier.effects import (
     assign_executor_effect,
     open_cell_effect,
     remove_executor_effect,
+    sync_locker_cell_status,
 )
 from domains.courier.guards import (
     can_assign_executor,
@@ -116,5 +117,8 @@ def register_all(service_id: str) -> None:
     )
     default_effect_registry.register(
         service_id, "open_cell_effect", open_cell_effect
+    )
+    default_effect_registry.register(
+        service_id, "sync_locker_cell_status", sync_locker_cell_status
     )
 

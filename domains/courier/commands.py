@@ -7,8 +7,6 @@ from typing import Any, Optional
 from domains.courier import db_layer
 from domains.courier.errors import DomainError
 
-_VALID_CELL_SIZES = frozenset({"S", "M", "L", "P"})
-
 
 def _require_str(params: dict[str, Any], key: str) -> str:
     """Проверяет, что параметр есть и не пустой. Возвращает строку без пробелов по краям."""
@@ -48,9 +46,7 @@ def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) 
     from_address = _require_str(params, "from_address")
     to_address = _require_str(params, "to_address")
 
-    cell_size = _require_str(params, "cell_size").upper()
-    if cell_size not in _VALID_CELL_SIZES:
-        raise ValueError(f"cell_size must be one of {sorted(_VALID_CELL_SIZES)}")
+    cell_size = db_layer.normalize_cell_size(domain_session, params.get("cell_size"))
 
     parcel_type = _require_str(params, "parcel_type")
     pickup_type = _delivery_to_type(params.get("sender_delivery"), field="sender_delivery")
@@ -114,6 +110,18 @@ def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) 
         "entity_type": "order",
         "entity_id": order_id,
         "initial_state": "order_created",
+        "related_entities": [
+            {
+                "entity_type": "locker",
+                "entity_id": src_id,
+                "initial_state": "locker_reserved",
+            },
+            {
+                "entity_type": "locker",
+                "entity_id": dst_id,
+                "initial_state": "locker_reserved",
+            },
+        ],
         "data": {
             "order_id": order_id,
             "status": "order_created",
@@ -260,8 +268,8 @@ def open_cell(
     Открытие ячейки (как старый open_cell).
     params: order_id, leg, pin.
     Цепочку (client / courier pickup|delivery) выбирают guards.
+    related_entities: bootstrap entity_fsm_state ячейки для companion.
     """
-    _ = domain_session
     try:
         actor_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
@@ -286,9 +294,27 @@ def open_cell(
         raise ValueError("pin required")
     pin = str(pin).strip()
 
+    order = db_layer.get_order(domain_session, order_id)
+    if order is None:
+        raise DomainError("ORDER_NOT_FOUND", f"order {order_id} not found")
+    cell_id = (
+        order.get("dest_cell_id") if leg == "delivery" else order.get("source_cell_id")
+    )
+    if not cell_id:
+        raise DomainError("CELL_MISSING", f"no cell for order {order_id} leg={leg}")
+    cell_id = int(cell_id)
+    cell_status = db_layer.get_cell_status(domain_session, cell_id) or "locker_reserved"
+
     return {
         "entity_type": "order",
         "entity_id": order_id,
+        "related_entities": [
+            {
+                "entity_type": "locker",
+                "entity_id": cell_id,
+                "initial_state": str(cell_status),
+            }
+        ],
         "enqueue": {
             "process_name": "open_cell",
             "payload": {
@@ -302,6 +328,7 @@ def open_cell(
         "data": {
             "order_id": order_id,
             "leg": leg,
+            "cell_id": cell_id,
             "status": "pending_fsm",
         },
     }

@@ -1,24 +1,34 @@
--- Unified open_cell: courier pickup/delivery + client self-drop.
--- Event open_cell; chains via guard_params. PIN required on all edges.
+-- open_cell: reuse existing order edges; delete duplicate open_cell rows;
+-- wire guards/effects + companions → locker_open_locker.
 
 INSERT INTO fsm_actions (name, label)
 SELECT 'open_cell', 'Otkryt yacheyku'
 WHERE NOT EXISTS (SELECT 1 FROM fsm_actions WHERE name = 'open_cell');
 
--- client self pickup: order_created -> order_client_post1
-INSERT INTO fsm_transitions (
-    entity_type, from_state_id, to_state_id, action_id,
-    guard_name, effect_name, priority, guard_params, effect_params
-)
-SELECT
-    'order',
-    fs.id,
-    ts.id,
-    a.id,
-    'can_open_cell',
-    'open_cell_effect',
-    100,
-    CAST('{
+-- Remove duplicate open_cell transitions (same from/to as legacy edges).
+DELETE t
+FROM fsm_transitions t
+JOIN fsm_actions a ON a.id = t.action_id
+JOIN fsm_states fs ON fs.id = t.from_state_id
+WHERE t.entity_type = 'order'
+  AND a.name = 'open_cell'
+  AND fs.name IN (
+      'order_created',
+      'order_courier1_assigned',
+      'order_courier2_assigned'
+  );
+
+-- client self: order_created -> order_client_post1 (was order_client_deliv_post1)
+UPDATE fsm_transitions t
+JOIN fsm_states fs ON fs.id = t.from_state_id
+JOIN fsm_states ts ON ts.id = t.to_state_id
+JOIN fsm_actions old_a ON old_a.id = t.action_id
+JOIN fsm_actions new_a ON new_a.name = 'open_cell'
+SET
+    t.action_id = new_a.id,
+    t.guard_name = 'can_open_cell',
+    t.effect_name = 'open_cell_effect',
+    t.guard_params = CAST('{
         "leg": "pickup",
         "user_role": "client",
         "required_status": "order_created",
@@ -31,35 +41,32 @@ SELECT
         "require_pin": true,
         "allowed_cell_statuses": ["locker_reserved", "locker_occupied"]
     }' AS JSON),
-    CAST('{"leg":"pickup"}' AS JSON)
-FROM fsm_states fs
-JOIN fsm_states ts ON ts.name = 'order_client_post1'
-JOIN fsm_actions a ON a.name = 'open_cell'
-WHERE fs.name = 'order_created'
-  AND NOT EXISTS (
-      SELECT 1
-      FROM fsm_transitions t
-      JOIN fsm_actions xa ON xa.id = t.action_id
-      JOIN fsm_states xfs ON xfs.id = t.from_state_id
-      WHERE t.entity_type = 'order'
-        AND xa.name = 'open_cell'
-        AND xfs.name = 'order_created'
-  );
+    t.effect_params = CAST('{
+        "leg": "pickup",
+        "companions": [
+            {
+                "entity_type": "locker",
+                "event_name": "locker_open_locker",
+                "entity_id_key": "cell_id"
+            }
+        ]
+    }' AS JSON)
+WHERE t.entity_type = 'order'
+  AND old_a.name = 'order_client_deliv_post1'
+  AND fs.name = 'order_created'
+  AND ts.name = 'order_client_post1';
 
 -- courier1: order_courier1_assigned -> order_courier_has_parcel
-INSERT INTO fsm_transitions (
-    entity_type, from_state_id, to_state_id, action_id,
-    guard_name, effect_name, priority, guard_params, effect_params
-)
-SELECT
-    'order',
-    fs.id,
-    ts.id,
-    a.id,
-    'can_open_cell',
-    'open_cell_effect',
-    100,
-    CAST('{
+UPDATE fsm_transitions t
+JOIN fsm_states fs ON fs.id = t.from_state_id
+JOIN fsm_states ts ON ts.id = t.to_state_id
+JOIN fsm_actions old_a ON old_a.id = t.action_id
+JOIN fsm_actions new_a ON new_a.name = 'open_cell'
+SET
+    t.action_id = new_a.id,
+    t.guard_name = 'can_open_cell',
+    t.effect_name = 'open_cell_effect',
+    t.guard_params = CAST('{
         "leg": "pickup",
         "user_role": "courier",
         "required_status": "order_courier1_assigned",
@@ -71,35 +78,32 @@ SELECT
         "require_pin": true,
         "allowed_cell_statuses": ["locker_reserved", "locker_occupied"]
     }' AS JSON),
-    CAST('{"leg":"pickup"}' AS JSON)
-FROM fsm_states fs
-JOIN fsm_states ts ON ts.name = 'order_courier_has_parcel'
-JOIN fsm_actions a ON a.name = 'open_cell'
-WHERE fs.name = 'order_courier1_assigned'
-  AND NOT EXISTS (
-      SELECT 1
-      FROM fsm_transitions t
-      JOIN fsm_actions xa ON xa.id = t.action_id
-      JOIN fsm_states xfs ON xfs.id = t.from_state_id
-      WHERE t.entity_type = 'order'
-        AND xa.name = 'open_cell'
-        AND xfs.name = 'order_courier1_assigned'
-  );
+    t.effect_params = CAST('{
+        "leg": "pickup",
+        "companions": [
+            {
+                "entity_type": "locker",
+                "event_name": "locker_open_locker",
+                "entity_id_key": "cell_id"
+            }
+        ]
+    }' AS JSON)
+WHERE t.entity_type = 'order'
+  AND old_a.name = 'order_courier_pickup_parcel'
+  AND fs.name = 'order_courier1_assigned'
+  AND ts.name = 'order_courier_has_parcel';
 
 -- courier2: order_courier2_assigned -> order_courier2_has_parcel
-INSERT INTO fsm_transitions (
-    entity_type, from_state_id, to_state_id, action_id,
-    guard_name, effect_name, priority, guard_params, effect_params
-)
-SELECT
-    'order',
-    fs.id,
-    ts.id,
-    a.id,
-    'can_open_cell',
-    'open_cell_effect',
-    100,
-    CAST('{
+UPDATE fsm_transitions t
+JOIN fsm_states fs ON fs.id = t.from_state_id
+JOIN fsm_states ts ON ts.id = t.to_state_id
+JOIN fsm_actions old_a ON old_a.id = t.action_id
+JOIN fsm_actions new_a ON new_a.name = 'open_cell'
+SET
+    t.action_id = new_a.id,
+    t.guard_name = 'can_open_cell',
+    t.effect_name = 'open_cell_effect',
+    t.guard_params = CAST('{
         "leg": "delivery",
         "user_role": "courier",
         "required_status": "order_courier2_assigned",
@@ -111,17 +115,27 @@ SELECT
         "require_pin": true,
         "allowed_cell_statuses": ["locker_reserved", "locker_occupied"]
     }' AS JSON),
-    CAST('{"leg":"delivery"}' AS JSON)
-FROM fsm_states fs
-JOIN fsm_states ts ON ts.name = 'order_courier2_has_parcel'
-JOIN fsm_actions a ON a.name = 'open_cell'
-WHERE fs.name = 'order_courier2_assigned'
-  AND NOT EXISTS (
-      SELECT 1
-      FROM fsm_transitions t
-      JOIN fsm_actions xa ON xa.id = t.action_id
-      JOIN fsm_states xfs ON xfs.id = t.from_state_id
-      WHERE t.entity_type = 'order'
-        AND xa.name = 'open_cell'
-        AND xfs.name = 'order_courier2_assigned'
-  );
+    t.effect_params = CAST('{
+        "leg": "delivery",
+        "companions": [
+            {
+                "entity_type": "locker",
+                "event_name": "locker_open_locker",
+                "entity_id_key": "cell_id"
+            }
+        ]
+    }' AS JSON)
+WHERE t.entity_type = 'order'
+  AND old_a.name = 'order_courier2_pickup_parcel'
+  AND fs.name = 'order_courier2_assigned'
+  AND ts.name = 'order_courier2_has_parcel';
+
+-- locker graph: sync domain mirror after FSM apply
+UPDATE fsm_transitions t
+JOIN fsm_actions a ON a.id = t.action_id
+SET
+    t.effect_name = 'sync_locker_cell_status',
+    t.effect_params = CAST('{}' AS JSON)
+WHERE t.entity_type = 'locker'
+  AND a.name = 'locker_open_locker'
+  AND (t.effect_name IS NULL OR t.effect_name = '' OR t.effect_name = 'sync_locker_cell_status');

@@ -423,6 +423,8 @@ ROLLBACK domain; ROLLBACK platform
 
 **Владелец INSERT:** только Request Runtime (platform session). Command handler возвращает `{entity_type, entity_id}` и **обычно** `initial_state`; сам в `entity_fsm_state` не пишет.
 
+Опционально handler может вернуть `related_entities: [{entity_type, entity_id, initial_state}, …]` — Runtime создаёт `entity_fsm_state` и для них (если строки ещё нет). Нужно для multi-entity companions (§2 #16): например order + locker cells при `create_order` / перед `open_cell`.
+
 **Алгоритм invoke-create / command с entity (норматив):**
 
 Параметры создания сущности приходят в JSON тела `POST .../invoke` как `params`. Handler пишет их в staging/бизнес-таблицы domain DB.

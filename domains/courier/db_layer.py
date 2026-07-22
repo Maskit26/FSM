@@ -17,6 +17,48 @@ def _city_hint(address: str) -> str:
     return address.split(",")[0].strip()
 
 
+def list_cell_types(session: Session) -> frozenset[str]:
+    """Допустимые cell_type из ENUM locker_cells.cell_type (источник — схема БД)."""
+    raw = session.execute(
+        text(
+            """
+            SELECT COLUMN_TYPE
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'locker_cells'
+              AND COLUMN_NAME = 'cell_type'
+            """
+        )
+    ).scalar()
+    if not raw:
+        return frozenset()
+    # enum('S','M','L','P') → {S,M,L,P}
+    inner = str(raw)
+    if inner.lower().startswith("enum("):
+        inner = inner[5:]
+    if inner.endswith(")"):
+        inner = inner[:-1]
+    values = {
+        part.strip().strip("'").strip('"').upper()
+        for part in inner.split(",")
+        if part.strip()
+    }
+    return frozenset(v for v in values if v)
+
+
+def normalize_cell_size(session: Session, raw: Any) -> str:
+    """Нормализует cell_size и сверяет со схемой БД. Иначе ValueError."""
+    if raw is None or str(raw).strip() == "":
+        raise ValueError("cell_size required")
+    size = str(raw).strip().upper()
+    allowed = list_cell_types(session)
+    if not allowed:
+        raise ValueError("cell_size catalog unavailable")
+    if size not in allowed:
+        raise ValueError(f"cell_size must be one of {sorted(allowed)}")
+    return size
+
+
 def _haversine_km(
     lat1: float, lon1: float, lat2: float, lon2: float
 ) -> float:
@@ -667,6 +709,22 @@ def open_locker_cell(
             ),
             {"cell_id": cell_id},
         )
+    return int(result.rowcount or 0) == 1
+
+
+def set_cell_status(session: Session, cell_id: int, status: str) -> bool:
+    """Пишет locker_cells.status = status (зеркало entity_fsm_state после companion)."""
+    result = session.execute(
+        text(
+            """
+            UPDATE locker_cells
+            SET status = :status,
+                updated_at = UTC_TIMESTAMP()
+            WHERE id = :cell_id
+            """
+        ),
+        {"cell_id": cell_id, "status": status},
+    )
     return int(result.rowcount or 0) == 1
 
 

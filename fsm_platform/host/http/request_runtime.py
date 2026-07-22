@@ -62,7 +62,8 @@ def _bootstrap_and_maybe_enqueue(
 ) -> None:
     """
     Для command с entity_type: при необходимости создаёт entity_fsm_state.
-    Если handler вернул enqueue.process_name — ставит задачу; actor_id берётся из HTTP actor.
+    related_entities[] — доп. сущности (например locker cells для companions).
+    Если handler вернул enqueue.process_name — ставит задачу; actor_id из HTTP actor.
     """
     entity_type = str(result["entity_type"])
     entity_id = int(result["entity_id"])
@@ -77,6 +78,30 @@ def _bootstrap_and_maybe_enqueue(
         default_db_layer.insert_entity_state_initial(
             sp, service_id, entity_type, entity_id, str(initial)
         )
+
+    for related in result.get("related_entities") or []:
+        if not isinstance(related, dict):
+            raise ValueError("related_entities items must be objects")
+        r_type = related.get("entity_type")
+        r_id = related.get("entity_id")
+        r_initial = related.get("initial_state")
+        if not r_type or r_id is None:
+            raise ValueError(
+                "related_entities require entity_type and entity_id"
+            )
+        r_id_int = int(r_id)
+        r_existing = default_db_layer.get_entity_state(
+            sp, service_id, str(r_type), r_id_int
+        )
+        if r_existing is None:
+            if not r_initial:
+                raise ValueError(
+                    "related_entities.initial_state required when "
+                    "entity_fsm_state is missing"
+                )
+            default_db_layer.insert_entity_state_initial(
+                sp, service_id, str(r_type), r_id_int, str(r_initial)
+            )
 
     enqueue = result.get("enqueue") or {}
     process_name = enqueue.get("process_name")
