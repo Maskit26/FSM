@@ -25,6 +25,10 @@ scripts/
 # Logs
 *.log
 
+# E2E reports (keep directory, ignore generated markdown)
+tools/domain_e2e/reports/*
+!tools/domain_e2e/reports/.gitkeep
+
 # Environment
 .env
 .env.local

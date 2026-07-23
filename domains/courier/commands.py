@@ -33,8 +33,9 @@ def _opt_float(params: dict[str, Any], key: str) -> Optional[float]:
 
 def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
     """
-    Создаёт заказ: ищет ячейки по адресам, резервирует их, пишет orders и stage_orders.
-    Клиент берётся из actor.actor_id; FSM назначения курьера здесь не запускается.
+    Создаёт заказ: ищет свободные ячейки, пишет orders и stage_orders.
+    Резерв ячеек — FSM process locker_reserve (locker_free → locker_reserved).
+    Клиент берётся из actor.actor_id.
     """
     try:
         client_user_id = int((actor or {}).get("actor_id") or 0)
@@ -101,27 +102,54 @@ def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) 
         source_cell_id=src_id,
         dest_cell_id=dst_id,
     )
-    db_layer.reserve_and_bind_cells(domain_session, order_id, src_id, dst_id)
 
     db_layer.create_stage_order(domain_session, order_id, "pickup")
     db_layer.create_stage_order(domain_session, order_id, "delivery")
+
+    # Ячейки резервирует FSM locker_reserve_cell (effect), не SQL в command.
+    locker_bootstrap = [
+        {
+            "entity_type": "locker",
+            "entity_id": src_id,
+            "initial_state": "locker_free",
+        },
+        {
+            "entity_type": "locker",
+            "entity_id": dst_id,
+            "initial_state": "locker_free",
+        },
+    ]
+    reserve_jobs = [
+        {
+            "entity_type": "locker",
+            "entity_id": src_id,
+            "initial_state": "locker_free",
+            "process_name": "locker_reserve",
+            "payload": {
+                "order_id": order_id,
+                "cell_role": "source",
+                "source": "create_order",
+            },
+        },
+        {
+            "entity_type": "locker",
+            "entity_id": dst_id,
+            "initial_state": "locker_free",
+            "process_name": "locker_reserve",
+            "payload": {
+                "order_id": order_id,
+                "cell_role": "dest",
+                "source": "create_order",
+            },
+        },
+    ]
 
     return {
         "entity_type": "order",
         "entity_id": order_id,
         "initial_state": "order_created",
-        "related_entities": [
-            {
-                "entity_type": "locker",
-                "entity_id": src_id,
-                "initial_state": "locker_reserved",
-            },
-            {
-                "entity_type": "locker",
-                "entity_id": dst_id,
-                "initial_state": "locker_reserved",
-            },
-        ],
+        "related_entities": locker_bootstrap,
+        "enqueues": reserve_jobs,
         "data": {
             "order_id": order_id,
             "status": "order_created",

@@ -1,0 +1,221 @@
+# Сценарий 1: клиент сам сдаёт посылку в постамат → направление → водитель забирает.
+# Покрывает (этот happy-path):
+#   create_order, list_client_orders,
+#   request_locker_access_code, view_locker_access_code,
+#   open_cell, close_cell (client),
+#   list_driver_exchange, reserve_direction_slot, start_loading,
+#   open_cell, close_cell (driver), complete_loading
+# Не входит (сценарий courier отдельно):
+#   take_courier_order, assign_executor, remove_executor, cancel_courier_order,
+#   list_courier_exchange, list_courier_orders
+#
+# Требования к сидам: user 3 = client, user 1 = driver с city=Москва.
+
+name: client_self_pickup
+service_id: svc_courier_01
+vars:
+  client_id: "3"
+  driver_id: "1"
+defaults:
+  poll_timeout: 45
+  poll_interval: 0.5
+
+steps:
+  # --- клиент: создать заказ (self) ---
+  - name: create_order
+    operation: create_order
+    actor:
+      actor_type: user
+      actor_id: "{{client_id}}"
+      channel: api
+    params:
+      from_address: "Москва, ул. Тверская, д. 10"
+      to_address: "Санкт-Петербург, Невский пр., д. 28"
+      cell_size: M
+      parcel_type: документы
+      sender_delivery: self
+      recipient_delivery: self
+    expect:
+      status_code: 200
+      body:
+        data.status: order_created
+        data.pickup_type: self
+    capture:
+      order_id: data.order_id
+      source_cell_id: data.source_cell_id
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: list_client_orders
+    operation: list_client_orders
+    actor:
+      actor_type: user
+      actor_id: "{{client_id}}"
+      channel: api
+    params: {}
+    expect:
+      status_code: 200
+
+  # --- клиент: PIN → открыть → закрыть (посылка в ячейке) ---
+  - name: request_pin_client
+    operation: request_locker_access_code
+    actor:
+      actor_type: user
+      actor_id: "{{client_id}}"
+      channel: api
+    params:
+      order_id: "{{order_id}}"
+      leg: pickup
+    expect:
+      status_code: 200
+    capture:
+      pin: data.pin
+
+  - name: view_pin_client
+    operation: view_locker_access_code
+    actor:
+      actor_type: user
+      actor_id: "{{client_id}}"
+      channel: api
+    params:
+      order_id: "{{order_id}}"
+      leg: pickup
+    expect:
+      status_code: 200
+      body:
+        data.pin: "{{pin}}"
+
+  - name: open_cell_client
+    operation: open_cell
+    actor:
+      actor_type: user
+      actor_id: "{{client_id}}"
+      channel: api
+    params:
+      order_id: "{{order_id}}"
+      leg: pickup
+      pin: "{{pin}}"
+    expect:
+      status_code: 200
+    wait_instance: true
+    expect_instance:
+      status: COMPLETED
+
+  - name: close_cell_client
+    operation: close_cell
+    actor:
+      actor_type: user
+      actor_id: "{{client_id}}"
+      channel: api
+    params:
+      order_id: "{{order_id}}"
+      leg: pickup
+    expect:
+      status_code: 200
+    wait_instance: true
+    expect_instance:
+      status: COMPLETED
+    # после close: order_parcel_confirmed + bind → directions
+
+  # --- водитель: биржа → резерв → погрузка ---
+  - name: list_driver_exchange
+    operation: list_driver_exchange
+    actor:
+      actor_type: user
+      actor_id: "{{driver_id}}"
+      channel: api
+    params: {}
+    expect:
+      status_code: 200
+    capture:
+      direction_id: data.directions.0.id
+
+  - name: reserve_direction_slot
+    operation: reserve_direction_slot
+    actor:
+      actor_type: user
+      actor_id: "{{driver_id}}"
+      channel: api
+    params:
+      direction_id: "{{direction_id}}"
+      capacity: 1
+    expect:
+      status_code: 200
+      body:
+        data.status: reservation_active
+    capture:
+      reservation_id: data.reservation_id
+
+  - name: start_loading
+    operation: start_loading
+    actor:
+      actor_type: user
+      actor_id: "{{driver_id}}"
+      channel: api
+    params:
+      reservation_id: "{{reservation_id}}"
+    expect:
+      status_code: 200
+    wait_instance: true
+    expect_instance:
+      status: COMPLETED
+
+  # --- водитель: PIN → open/close pickup (забрать из ячейки) ---
+  - name: request_pin_driver
+    operation: request_locker_access_code
+    actor:
+      actor_type: user
+      actor_id: "{{driver_id}}"
+      channel: api
+    params:
+      order_id: "{{order_id}}"
+      leg: pickup
+    expect:
+      status_code: 200
+    capture:
+      driver_pin: data.pin
+
+  - name: open_cell_driver
+    operation: open_cell
+    actor:
+      actor_type: user
+      actor_id: "{{driver_id}}"
+      channel: api
+    params:
+      order_id: "{{order_id}}"
+      leg: pickup
+      pin: "{{driver_pin}}"
+    expect:
+      status_code: 200
+    wait_instance: true
+    expect_instance:
+      status: COMPLETED
+
+  - name: close_cell_driver
+    operation: close_cell
+    actor:
+      actor_type: user
+      actor_id: "{{driver_id}}"
+      channel: api
+    params:
+      order_id: "{{order_id}}"
+      leg: pickup
+    expect:
+      status_code: 200
+    wait_instance: true
+    expect_instance:
+      status: COMPLETED
+
+  - name: complete_loading
+    operation: complete_loading
+    actor:
+      actor_type: user
+      actor_id: "{{driver_id}}"
+      channel: api
+    params:
+      direction_id: "{{direction_id}}"
+    expect:
+      status_code: 200
+    wait_instance: true
+    expect_instance:
+      status: COMPLETED

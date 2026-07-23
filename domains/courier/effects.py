@@ -224,6 +224,40 @@ def sync_locker_cell_status(
     )
 
 
+def reserve_locker_cell_effect(
+    session_domain, db, context, instance, effect_params
+) -> EffectResult:
+    """
+    Effect locker_reserve_cell: CAS free→reserved + bind current_order_id.
+    order_id из context (payload create_order).
+    """
+    _ = db
+    _ = effect_params
+    ctx = context or {}
+    cell_id = int(
+        ctx.get("applied_entity_id") or ctx.get("cell_id") or instance["entity_id"]
+    )
+    order_id = ctx.get("order_id")
+    if order_id is None:
+        order_id = _payload_dict(instance).get("order_id")
+    if not order_id:
+        return EffectResult(ok=False, error="ORDER_ID_REQUIRED")
+
+    ok = db_layer.reserve_cell_for_order(
+        session_domain, cell_id, int(order_id)
+    )
+    if not ok:
+        return EffectResult(ok=False, error="RESERVE_CELL_FAILED")
+    return EffectResult(
+        ok=True,
+        payload={
+            "cell_id": cell_id,
+            "order_id": int(order_id),
+            "cell_status": "locker_reserved",
+        },
+    )
+
+
 def sync_reservation_status(
     session_domain, db, context, instance, effect_params
 ) -> EffectResult:

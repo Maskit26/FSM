@@ -168,15 +168,14 @@ def find_nearest_free_cell(
     return scored[0][1]
 
 
-def reserve_and_bind_cells(
+def reserve_cell_for_order(
     session: Session,
+    cell_id: int,
     order_id: int,
-    source_cell_id: int,
-    dest_cell_id: int,
-) -> None:
+) -> bool:
     """
-    Резервирует две ячейки под заказ и пишет current_order_id.
-    Обе ячейки должны быть свободны, иначе ошибка.
+    Атомарно: locker_free → locker_reserved + current_order_id.
+    Возвращает True только если CAS успешен (ячейка была свободна).
     """
     result = session.execute(
         text(
@@ -185,17 +184,28 @@ def reserve_and_bind_cells(
             SET status = 'locker_reserved',
                 current_order_id = :order_id,
                 updated_at = UTC_TIMESTAMP()
-            WHERE (id = :source_id OR id = :dest_id)
+            WHERE id = :cell_id
               AND status = 'locker_free'
             """
         ),
-        {
-            "order_id": order_id,
-            "source_id": source_cell_id,
-            "dest_id": dest_cell_id,
-        },
+        {"cell_id": cell_id, "order_id": order_id},
     )
-    if int(result.rowcount or 0) != 2:
+    return int(result.rowcount or 0) == 1
+
+
+def reserve_and_bind_cells(
+    session: Session,
+    order_id: int,
+    source_cell_id: int,
+    dest_cell_id: int,
+) -> None:
+    """
+    Резервирует две ячейки под заказ (sync helper).
+    Для create_order используйте FSM locker_reserve_cell.
+    """
+    ok_src = reserve_cell_for_order(session, source_cell_id, order_id)
+    ok_dst = reserve_cell_for_order(session, dest_cell_id, order_id)
+    if not (ok_src and ok_dst):
         raise RuntimeError("failed to reserve both cells")
 
 

@@ -166,3 +166,33 @@ def build_invoke_order_context(
     }
     ctx = build_order_context(session_domain, None, {}, instance)
     return ctx, instance
+
+
+def build_locker_context(session_domain, db, runtime_ctx, instance) -> dict[str, Any]:
+    """
+    Context для процессов entity_type=locker (резерв ячейки и т.п.).
+    entity_id инстанса = cell_id; order_id берётся из payload.
+    """
+    _ = db
+    _ = runtime_ctx
+    cell_id = int(instance["entity_id"])
+    payload = _payload_dict(instance)
+    order_id_raw = payload.get("order_id")
+    order_id: Optional[int] = None
+    if order_id_raw is not None and str(order_id_raw).strip() != "":
+        order_id = int(order_id_raw)
+
+    order = db_layer.get_order(session_domain, order_id) if order_id else None
+    cell_status = db_layer.get_cell_status(session_domain, cell_id)
+    locker_city = db_layer.get_locker_city_by_cell(session_domain, cell_id)
+
+    return {
+        "cell_id": cell_id,
+        "cell_status": cell_status,
+        "locker_city": locker_city,
+        "order_id": order_id,
+        "order": order,
+        "cell_role": payload.get("cell_role"),
+        "source_cell_id": (order or {}).get("source_cell_id") if order else None,
+        "dest_cell_id": (order or {}).get("dest_cell_id") if order else None,
+    }

@@ -406,6 +406,42 @@ def can_complete_loading(
     return _match_reservation_edge(context, guard_params)
 
 
+def can_reserve_locker_cell(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """
+    Резерв ячейки под заказ: ячейка свободна в домене и привязана к order
+    как source или dest (order_id в payload / context).
+    """
+    _ = db
+    _ = session_domain
+    _ = instance
+    _ = guard_params
+    ctx = context or {}
+    cell_id = ctx.get("cell_id")
+    if not cell_id:
+        return GuardResult(ok=False, reason="CELL_MISSING")
+
+    status = str(ctx.get("cell_status") or "")
+    if status != "locker_free":
+        return GuardResult(ok=False, reason=f"CELL_NOT_FREE:{status or 'none'}")
+
+    order_id = ctx.get("order_id")
+    order = ctx.get("order")
+    if not order_id or order is None:
+        return GuardResult(ok=False, reason="ORDER_REQUIRED")
+
+    src = order.get("source_cell_id")
+    dst = order.get("dest_cell_id")
+    if int(cell_id) not in {
+        int(src) if src is not None else -1,
+        int(dst) if dst is not None else -1,
+    }:
+        return GuardResult(ok=False, reason="CELL_NOT_ON_ORDER")
+
+    return GuardResult(ok=True)
+
+
 def _match_reservation_edge(context, guard_params) -> GuardResult:
     ctx = context or {}
     params = guard_params or {}

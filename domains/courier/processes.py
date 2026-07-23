@@ -23,12 +23,17 @@ from domains.courier.commands import (
     start_loading,
     take_courier_order,
 )
-from domains.courier.context import build_order_context, build_reservation_context
+from domains.courier.context import (
+    build_locker_context,
+    build_order_context,
+    build_reservation_context,
+)
 from domains.courier.effects import (
     assign_executor_effect,
     close_cell_effect,
     open_cell_effect,
     remove_executor_effect,
+    reserve_locker_cell_effect,
     sync_locker_cell_status,
     sync_reservation_status,
 )
@@ -38,6 +43,7 @@ from domains.courier.guards import (
     can_complete_loading,
     can_open_cell,
     can_remove_executor,
+    can_reserve_locker_cell,
     can_start_loading,
 )
 from domains.courier.queries import (
@@ -167,6 +173,16 @@ def register_all(service_id: str) -> None:
             initial_state="reservation_active",
         )
     )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
+            process_name="locker_reserve",
+            entity_type="locker",
+            event_name="locker_reserve_cell",
+            context_builder=build_locker_context,
+            initial_state="locker_free",
+        )
+    )
 
     default_guard_registry.register(
         service_id, "can_assign_executor", can_assign_executor
@@ -182,6 +198,9 @@ def register_all(service_id: str) -> None:
     default_guard_registry.register(
         service_id, "can_complete_loading", can_complete_loading
     )
+    default_guard_registry.register(
+        service_id, "can_reserve_locker_cell", can_reserve_locker_cell
+    )
     default_effect_registry.register(
         service_id, "assign_executor_effect", assign_executor_effect
     )
@@ -196,6 +215,9 @@ def register_all(service_id: str) -> None:
     )
     default_effect_registry.register(
         service_id, "sync_locker_cell_status", sync_locker_cell_status
+    )
+    default_effect_registry.register(
+        service_id, "reserve_locker_cell_effect", reserve_locker_cell_effect
     )
     default_effect_registry.register(
         service_id, "sync_reservation_status", sync_reservation_status
