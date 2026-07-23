@@ -1144,7 +1144,7 @@ def reserve_orders_for_direction(
 ) -> tuple[int, int, datetime]:
     """
     Резерв до capacity заказов за водителем (как old reserve_orders_for_direction).
-    Returns (reservation_id, reserved_count, expires_at).
+    Returns (reservation_id, reserved_count, expires_at, order_ids).
     Raises ValueError with code-like message on business failure.
     """
     if capacity <= 0:
@@ -1170,10 +1170,12 @@ def reserve_orders_for_direction(
             """
             SELECT COUNT(DISTINCT so.order_id)
             FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
             WHERE so.direction_id = :direction_id
               AND so.leg = 'pickup'
               AND so.reserved_by_driver_id IS NULL
               AND so.trip_id IS NULL
+              AND o.status IN ('order_parcel_confirmed', 'order_parcel_submitted')
             """
         ),
         {"direction_id": direction_id},
@@ -1206,12 +1208,14 @@ def reserve_orders_for_direction(
     order_rows = session.execute(
         text(
             f"""
-            SELECT DISTINCT so.order_id
+            SELECT so.order_id
             FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
             WHERE so.direction_id = :direction_id
-              AND so.leg IN ('pickup', 'delivery')
+              AND so.leg = 'pickup'
               AND so.reserved_by_driver_id IS NULL
               AND so.trip_id IS NULL
+              AND o.status IN ('order_parcel_confirmed', 'order_parcel_submitted')
             ORDER BY so.order_id ASC
             LIMIT {int(capacity)}
             """
@@ -1255,7 +1259,7 @@ def reserve_orders_for_direction(
         {"count": reserved_count, "reservation_id": reservation_id},
     )
     recalculate_direction_counters(session, direction_id)
-    return reservation_id, reserved_count, expires_at
+    return reservation_id, reserved_count, expires_at, order_ids
 
 
 def get_driver_reservation(
@@ -1448,3 +1452,94 @@ def complete_driver_reservations_loading(
         params,
     )
     return int(result.rowcount or 0)
+
+
+def list_orders_by_reservation(
+    session: Session, reservation_id: int
+) -> list[dict[str, Any]]:
+    """Заказы резерва (pickup stage) с текущим orders.status."""
+    rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT o.id AS order_id, o.status
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            WHERE so.reservation_id = :reservation_id
+              AND so.leg = 'pickup'
+            ORDER BY o.id ASC
+            """
+        ),
+        {"reservation_id": reservation_id},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def validate_reservation_for_cancellation(
+    session: Session, reservation_id: int
+) -> tuple[bool, list[int], str]:
+    """
+    Можно отменить, если резерв active|loading и все заказы
+    ещё order_parcel_confirmed (водитель ничего не забрал).
+    Returns (ok, blocked_order_ids, error_code).
+    """
+    reservation = get_driver_reservation(session, reservation_id)
+    if reservation is None:
+        return False, [], "RESERVATION_NOT_FOUND"
+    status = str(reservation.get("status") or "")
+    if status not in ("reservation_active", "reservation_loading"):
+        return False, [], f"INVALID_RESERVATION_STATUS:{status}"
+
+    orders = list_orders_by_reservation(session, reservation_id)
+    if not orders:
+        return False, [], "NO_ORDERS_IN_RESERVATION"
+
+    blocked = [
+        int(o["order_id"])
+        for o in orders
+        if str(o.get("status") or "") != "order_parcel_confirmed"
+    ]
+    if blocked:
+        return False, blocked, f"ORDERS_NOT_CONFIRMED:{blocked}"
+    return True, [], ""
+
+
+def release_orders_from_reservation(session: Session, reservation_id: int) -> int:
+    """
+    Снять резерв с заказов: вернуть в пул направления
+    (reserved_by_driver_id / reservation_id → NULL на pickup+delivery).
+    Статус orders не меняется (остаётся order_parcel_confirmed).
+    """
+    reservation = get_driver_reservation(session, reservation_id)
+    if reservation is None:
+        raise ValueError("RESERVATION_NOT_FOUND")
+    direction_id = int(reservation["direction_id"])
+
+    count = session.execute(
+        text(
+            """
+            SELECT COUNT(DISTINCT order_id)
+            FROM stage_orders
+            WHERE reservation_id = :reservation_id
+              AND leg = 'pickup'
+            """
+        ),
+        {"reservation_id": reservation_id},
+    ).scalar()
+    released = int(count or 0)
+    if released == 0:
+        return 0
+
+    session.execute(
+        text(
+            """
+            UPDATE stage_orders
+            SET reserved_by_driver_id = NULL,
+                reservation_id = NULL
+            WHERE reservation_id = :reservation_id
+              AND leg IN ('pickup', 'delivery')
+            """
+        ),
+        {"reservation_id": reservation_id},
+    )
+    recalculate_direction_counters(session, direction_id)
+    return released

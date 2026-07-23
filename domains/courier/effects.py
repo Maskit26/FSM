@@ -286,3 +286,45 @@ def sync_reservation_status(
             "direction_id": ctx.get("direction_id"),
         },
     )
+
+
+def cancel_reservation_effect(
+    session_domain, db, context, instance, effect_params
+) -> EffectResult:
+    """
+    Отмена резерва: заказы обратно в пул направления (stage_orders),
+    затем mirror status → reservation_cancelled.
+    orders.status / platform order state не меняются (остаются parcel_confirmed).
+    """
+    _ = db
+    _ = effect_params
+    ctx = context or {}
+    reservation_id = int(
+        ctx.get("applied_entity_id")
+        or ctx.get("reservation_id")
+        or instance["entity_id"]
+    )
+    to_state = ctx.get("to_state") or "reservation_cancelled"
+
+    try:
+        released = db_layer.release_orders_from_reservation(
+            session_domain, reservation_id
+        )
+    except ValueError as exc:
+        return EffectResult(ok=False, error=str(exc))
+
+    ok = db_layer.set_reservation_status(
+        session_domain, reservation_id, str(to_state)
+    )
+    if not ok:
+        return EffectResult(ok=False, error="SYNC_RESERVATION_STATUS_FAILED")
+
+    return EffectResult(
+        ok=True,
+        payload={
+            "reservation_id": reservation_id,
+            "status": str(to_state),
+            "released_count": released,
+            "direction_id": ctx.get("direction_id"),
+        },
+    )

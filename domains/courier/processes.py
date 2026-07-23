@@ -13,6 +13,7 @@ from fsm_platform.host.operations import default_operation_registry
 from domains.courier.commands import (
     assign_executor,
     cancel_courier_order,
+    cancel_reservation,
     close_cell,
     complete_loading,
     create_order,
@@ -30,6 +31,7 @@ from domains.courier.context import (
 )
 from domains.courier.effects import (
     assign_executor_effect,
+    cancel_reservation_effect,
     close_cell_effect,
     open_cell_effect,
     remove_executor_effect,
@@ -39,6 +41,7 @@ from domains.courier.effects import (
 )
 from domains.courier.guards import (
     can_assign_executor,
+    can_cancel_reservation,
     can_close_cell,
     can_complete_loading,
     can_open_cell,
@@ -93,6 +96,9 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "start_loading", "command", start_loading
+    )
+    default_operation_registry.register(
+        service_id, "cancel_reservation", "command", cancel_reservation
     )
     default_operation_registry.register(
         service_id, "complete_loading", "command", complete_loading
@@ -176,6 +182,16 @@ def register_all(service_id: str) -> None:
     default_process_registry.register(
         ProcessDef(
             service_id=service_id,
+            process_name="cancel_reservation",
+            entity_type="driver_reservations",
+            event_name="cancel_reservation",
+            context_builder=build_reservation_context,
+            initial_state="reservation_active",
+        )
+    )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
             process_name="locker_reserve",
             entity_type="locker",
             event_name="locker_reserve_cell",
@@ -197,6 +213,9 @@ def register_all(service_id: str) -> None:
     )
     default_guard_registry.register(
         service_id, "can_complete_loading", can_complete_loading
+    )
+    default_guard_registry.register(
+        service_id, "can_cancel_reservation", can_cancel_reservation
     )
     default_guard_registry.register(
         service_id, "can_reserve_locker_cell", can_reserve_locker_cell
@@ -221,5 +240,8 @@ def register_all(service_id: str) -> None:
     )
     default_effect_registry.register(
         service_id, "sync_reservation_status", sync_reservation_status
+    )
+    default_effect_registry.register(
+        service_id, "cancel_reservation_effect", cancel_reservation_effect
     )
 

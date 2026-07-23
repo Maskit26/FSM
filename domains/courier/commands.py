@@ -539,7 +539,7 @@ def reserve_direction_slot(
         )
 
     try:
-        reservation_id, reserved_count, expires_at = (
+        reservation_id, reserved_count, expires_at, order_ids = (
             db_layer.reserve_orders_for_direction(
                 domain_session, direction_id, driver_id, capacity
             )
@@ -558,6 +558,7 @@ def reserve_direction_slot(
             "driver_user_id": driver_id,
             "requested_count": capacity,
             "reserved_count": reserved_count,
+            "order_ids": order_ids,
             "expires_at": expires_at.isoformat() + "Z",
             "status": "reservation_active",
         },
@@ -618,6 +619,74 @@ def start_loading(
             "reservation_id": reservation_id,
             "direction_id": int(reservation["direction_id"]),
             "driver_user_id": driver_id,
+            "status": "pending_fsm",
+        },
+    }
+
+
+def cancel_reservation(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Водитель отменяет резерв: заказы возвращаются на направление,
+    FSM driver_reservations → reservation_cancelled.
+    params: reservation_id.
+    Можно из reservation_active или reservation_loading, пока все заказы
+    ещё order_parcel_confirmed.
+    """
+    try:
+        driver_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not driver_id:
+        raise ValueError("actor.actor_id required")
+
+    user = db_layer.get_user(domain_session, driver_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
+    if str(user.get("role_name") or "") != "driver":
+        raise DomainError("ROLE_NOT_ALLOWED", "only driver can cancel reservation")
+
+    reservation_id = int(
+        params.get("reservation_id") or params.get("entity_id") or 0
+    )
+    if not reservation_id:
+        raise ValueError("reservation_id required")
+
+    reservation = db_layer.get_driver_reservation(domain_session, reservation_id)
+    if reservation is None:
+        raise DomainError("RESERVATION_NOT_FOUND", f"reservation {reservation_id}")
+    if int(reservation["driver_user_id"]) != driver_id:
+        raise DomainError("NOT_RESERVATION_OWNER", "reservation belongs to another driver")
+
+    status = str(reservation.get("status") or "")
+    if status not in ("reservation_active", "reservation_loading"):
+        raise DomainError("INVALID_RESERVATION_STATUS", f"status={status}")
+
+    ok, blocked, err = db_layer.validate_reservation_for_cancellation(
+        domain_session, reservation_id
+    )
+    if not ok:
+        raise DomainError(err or "CANCEL_NOT_ALLOWED", err or "cancel blocked")
+
+    return {
+        "entity_type": "driver_reservations",
+        "entity_id": reservation_id,
+        "initial_state": status,
+        "enqueue": {
+            "process_name": "cancel_reservation",
+            "payload": {
+                "direction_id": int(reservation["direction_id"]),
+                "executor_user_id": driver_id,
+                "driver_user_id": driver_id,
+                "source": "cancel_reservation",
+            },
+        },
+        "data": {
+            "reservation_id": reservation_id,
+            "direction_id": int(reservation["direction_id"]),
+            "driver_user_id": driver_id,
+            "blocked_order_ids": blocked,
             "status": "pending_fsm",
         },
     }

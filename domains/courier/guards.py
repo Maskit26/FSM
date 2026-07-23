@@ -406,6 +406,28 @@ def can_complete_loading(
     return _match_reservation_edge(context, guard_params)
 
 
+def can_cancel_reservation(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """
+    Отмена резерва: owner + active|loading + все заказы ещё
+    order_parcel_confirmed (как old validate_reservation_for_cancellation).
+    """
+    _ = db
+    _ = instance
+    base = _match_reservation_edge(context, guard_params)
+    if not base.ok:
+        return base
+
+    reservation_id = int((context or {}).get("reservation_id") or 0)
+    ok, blocked, err = db_layer.validate_reservation_for_cancellation(
+        session_domain, reservation_id
+    )
+    if not ok:
+        return GuardResult(ok=False, reason=err or "CANCEL_NOT_ALLOWED")
+    return GuardResult(ok=True)
+
+
 def can_reserve_locker_cell(
     session_domain, db, context, instance, guard_params
 ) -> GuardResult:

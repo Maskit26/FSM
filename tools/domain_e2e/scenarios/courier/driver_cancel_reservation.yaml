@@ -1,0 +1,73 @@
+# Водитель: резерв → отмена → заказы снова на бирже.
+#
+# Предусловие: ≥1 (лучше 3) order_parcel_confirmed на направлении
+# (после client_deposit_x3_to_direction.yaml на чистой БД).
+#
+# Сиды: user 1 = driver, city=Москва.
+# После cancel: orders остаются order_parcel_confirmed;
+# stage_orders без reserved_by → доступны другим водителям.
+
+name: driver_cancel_reservation
+service_id: svc_courier_01
+vars:
+  driver_id: "1"
+defaults:
+  poll_timeout: 60
+  poll_interval: 0.5
+
+steps:
+  - name: list_before
+    operation: list_driver_exchange
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: {}
+    expect: { status_code: 200 }
+    capture:
+      direction_id: data.directions.0.id
+
+  - name: reserve_3
+    operation: reserve_direction_slot
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params:
+      direction_id: "{{direction_id}}"
+      capacity: 3
+    expect:
+      status_code: 200
+      body:
+        data.status: reservation_active
+        data.reserved_count: 3
+    capture:
+      reservation_id: data.reservation_id
+      order_id_1: data.order_ids.0
+
+  - name: cancel_reservation
+    operation: cancel_reservation
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { reservation_id: "{{reservation_id}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  # После cancel заказы снова available (ещё не взяты повторно)
+  - name: list_after_cancel
+    operation: list_driver_exchange
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: {}
+    expect:
+      status_code: 200
+      body:
+        data.directions.0.orders_available: 3
+    capture:
+      direction_id_after: data.directions.0.id
+
+  # Доказательство, что пул снова берётся: повторный резерв
+  - name: reserve_again
+    operation: reserve_direction_slot
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params:
+      direction_id: "{{direction_id_after}}"
+      capacity: 3
+    expect:
+      status_code: 200
+      body:
+        data.status: reservation_active
+        data.reserved_count: 3

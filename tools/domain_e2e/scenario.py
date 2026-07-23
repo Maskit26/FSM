@@ -102,7 +102,16 @@ def assert_expect(
 
     want_code = expect.get("status_code")
     if want_code is not None and int(status_code) != int(want_code):
-        errors.append(f"status_code: expected {want_code}, got {status_code}")
+        detail = ""
+        if isinstance(body, dict):
+            err = body.get("detail")
+            if isinstance(err, dict):
+                code = err.get("error_code") or err.get("message")
+                if code:
+                    detail = f" ({code})"
+            elif err is not None:
+                detail = f" ({err})"
+        errors.append(f"status_code: expected {want_code}, got {status_code}{detail}")
 
     body_expect = expect.get("body") or {}
     if isinstance(body_expect, dict):

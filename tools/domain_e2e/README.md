@@ -20,9 +20,17 @@ cd C:\FSM_Platform
 $env:PYTHONPATH = "C:\FSM_Platform"
 
 python -m tools.domain_e2e.runner scenarios/courier/client_self_pickup.yaml
+python -m tools.domain_e2e.runner scenarios/courier/client_deposit_x3_to_direction.yaml
+python -m tools.domain_e2e.runner scenarios/courier/driver_loading_x3.yaml
+python -m tools.domain_e2e.runner scenarios/courier/driver_cancel_reservation.yaml
 python -m tools.domain_e2e.runner scenarios/courier/
-python -m tools.domain_e2e.runner scenarios/courier/ --report reports/run.md
 ```
+
+Порядок x3: сначала `client_deposit_x3_to_direction` (заказы на бирже), потом `driver_loading_x3` или `driver_cancel_reservation`.
+
+Перед прогонами на domain DB: `CALL clear_test_data();` (скрипт `sql/domain/012_clear_test_data.sql`).  
+Сразу после — на **platform** DB: `sql/platform/003_clear_test_runtime.sql` (entity_fsm_state + instances).  
+Чистить только домен недостаточно: platform хранит свои FSM-состояния по тем же entity_id.
 
 Пути к сценариям и `--report` резолвятся относительно `tools/domain_e2e/` (и CWD).
 
