@@ -1,0 +1,46 @@
+# Водитель: lifecycle рейса после погрузки.
+# list_driver_trips → start_trip → (позже: complete_trip).
+#
+# Предусловие: есть активный trip_assigned у driver
+# (после driver_loading_x3.yaml на той же БД).
+#
+# Сиды: user 1 = driver.
+# complete_trip пока не реализован — шаг добавим вместе с командой.
+
+name: driver_trip_lifecycle
+service_id: svc_courier_01
+vars:
+  driver_id: "1"
+defaults:
+  poll_timeout: 60
+  poll_interval: 0.5
+
+steps:
+  - name: list_driver_trips
+    operation: list_driver_trips
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: {}
+    expect:
+      status_code: 200
+      body:
+        data.trips.0.status: trip_assigned
+    capture:
+      trip_id: data.active_trip_id
+
+  - name: start_trip
+    operation: start_trip
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { trip_id: "{{trip_id}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: list_driver_trips_in_progress
+    operation: list_driver_trips
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: {}
+    expect:
+      status_code: 200
+      body:
+        data.trips.0.status: trip_in_progress
+        data.active_trip_id: "{{trip_id}}"

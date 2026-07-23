@@ -16,6 +16,7 @@ BEGIN
     DELETE FROM stage_orders;
     DELETE FROM driver_reservations;
     DELETE FROM directions;
+    DELETE FROM trips;
 
     DELETE FROM orders;
 

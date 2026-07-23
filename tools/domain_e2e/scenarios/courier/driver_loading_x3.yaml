@@ -1,11 +1,11 @@
-# Водитель: резерв 3 заказов с направления → погрузка → ячейки → complete.
+# Водитель: резерв 3 заказов → погрузка → ячейки → complete_loading
+# (создаёт trip в domain + отдаёт data.trip_id).
 #
-# Предусловие: на бирже ≥3 доступных order_parcel_confirmed на направлении
-# из city водителя (обычно после client_deposit_x3_to_direction.yaml
-# на чистой БД — ровно эти 3 заказа).
+# Предусловие: ≥3 order_parcel_confirmed на направлении
+# (обычно после client_deposit_x3_to_direction.yaml на чистой БД).
 #
 # Сиды: user 1 = driver, city=Москва.
-# order_ids берутся из ответа reserve_direction_slot (FIFO на направлении).
+# Рейс дальше — scenarios/courier/driver_trip_lifecycle.yaml
 
 name: driver_loading_x3
 service_id: svc_courier_01
@@ -125,6 +125,11 @@ steps:
     operation: complete_loading
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
     params: { direction_id: "{{direction_id}}" }
-    expect: { status_code: 200 }
+    expect:
+      status_code: 200
+      body:
+        data.trip_status: trip_assigned
     wait_instance: true
     expect_instance: { status: COMPLETED }
+    capture:
+      trip_id: data.trip_id

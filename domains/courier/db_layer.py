@@ -1543,3 +1543,143 @@ def release_orders_from_reservation(session: Session, reservation_id: int) -> in
     )
     recalculate_direction_counters(session, direction_id)
     return released
+
+
+def create_trip_with_orders(
+    session: Session,
+    *,
+    direction_id: int,
+    driver_user_id: int,
+    order_ids: list[int],
+) -> int:
+    """
+    Создаёт trip (status=trip_assigned) и пишет trip_id в stage_orders
+    для переданных заказов (pickup+delivery).
+    """
+    if not order_ids:
+        raise ValueError("NO_ORDERS_FOR_TRIP")
+
+    direction = get_direction(session, direction_id)
+    if direction is None:
+        raise ValueError("DIRECTION_NOT_FOUND")
+
+    session.execute(
+        text(
+            """
+            INSERT INTO trips (
+                driver_user_id, from_city, to_city,
+                pickup_locker_id, delivery_locker_id,
+                status, active, created_at
+            ) VALUES (
+                :driver_user_id, :from_city, :to_city,
+                :pickup_locker_id, :delivery_locker_id,
+                'trip_assigned', 1, UTC_TIMESTAMP()
+            )
+            """
+        ),
+        {
+            "driver_user_id": driver_user_id,
+            "from_city": direction["from_city"],
+            "to_city": direction["to_city"],
+            "pickup_locker_id": direction["pickup_locker_id"],
+            "delivery_locker_id": direction["delivery_locker_id"],
+        },
+    )
+    trip_id = int(session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one())
+
+    placeholders = ", ".join(f":oid_{i}" for i in range(len(order_ids)))
+    params: dict[str, Any] = {f"oid_{i}": oid for i, oid in enumerate(order_ids)}
+    params["trip_id"] = trip_id
+    session.execute(
+        text(
+            f"""
+            UPDATE stage_orders
+            SET trip_id = :trip_id
+            WHERE order_id IN ({placeholders})
+              AND leg IN ('pickup', 'delivery')
+            """
+        ),
+        params,
+    )
+    recalculate_direction_counters(session, direction_id)
+    return trip_id
+
+
+def get_trip(session: Session, trip_id: int) -> Optional[dict[str, Any]]:
+    row = session.execute(
+        text(
+            """
+            SELECT id, driver_user_id, from_city, to_city,
+                   pickup_locker_id, delivery_locker_id,
+                   status, description, active, created_at
+            FROM trips
+            WHERE id = :id
+            """
+        ),
+        {"id": trip_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def set_trip_status(session: Session, trip_id: int, status: str) -> bool:
+    result = session.execute(
+        text(
+            """
+            UPDATE trips
+            SET status = :status
+            WHERE id = :id
+            """
+        ),
+        {"id": trip_id, "status": status},
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def list_trip_order_ids(session: Session, trip_id: int) -> list[int]:
+    rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT order_id
+            FROM stage_orders
+            WHERE trip_id = :trip_id
+              AND leg = 'pickup'
+            ORDER BY order_id ASC
+            """
+        ),
+        {"trip_id": trip_id},
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def list_driver_trips(
+    session: Session,
+    driver_user_id: int,
+    *,
+    statuses: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    """Рейсы водителя; по умолчанию assigned + in_progress."""
+    wanted = statuses or ["trip_assigned", "trip_in_progress"]
+    placeholders = ", ".join(f":st_{i}" for i in range(len(wanted)))
+    params: dict[str, Any] = {f"st_{i}": s for i, s in enumerate(wanted)}
+    params["driver_user_id"] = driver_user_id
+    rows = session.execute(
+        text(
+            f"""
+            SELECT id, driver_user_id, from_city, to_city,
+                   pickup_locker_id, delivery_locker_id,
+                   status, description, active, created_at
+            FROM trips
+            WHERE driver_user_id = :driver_user_id
+              AND active = 1
+              AND status IN ({placeholders})
+            ORDER BY id DESC
+            """
+        ),
+        params,
+    ).mappings().all()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["order_ids"] = list_trip_order_ids(session, int(item["id"]))
+        out.append(item)
+    return out

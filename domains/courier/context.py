@@ -196,3 +196,35 @@ def build_locker_context(session_domain, db, runtime_ctx, instance) -> dict[str,
         "source_cell_id": (order or {}).get("source_cell_id") if order else None,
         "dest_cell_id": (order or {}).get("dest_cell_id") if order else None,
     }
+
+
+def build_trip_context(session_domain, db, runtime_ctx, instance) -> dict[str, Any]:
+    """Context для процессов entity_type=trip."""
+    _ = db
+    trip_id = int(instance["entity_id"])
+    payload = _payload_dict(instance)
+
+    executor_raw = (
+        payload.get("executor_user_id")
+        or payload.get("driver_user_id")
+        or instance.get("actor_id")
+    )
+    executor_id: Optional[int] = None
+    if executor_raw is not None and str(executor_raw).strip() != "":
+        executor_id = int(executor_raw)
+
+    trip = db_layer.get_trip(session_domain, trip_id)
+    executor = (
+        db_layer.get_user(session_domain, executor_id) if executor_id else None
+    )
+    order_ids = db_layer.list_trip_order_ids(session_domain, trip_id)
+
+    return {
+        "trip": trip,
+        "trip_id": trip_id,
+        "order_ids": order_ids,
+        "payload": payload,
+        "executor_id": executor_id,
+        "executor": executor,
+        "runtime_ctx": runtime_ctx,
+    }

@@ -328,3 +328,27 @@ def cancel_reservation_effect(
             "direction_id": ctx.get("direction_id"),
         },
     )
+
+
+def sync_trip_status(
+    session_domain, db, context, instance, effect_params
+) -> EffectResult:
+    """Зеркало trips.status = to_state после FSM apply."""
+    _ = db
+    ctx = context or {}
+    params = effect_params or {}
+    trip_id = int(
+        ctx.get("applied_entity_id")
+        or ctx.get("trip_id")
+        or instance["entity_id"]
+    )
+    to_state = ctx.get("to_state") or params.get("to_state")
+    if not to_state:
+        return EffectResult(ok=False, error="TO_STATE_REQUIRED")
+    ok = db_layer.set_trip_status(session_domain, trip_id, str(to_state))
+    if not ok:
+        return EffectResult(ok=False, error="SYNC_TRIP_STATUS_FAILED")
+    return EffectResult(
+        ok=True,
+        payload={"trip_id": trip_id, "status": str(to_state)},
+    )

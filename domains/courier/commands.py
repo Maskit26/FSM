@@ -759,9 +759,26 @@ def complete_loading(
         domain_session, direction_id, driver_id, picked
     )
 
+    try:
+        trip_id = db_layer.create_trip_with_orders(
+            domain_session,
+            direction_id=direction_id,
+            driver_user_id=driver_id,
+            order_ids=picked,
+        )
+    except ValueError as exc:
+        raise DomainError(str(exc), str(exc)) from exc
+
     return {
         "entity_type": "driver_reservations",
         "entity_id": loading_ids[0],
+        "related_entities": [
+            {
+                "entity_type": "trip",
+                "entity_id": trip_id,
+                "initial_state": "trip_assigned",
+            }
+        ],
         "enqueues": [
             {
                 "entity_type": "driver_reservations",
@@ -782,6 +799,92 @@ def complete_loading(
             "reservation_ids": loading_ids,
             "picked_order_ids": picked,
             "released_rows": released,
+            "trip_id": trip_id,
+            "trip_status": "trip_assigned",
+            "status": "pending_fsm",
+        },
+    }
+
+
+def start_trip(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Старт рейса: FSM trip_assigned → trip_in_progress + заказы в transit.
+    params: trip_id.
+    """
+    try:
+        driver_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not driver_id:
+        raise ValueError("actor.actor_id required")
+
+    user = db_layer.get_user(domain_session, driver_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
+    if str(user.get("role_name") or "") != "driver":
+        raise DomainError("ROLE_NOT_ALLOWED", "only driver can start trip")
+
+    trip_id = int(params.get("trip_id") or params.get("entity_id") or 0)
+    if not trip_id:
+        raise ValueError("trip_id required")
+
+    trip = db_layer.get_trip(domain_session, trip_id)
+    if trip is None:
+        raise DomainError("TRIP_NOT_FOUND", f"trip {trip_id}")
+    if int(trip.get("driver_user_id") or 0) != driver_id:
+        raise DomainError("NOT_TRIP_OWNER", "trip belongs to another driver")
+    if int(trip.get("active") or 0) != 1:
+        raise DomainError("TRIP_INACTIVE", f"trip {trip_id} inactive")
+    if str(trip.get("status") or "") != "trip_assigned":
+        raise DomainError(
+            "INVALID_TRIP_STATUS",
+            f"status={trip.get('status')}",
+        )
+
+    order_ids = db_layer.list_trip_order_ids(domain_session, trip_id)
+    if not order_ids:
+        raise DomainError("NO_ORDERS_ON_TRIP", f"trip {trip_id} has no orders")
+
+    jobs: list[dict[str, Any]] = [
+        {
+            "entity_type": "trip",
+            "entity_id": trip_id,
+            "initial_state": "trip_assigned",
+            "process_name": "start_trip",
+            "payload": {
+                "executor_user_id": driver_id,
+                "driver_user_id": driver_id,
+                "source": "start_trip",
+            },
+        }
+    ]
+    for oid in order_ids:
+        jobs.append(
+            {
+                "entity_type": "order",
+                "entity_id": oid,
+                "initial_state": "order_picked_up_from_post1",
+                "process_name": "start_order_transit",
+                "payload": {
+                    "trip_id": trip_id,
+                    "executor_user_id": driver_id,
+                    "driver_user_id": driver_id,
+                    "source": "start_trip",
+                },
+            }
+        )
+
+    return {
+        "entity_type": "trip",
+        "entity_id": trip_id,
+        "initial_state": "trip_assigned",
+        "enqueues": jobs,
+        "data": {
+            "trip_id": trip_id,
+            "driver_user_id": driver_id,
+            "order_ids": order_ids,
             "status": "pending_fsm",
         },
     }

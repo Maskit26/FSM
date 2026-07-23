@@ -182,3 +182,40 @@ def list_driver_exchange(
             "directions": directions,
         }
     }
+
+
+def list_driver_trips(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Рейсы водителя (по умолчанию trip_assigned + trip_in_progress).
+    params.status — опционально один статус-фильтр.
+    """
+    try:
+        driver_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not driver_id:
+        raise ValueError("actor.actor_id required")
+
+    user = db_layer.get_user(domain_session, driver_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"User {driver_id} not found")
+    if str(user.get("role_name") or "") != "driver":
+        raise DomainError("NOT_A_DRIVER", "User is not a driver")
+
+    statuses: list[str] | None = None
+    raw = params.get("status")
+    if raw is not None and str(raw).strip() != "":
+        statuses = [str(raw).strip()]
+
+    trips = db_layer.list_driver_trips(
+        domain_session, driver_id, statuses=statuses
+    )
+    return {
+        "data": {
+            "driver_id": driver_id,
+            "trips": trips,
+            "active_trip_id": trips[0]["id"] if trips else None,
+        }
+    }
