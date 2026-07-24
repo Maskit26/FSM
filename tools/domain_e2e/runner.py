@@ -81,6 +81,18 @@ def run_step(
     status_code, body = client.invoke(service_id, operation, params, actor)
     errors = assert_expect(status_code=status_code, body=body, expect=expect)
 
+    wait_until = bool(step.get("wait_until", False))
+    if wait_until and expect and status_code < 400:
+        deadline = time.monotonic() + poll_timeout
+        while errors and time.monotonic() < deadline:
+            time.sleep(poll_interval)
+            status_code, body = client.invoke(
+                service_id, operation, params, actor
+            )
+            errors = assert_expect(
+                status_code=status_code, body=body, expect=expect
+            )
+
     captured: dict[str, Any] = {}
     capture_spec = step.get("capture") or {}
     if capture_spec and status_code < 400:

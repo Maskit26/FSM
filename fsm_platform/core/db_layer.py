@@ -542,6 +542,247 @@ class FsmDbLayer:
         )
         return int(result.lastrowid)
 
+    # --- fsm_sagas ---
+
+    def insert_saga(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        fail_policy: str = "fail_fast",
+        on_success: Optional[dict[str, Any]] = None,
+        on_fail: Optional[dict[str, Any]] = None,
+        payload: Optional[dict[str, Any]] = None,
+        actor_id: Optional[int] = None,
+    ) -> int:
+        """Создаёт RUNNING saga. Возвращает saga_id."""
+        result = session.execute(
+            text(
+                """
+                INSERT INTO fsm_sagas
+                    (service_id, status, fail_policy, on_success_json, on_fail_json,
+                     payload_json, actor_id, created_at, updated_at)
+                VALUES
+                    (:service_id, 'RUNNING', :fail_policy, :on_success_json, :on_fail_json,
+                     :payload_json, :actor_id, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "service_id": service_id,
+                "fail_policy": fail_policy,
+                "on_success_json": (
+                    json.dumps(on_success) if on_success is not None else None
+                ),
+                "on_fail_json": json.dumps(on_fail) if on_fail is not None else None,
+                "payload_json": json.dumps(payload or {}),
+                "actor_id": actor_id,
+            },
+        )
+        return int(result.lastrowid)
+
+    def insert_saga_child(
+        self,
+        session: SessionLike,
+        *,
+        saga_id: int,
+        instance_id: int,
+        entity_type: str,
+        entity_id: int,
+        process_name: str,
+    ) -> int:
+        """Привязывает PENDING instance к saga."""
+        result = session.execute(
+            text(
+                """
+                INSERT INTO fsm_saga_children
+                    (saga_id, instance_id, entity_type, entity_id, process_name,
+                     status, created_at, updated_at)
+                VALUES
+                    (:saga_id, :instance_id, :entity_type, :entity_id, :process_name,
+                     'PENDING', UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "saga_id": saga_id,
+                "instance_id": instance_id,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "process_name": process_name,
+            },
+        )
+        return int(result.lastrowid)
+
+    def get_saga(self, session: SessionLike, saga_id: int) -> Optional[dict[str, Any]]:
+        row = session.execute(
+            text(
+                """
+                SELECT id, service_id, status, fail_policy,
+                       on_success_json, on_fail_json, payload_json, actor_id,
+                       created_at, updated_at, finished_at
+                FROM fsm_sagas
+                WHERE id = :id
+                """
+            ),
+            {"id": saga_id},
+        ).mappings().first()
+        if not row:
+            return None
+        item = dict(row)
+        for key in ("on_success_json", "on_fail_json", "payload_json"):
+            raw = item.get(key)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item[key.replace("_json", "")] = json.loads(raw)
+                except json.JSONDecodeError:
+                    item[key.replace("_json", "")] = None
+            elif isinstance(raw, dict):
+                item[key.replace("_json", "")] = raw
+            else:
+                item[key.replace("_json", "")] = None
+        return item
+
+    def get_saga_child_by_instance(
+        self, session: SessionLike, instance_id: int
+    ) -> Optional[dict[str, Any]]:
+        row = session.execute(
+            text(
+                """
+                SELECT id, saga_id, instance_id, entity_type, entity_id,
+                       process_name, status, last_error
+                FROM fsm_saga_children
+                WHERE instance_id = :instance_id
+                """
+            ),
+            {"instance_id": instance_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def mark_saga_child_terminal(
+        self,
+        session: SessionLike,
+        instance_id: int,
+        status: str,
+        last_error: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        COMPLETED|FAILED для child. Возвращает saga_id или None если не child.
+        Идемпотентно: уже терминальный child не меняет status повторно.
+        """
+        child = self.get_saga_child_by_instance(session, instance_id)
+        if child is None:
+            return None
+        if str(child.get("status") or "") in (
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+        ):
+            return int(child["saga_id"])
+        session.execute(
+            text(
+                """
+                UPDATE fsm_saga_children
+                SET status = :status,
+                    last_error = :err,
+                    finished_at = UTC_TIMESTAMP(),
+                    updated_at = UTC_TIMESTAMP()
+                WHERE instance_id = :instance_id
+                  AND status IN ('PENDING', 'RUNNING')
+                """
+            ),
+            {
+                "instance_id": instance_id,
+                "status": status,
+                "err": (last_error or "")[:2000] if last_error else None,
+            },
+        )
+        return int(child["saga_id"])
+
+    def list_saga_children(
+        self, session: SessionLike, saga_id: int
+    ) -> list[dict[str, Any]]:
+        rows = session.execute(
+            text(
+                """
+                SELECT id, saga_id, instance_id, entity_type, entity_id,
+                       process_name, status, last_error
+                FROM fsm_saga_children
+                WHERE saga_id = :saga_id
+                ORDER BY id ASC
+                """
+            ),
+            {"saga_id": saga_id},
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def cancel_pending_saga_children(
+        self, session: SessionLike, saga_id: int
+    ) -> list[int]:
+        """CANCELLED на PENDING children + instances. Возвращает instance_ids."""
+        rows = session.execute(
+            text(
+                """
+                SELECT instance_id
+                FROM fsm_saga_children
+                WHERE saga_id = :saga_id AND status = 'PENDING'
+                FOR UPDATE
+                """
+            ),
+            {"saga_id": saga_id},
+        ).fetchall()
+        ids = [int(r[0]) for r in rows]
+        if not ids:
+            return []
+        placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
+        params: dict[str, Any] = {f"id_{i}": iid for i, iid in enumerate(ids)}
+        params["saga_id"] = saga_id
+        session.execute(
+            text(
+                f"""
+                UPDATE fsm_saga_children
+                SET status = 'CANCELLED',
+                    finished_at = UTC_TIMESTAMP(),
+                    updated_at = UTC_TIMESTAMP()
+                WHERE saga_id = :saga_id
+                  AND status = 'PENDING'
+                  AND instance_id IN ({placeholders})
+                """
+            ),
+            params,
+        )
+        session.execute(
+            text(
+                f"""
+                UPDATE server_fsm_instances
+                SET status = 'CANCELLED',
+                    finished_at = UTC_TIMESTAMP(),
+                    updated_at = UTC_TIMESTAMP(),
+                    last_error = 'SAGA_CANCELLED'
+                WHERE id IN ({placeholders})
+                  AND status = 'PENDING'
+                """
+            ),
+            {f"id_{i}": iid for i, iid in enumerate(ids)},
+        )
+        return ids
+
+    def cas_finish_saga(
+        self, session: SessionLike, saga_id: int, status: str
+    ) -> bool:
+        """CAS RUNNING → SUCCEEDED|FAILED. True если эта сессия выиграла финиш."""
+        result = session.execute(
+            text(
+                """
+                UPDATE fsm_sagas
+                SET status = :status,
+                    finished_at = UTC_TIMESTAMP(),
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :id AND status = 'RUNNING'
+                """
+            ),
+            {"id": saga_id, "status": status},
+        )
+        return int(result.rowcount or 0) == 1
+
     # --- domain_services (boot) ---
 
     def list_active_domain_services(

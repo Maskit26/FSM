@@ -174,6 +174,16 @@ Worker открывает `session_platform` + `session_domain`, владеет 
 - Fail на любом companion → `COMPANION_FAILED` (или более точный код вложенной ошибки) → instance FAILED; worker откатывает **обе** БД, включая уже применённый primary.
 - Цепочки через новый enqueue / `schedule_timer` остаются валидны для **отложенной** оркестрации; companions — для **синхронного** multi-entity в одном шаге (open_cell order+locker, taxi order+driver+client).
 
+**Оркестрация: companions vs saga vs timers**
+
+| Примитив | Когда | TX / async |
+|----------|--------|------------|
+| **companions** | 1 primary + мало sync entities (order↔locker) | один process-step, одна dual-tx |
+| **saga** | переменное N async children + fan-in `on_success` / `on_fail` | N instances; платформа считает прогресс |
+| **timers** | один отложенный process | `fsm_timers` → enqueue |
+
+Сага (v1): command возвращает `saga: { children[], on_success?, on_fail?, fail_policy }`. Runtime пишет `fsm_sagas` + child `server_fsm_instances` + `fsm_saga_children`. Worker при COMPLETED/FAILED child вызывает fan-in: `fail_fast` (дефолт) — первый fail → CANCELLED оставшихся PENDING + `on_fail`; все COMPLETED → `on_success`. Компенсация уже COMPLETED children — зона domain `on_fail` process, не платформы.
+
 ### 4.4. Guard routing
 
 - Несколько transitions на один `(entity_type, from_state, event_name)` — норма.
@@ -194,6 +204,7 @@ Worker открывает `session_platform` + `session_domain`, владеет 
 | `server_fsm_instances` | очередь: `service_id`, process_name, entity_type, entity_id, status, attempts, last_error |
 | `fsm_transition_logs` | аудит FSM-переходов (единственная log-таблица; не `fsm_action_logs`) |
 | `fsm_timers` | отложенные события |
+| `fsm_sagas` / `fsm_saga_children` | async saga: parent + children + fan-in |
 | `entity_fsm_state` | `(service_id, entity_type, entity_id) → current_state` |
 | `domain_services` | Domain Registry + `db_secret_ref` (§6.4); boot → `engine_by_service_id` в RAM |
 | `idempotency_keys` | Idempotency-Key → результат enqueue/invoke (§4.14) |

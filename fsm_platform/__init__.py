@@ -28,8 +28,10 @@ from fsm_platform.core import (
     default_effect_registry,
     default_guard_registry,
     default_process_registry,
+    on_child_terminal,
     run_instance,
     schedule_timer,
+    start_saga,
 )
 
 __all__ = [
@@ -48,6 +50,8 @@ __all__ = [
     "TransitionRunner",
     "schedule_timer",
     "cancel_timer",
+    "start_saga",
+    "on_child_terminal",
     "FsmResult",
     "GuardResult",
     "EffectResult",

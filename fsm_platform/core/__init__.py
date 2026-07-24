@@ -15,6 +15,7 @@ from .registry import (
     default_process_registry,
 )
 from .db_layer import FsmDbLayer
+from .sagas import on_child_terminal, start_saga
 from .state_store import EntityStateStore
 from .timers import cancel_timer, schedule_timer
 from .transition_executor import TransitionExecutor
@@ -44,6 +45,8 @@ __all__ = [
     "TransitionRunner",
     "schedule_timer",
     "cancel_timer",
+    "start_saga",
+    "on_child_terminal",
     "FsmResult",
     "GuardResult",
     "EffectResult",

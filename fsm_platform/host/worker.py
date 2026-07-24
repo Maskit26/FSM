@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from fsm_platform import run_instance
 from fsm_platform.core.db_layer import default_db_layer
+from fsm_platform.core.sagas import on_child_terminal
 from fsm_platform.core.types import FsmResult
 from fsm_platform.host import side_effects
 from fsm_platform.host.engines import domain_session, platform_session
@@ -82,6 +83,12 @@ def _failed_short_tx(instance: dict[str, Any], last_error: str) -> None:
             entity_type=instance.get("entity_type"),
             entity_id=instance.get("entity_id"),
             payload={"last_error": last_error},
+        )
+        on_child_terminal(
+            sp,
+            instance_id=int(instance["id"]),
+            status="FAILED",
+            last_error=last_error or "",
         )
         sp.commit()
     except Exception:
@@ -174,6 +181,11 @@ def process_one() -> bool:
                 payload=result.payload,
             )
             default_db_layer.mark_instance_completed(sp, int(instance["id"]))
+            on_child_terminal(
+                sp,
+                instance_id=int(instance["id"]),
+                status="COMPLETED",
+            )
             try:
                 sd.commit()
             except Exception:

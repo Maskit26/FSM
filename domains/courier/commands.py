@@ -807,8 +807,8 @@ def start_trip(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Старт рейса: context → can_start_trip → enqueue FSM
-    (trip_assigned → trip_in_progress + заказы в transit).
+    Старт рейса: context → can_start_trip → saga
+    (orders transit → then trip assigned→in_progress).
     params: trip_id.
     """
     from domains.courier.context import build_invoke_trip_context
@@ -841,45 +841,46 @@ def start_trip(
         raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
 
     order_ids = list(ctx.get("order_ids") or [])
-
-    jobs: list[dict[str, Any]] = [
-        {
-            "entity_type": "trip",
-            "entity_id": trip_id,
-            "initial_state": "trip_assigned",
-            "process_name": "start_trip",
-            "payload": {
-                "executor_user_id": driver_id,
-                "driver_user_id": driver_id,
-                "source": "start_trip",
-            },
-        }
-    ]
-    for oid in order_ids:
-        jobs.append(
-            {
-                "entity_type": "order",
-                "entity_id": oid,
-                "initial_state": "order_picked_up_from_post1",
-                "process_name": "start_order_transit",
-                "payload": {
-                    "trip_id": trip_id,
-                    "executor_user_id": driver_id,
-                    "driver_user_id": driver_id,
-                    "source": "start_trip",
-                },
-            }
-        )
+    trip_payload = {
+        "executor_user_id": driver_id,
+        "driver_user_id": driver_id,
+        "source": "start_trip",
+    }
 
     return {
         "entity_type": "trip",
         "entity_id": trip_id,
         "initial_state": "trip_assigned",
-        "enqueues": jobs,
+        "saga": {
+            "fail_policy": "fail_fast",
+            "children": [
+                {
+                    "entity_type": "order",
+                    "entity_id": oid,
+                    "initial_state": "order_picked_up_from_post1",
+                    "process_name": "start_order_transit",
+                    "payload": {
+                        "trip_id": trip_id,
+                        "executor_user_id": driver_id,
+                        "driver_user_id": driver_id,
+                        "source": "start_trip",
+                    },
+                }
+                for oid in order_ids
+            ],
+            "on_success": {
+                "entity_type": "trip",
+                "entity_id": trip_id,
+                "initial_state": "trip_assigned",
+                "process_name": "start_trip",
+                "payload": trip_payload,
+            },
+            "on_fail": None,
+        },
         "data": {
             "trip_id": trip_id,
             "driver_user_id": driver_id,
             "order_ids": order_ids,
-            "status": "pending_fsm",
+            "status": "saga_pending",
         },
     }

@@ -105,6 +105,10 @@ def _bootstrap_and_maybe_enqueue(
 
     _apply_timers(sp, service_id, result)
 
+    if result.get("saga"):
+        _apply_saga(sp, service_id, result, actor=actor)
+        return
+
     enqueues = result.get("enqueues")
     if isinstance(enqueues, list) and enqueues:
         instance_ids: list[int] = []
@@ -208,6 +212,39 @@ def _apply_timers(sp, service_id: str, result: dict[str, Any]) -> None:
         )
     if timer_ids:
         result["timer_ids"] = timer_ids
+
+
+def _apply_saga(
+    sp,
+    service_id: str,
+    result: dict[str, Any],
+    *,
+    actor: Optional[dict[str, Any]] = None,
+) -> None:
+    """result['saga'] → fsm_sagas + child instances."""
+    from fsm_platform.host import side_effects
+
+    raw = result.get("saga")
+    if not isinstance(raw, dict):
+        raise ValueError("saga must be an object")
+    children = raw.get("children")
+    if not isinstance(children, list) or not children:
+        raise ValueError("saga.children required (non-empty list)")
+
+    saga_id, instance_ids = side_effects.start_saga(
+        sp,
+        service_id=service_id,
+        children=children,
+        on_success=raw.get("on_success"),
+        on_fail=raw.get("on_fail"),
+        fail_policy=str(raw.get("fail_policy") or "fail_fast"),
+        payload=raw.get("payload") or {},
+        actor_id=_actor_id_from_actor(actor),
+    )
+    result["saga_id"] = saga_id
+    result["instance_ids"] = instance_ids
+    if instance_ids:
+        result["instance_id"] = instance_ids[0]
 
 
 def enqueue_instance(

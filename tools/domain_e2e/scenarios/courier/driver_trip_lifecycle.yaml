@@ -1,5 +1,5 @@
 # Водитель: lifecycle рейса после погрузки.
-# list_driver_trips → start_trip → (позже: complete_trip).
+# list_driver_trips → start_trip (saga: orders then trip) → list in_progress.
 #
 # Предусловие: есть активный trip_assigned у driver
 # (после driver_loading_x3.yaml на той же БД).
@@ -31,14 +31,20 @@ steps:
     operation: start_trip
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
     params: { trip_id: "{{trip_id}}" }
-    expect: { status_code: 200 }
+    expect:
+      status_code: 200
+      body:
+        data.status: saga_pending
     wait_instance: true
     expect_instance: { status: COMPLETED }
+    capture:
+      saga_id: saga_id
 
   - name: list_driver_trips_in_progress
     operation: list_driver_trips
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
     params: {}
+    wait_until: true
     expect:
       status_code: 200
       body:

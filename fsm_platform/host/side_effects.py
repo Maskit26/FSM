@@ -58,6 +58,32 @@ def notify(
     )
 
 
+def start_saga(
+    session_platform: SessionLike,
+    *,
+    service_id: str,
+    children: list[dict[str, Any]],
+    on_success: Optional[dict[str, Any]] = None,
+    on_fail: Optional[dict[str, Any]] = None,
+    fail_policy: str = "fail_fast",
+    payload: Optional[dict[str, Any]] = None,
+    actor_id: Optional[int] = None,
+) -> tuple[int, list[int]]:
+    """Старт async-саги: children instances + fan-in on_success/on_fail."""
+    from fsm_platform.core.sagas import start_saga as _start_saga
+
+    return _start_saga(
+        session_platform,
+        service_id=service_id,
+        children=children,
+        on_success=on_success,
+        on_fail=on_fail,
+        fail_policy=fail_policy,
+        payload=payload,
+        actor_id=actor_id,
+    )
+
+
 def emit_event(
     session_platform: SessionLike,
     *,
