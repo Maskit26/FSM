@@ -1,0 +1,640 @@
+# Полный цикл: 4 заказа Москва → Санкт-Петербург → order_completed.
+#
+#   1) courier / courier — курьер1 МСК сдаёт, курьер2 СПб выдаёт + confirm PIN
+#   2) self / courier    — клиент сам сдаёт, курьер2 СПб выдаёт + confirm PIN
+#   3) courier / self    — курьер1 МСК сдаёт, получатель сам забирает
+#   4) self / self       — клиент сам сдаёт, получатель сам забирает
+#
+# Пары постаматов / размеры (не все P — по 3 ячейки размера на постамат):
+#   1 P  POST1→POST2  Тверская → Невский
+#   2 S  POST1→POST2  Тверская → Невский
+#   3 M  POST3→POST4  Ленинградский → Лиговский
+#   4 L  POST3→POST4  Ленинградский → Лиговский
+#
+# Актёры (users):
+#   senders МСК: 3, 11, 12, 13
+#   recipients СПб: 4, 14, 15, 16
+#   courier1 МСК: 2, 7
+#   courier2 СПб: 6, 8
+#   driver: 1
+#
+# Перед прогоном: CALL clear_test_data(); + sql/platform/003_clear_test_runtime.sql
+# Миграции: 015–019.
+
+name: full_cycle_msk_to_spb_x4
+service_id: svc_courier_01
+vars:
+  sender_1: "3"
+  sender_2: "11"
+  sender_3: "12"
+  sender_4: "13"
+  recipient_1: "4"
+  recipient_2: "14"
+  recipient_3: "15"
+  recipient_4: "16"
+  courier1_a: "2"
+  courier1_b: "7"
+  courier2_a: "6"
+  courier2_b: "8"
+  driver_id: "1"
+defaults:
+  poll_timeout: 90
+  poll_interval: 0.5
+
+steps:
+  # ========== 1) courier / courier (POST1 → POST2) ==========
+  - name: create_order_cc
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{sender_1}}", channel: api }
+    params:
+      from_address: "Москва, ул. Тверская, д. 1"
+      to_address: "Санкт-Петербург, Невский пр., д. 1"
+      cell_size: P
+      parcel_type: документы
+      sender_delivery: courier
+      recipient_delivery: courier
+      recipient_user_id: 4
+    expect:
+      status_code: 200
+      body:
+        data.pickup_type: courier
+        data.delivery_type: courier
+    capture: { order_cc: data.order_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: take_cc_pickup
+    operation: take_courier_order
+    actor: { actor_type: user, actor_id: "{{courier1_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_cc_pickup
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{courier1_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: pickup }
+    expect: { status_code: 200 }
+    capture: { pin_cc_pickup: data.pin }
+
+  - name: open_cc_pickup
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{courier1_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: pickup, pin: "{{pin_cc_pickup}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cc_pickup
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{courier1_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  # ========== 2) self / courier (POST1 → POST2) ==========
+  - name: create_order_sc
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{sender_2}}", channel: api }
+    params:
+      from_address: "Москва, ул. Тверская, д. 1"
+      to_address: "Санкт-Петербург, Невский пр., д. 1"
+      cell_size: S
+      parcel_type: документы
+      sender_delivery: self
+      recipient_delivery: courier
+      recipient_user_id: 14
+    expect:
+      status_code: 200
+      body:
+        data.pickup_type: self
+        data.delivery_type: courier
+    capture: { order_sc: data.order_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_sc_client
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{sender_2}}", channel: api }
+    params: { order_id: "{{order_sc}}", leg: pickup }
+    expect: { status_code: 200 }
+    capture: { pin_sc_client: data.pin }
+
+  - name: open_sc_client
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{sender_2}}", channel: api }
+    params: { order_id: "{{order_sc}}", leg: pickup, pin: "{{pin_sc_client}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_sc_client
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{sender_2}}", channel: api }
+    params: { order_id: "{{order_sc}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  # ========== 3) courier / self (POST3 → POST4) ==========
+  - name: create_order_cs
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{sender_3}}", channel: api }
+    params:
+      from_address: "Москва, Ленинградский проспект, д. 1"
+      to_address: "Санкт-Петербург, Лиговский пр., д. 1"
+      cell_size: M
+      parcel_type: документы
+      sender_delivery: courier
+      recipient_delivery: self
+      recipient_user_id: 15
+    expect:
+      status_code: 200
+      body:
+        data.pickup_type: courier
+        data.delivery_type: self
+    capture: { order_cs: data.order_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: take_cs_pickup
+    operation: take_courier_order
+    actor: { actor_type: user, actor_id: "{{courier1_b}}", channel: api }
+    params: { order_id: "{{order_cs}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_cs_pickup
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{courier1_b}}", channel: api }
+    params: { order_id: "{{order_cs}}", leg: pickup }
+    expect: { status_code: 200 }
+    capture: { pin_cs_pickup: data.pin }
+
+  - name: open_cs_pickup
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{courier1_b}}", channel: api }
+    params: { order_id: "{{order_cs}}", leg: pickup, pin: "{{pin_cs_pickup}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cs_pickup
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{courier1_b}}", channel: api }
+    params: { order_id: "{{order_cs}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  # ========== 4) self / self (POST3 → POST4) ==========
+  - name: create_order_ss
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{sender_4}}", channel: api }
+    params:
+      from_address: "Москва, Ленинградский проспект, д. 1"
+      to_address: "Санкт-Петербург, Лиговский пр., д. 1"
+      cell_size: L
+      parcel_type: документы
+      sender_delivery: self
+      recipient_delivery: self
+      recipient_user_id: 16
+    expect:
+      status_code: 200
+      body:
+        data.pickup_type: self
+        data.delivery_type: self
+    capture: { order_ss: data.order_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_ss_client
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{sender_4}}", channel: api }
+    params: { order_id: "{{order_ss}}", leg: pickup }
+    expect: { status_code: 200 }
+    capture: { pin_ss_client: data.pin }
+
+  - name: open_ss_client
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{sender_4}}", channel: api }
+    params: { order_id: "{{order_ss}}", leg: pickup, pin: "{{pin_ss_client}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_ss_client
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{sender_4}}", channel: api }
+    params: { order_id: "{{order_ss}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  # ========== водитель: резерв ×4 → погрузка → trip → разгрузка ==========
+  - name: list_driver_exchange
+    operation: list_driver_exchange
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { city: "Москва" }
+    expect:
+      status_code: 200
+      body:
+        data.directions.0.orders_available: 4
+    capture:
+      from_city: data.directions.0.from_city
+      to_city: data.directions.0.to_city
+
+  - name: reserve_4
+    operation: reserve_direction_slot
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params:
+      from_city: "{{from_city}}"
+      to_city: "{{to_city}}"
+      capacity: 4
+    expect:
+      status_code: 200
+      body:
+        data.status: reservation_active
+        data.reserved_count: 4
+    capture:
+      reservation_id: data.reservation_id
+      order_id_1: data.order_ids.0
+      order_id_2: data.order_ids.1
+      order_id_3: data.order_ids.2
+      order_id_4: data.order_ids.3
+
+  - name: start_loading
+    operation: start_loading
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { reservation_id: "{{reservation_id}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_drv_1
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: pickup }
+    expect: { status_code: 200 }
+    capture: { pin_drv_1: data.pin }
+
+  - name: open_drv_1
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: pickup, pin: "{{pin_drv_1}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_drv_1
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_drv_2
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: pickup }
+    expect: { status_code: 200 }
+    capture: { pin_drv_2: data.pin }
+
+  - name: open_drv_2
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: pickup, pin: "{{pin_drv_2}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_drv_2
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_drv_3
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_3}}", leg: pickup }
+    expect: { status_code: 200 }
+    capture: { pin_drv_3: data.pin }
+
+  - name: open_drv_3
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_3}}", leg: pickup, pin: "{{pin_drv_3}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_drv_3
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_3}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_drv_4
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_4}}", leg: pickup }
+    expect: { status_code: 200 }
+    capture: { pin_drv_4: data.pin }
+
+  - name: open_drv_4
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_4}}", leg: pickup, pin: "{{pin_drv_4}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_drv_4
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_4}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: complete_loading
+    operation: complete_loading
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params:
+      from_city: "{{from_city}}"
+      to_city: "{{to_city}}"
+    expect:
+      status_code: 200
+      body:
+        data.trip_status: trip_assigned
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+    capture: { trip_id: data.trip_id }
+
+  - name: start_trip
+    operation: start_trip
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { trip_id: "{{trip_id}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: list_trip_in_progress
+    operation: list_driver_trips
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: {}
+    wait_until: true
+    expect:
+      status_code: 200
+      body:
+        data.trips.0.status: trip_in_progress
+        data.active_trip_id: "{{trip_id}}"
+
+  - name: pin_del_1
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_del_1: data.pin }
+
+  - name: open_del_1
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: delivery, pin: "{{pin_del_1}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_del_1
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_del_2
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_del_2: data.pin }
+
+  - name: open_del_2
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: delivery, pin: "{{pin_del_2}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_del_2
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_del_3
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_3}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_del_3: data.pin }
+
+  - name: open_del_3
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_3}}", leg: delivery, pin: "{{pin_del_3}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_del_3
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_3}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_del_4
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_4}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_del_4: data.pin }
+
+  - name: open_del_4
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_4}}", leg: delivery, pin: "{{pin_del_4}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_del_4
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_4}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: complete_trip
+    operation: complete_trip
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { trip_id: "{{trip_id}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  # ========== финал: courier delivery (заказы 1–2) ==========
+  - name: take_cc_delivery
+    operation: take_courier_order
+    actor: { actor_type: user, actor_id: "{{courier2_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_cc_c2
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{courier2_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_cc_c2: data.pin }
+
+  - name: open_cc_c2
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{courier2_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: delivery, pin: "{{pin_cc_c2}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cc_c2
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{courier2_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_cc_recipient
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{recipient_1}}", channel: api }
+    params: { order_id: "{{order_cc}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_cc_confirm: data.pin }
+
+  - name: confirm_cc
+    operation: confirm_courier2_delivery
+    actor: { actor_type: user, actor_id: "{{courier2_a}}", channel: api }
+    params: { order_id: "{{order_cc}}", pin: "{{pin_cc_confirm}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: take_sc_delivery
+    operation: take_courier_order
+    actor: { actor_type: user, actor_id: "{{courier2_b}}", channel: api }
+    params: { order_id: "{{order_sc}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_sc_c2
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{courier2_b}}", channel: api }
+    params: { order_id: "{{order_sc}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_sc_c2: data.pin }
+
+  - name: open_sc_c2
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{courier2_b}}", channel: api }
+    params: { order_id: "{{order_sc}}", leg: delivery, pin: "{{pin_sc_c2}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_sc_c2
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{courier2_b}}", channel: api }
+    params: { order_id: "{{order_sc}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_sc_recipient
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{recipient_2}}", channel: api }
+    params: { order_id: "{{order_sc}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_sc_confirm: data.pin }
+
+  - name: confirm_sc
+    operation: confirm_courier2_delivery
+    actor: { actor_type: user, actor_id: "{{courier2_b}}", channel: api }
+    params: { order_id: "{{order_sc}}", pin: "{{pin_sc_confirm}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  # ========== финал: self pickup получателей (заказы 3–4) ==========
+  - name: pin_cs_recipient
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{recipient_3}}", channel: api }
+    params: { order_id: "{{order_cs}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_cs_recv: data.pin }
+
+  - name: open_cs_recipient
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{recipient_3}}", channel: api }
+    params: { order_id: "{{order_cs}}", leg: delivery, pin: "{{pin_cs_recv}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cs_recipient
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{recipient_3}}", channel: api }
+    params: { order_id: "{{order_cs}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: pin_ss_recipient
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{recipient_4}}", channel: api }
+    params: { order_id: "{{order_ss}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_ss_recv: data.pin }
+
+  - name: open_ss_recipient
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{recipient_4}}", channel: api }
+    params: { order_id: "{{order_ss}}", leg: delivery, pin: "{{pin_ss_recv}}" }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_ss_recipient
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{recipient_4}}", channel: api }
+    params: { order_id: "{{order_ss}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
