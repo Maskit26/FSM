@@ -150,7 +150,7 @@ steps:
   - name: list_driver_exchange_sanity
     operation: list_driver_exchange
     actor: { actor_type: user, actor_id: "1", channel: api }
-    params: {}
+    params: { city: "Москва" }
     expect:
       status_code: 200
     capture:

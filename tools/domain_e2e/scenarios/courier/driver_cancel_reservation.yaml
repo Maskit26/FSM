@@ -3,7 +3,7 @@
 # Предусловие: ≥1 (лучше 3) order_parcel_confirmed на направлении
 # (после client_deposit_x3_to_direction.yaml на чистой БД).
 #
-# Сиды: user 1 = driver, city=Москва.
+# Сиды: user 1 = driver. Биржа: params.city=Москва.
 # После cancel: orders остаются order_parcel_confirmed;
 # stage_orders без reserved_by → доступны другим водителям.
 
@@ -19,7 +19,7 @@ steps:
   - name: list_before
     operation: list_driver_exchange
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
-    params: {}
+    params: { city: "Москва" }
     expect: { status_code: 200 }
     capture:
       from_city: data.directions.0.from_city
@@ -53,7 +53,7 @@ steps:
   - name: list_after_cancel
     operation: list_driver_exchange
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
-    params: {}
+    params: { city: "Москва" }
     expect:
       status_code: 200
       body:

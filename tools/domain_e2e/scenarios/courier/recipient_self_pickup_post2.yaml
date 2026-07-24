@@ -1,0 +1,52 @@
+# Клиент-получатель сам забирает посылку из постамата (delivery_type=self).
+# Предусловие: заказ в order_parcel_confirmed_post2, dest-ячейка занята,
+# recipient_user_id = client Москва (user 3). Роли recipient в users нет.
+#
+# Пример: после self_and_courier_to_start_trip / driver_delivery_* заказ self
+# (напр. 1601). Перед прогоном выставить recipient_user_id если NULL:
+#   UPDATE orders SET recipient_user_id=3 WHERE id=<order_id> AND delivery_type='self';
+#
+# Миграции: 018 + 019 (user_role=client на self-pickup рёбрах).
+
+name: recipient_self_pickup_post2
+service_id: svc_courier_01
+vars:
+  recipient_id: "3"
+  # Подставьте актуальный self-заказ в order_parcel_confirmed_post2
+  order_id: "1601"
+defaults:
+  poll_timeout: 60
+  poll_interval: 0.5
+
+steps:
+  - name: request_pin_recipient
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{recipient_id}}", channel: api }
+    params: { order_id: "{{order_id}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_delivery: data.pin }
+
+  - name: open_cell_recipient
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{recipient_id}}", channel: api }
+    params:
+      order_id: "{{order_id}}"
+      leg: delivery
+      pin: "{{pin_delivery}}"
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cell_recipient
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{recipient_id}}", channel: api }
+    params: { order_id: "{{order_id}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: list_client_orders_done
+    operation: list_client_orders
+    actor: { actor_type: user, actor_id: "4", channel: api }
+    params: {}
+    expect: { status_code: 200 }

@@ -4,7 +4,7 @@
 # Предусловие: ≥3 order_parcel_confirmed на направлении
 # (обычно после client_deposit_x3_to_direction.yaml на чистой БД).
 #
-# Сиды: user 1 = driver, city=Москва.
+# Сиды: user 1 = driver. Биржа: params.city=Москва.
 # Рейс дальше — scenarios/courier/driver_trip_lifecycle.yaml
 
 name: driver_loading_x3
@@ -19,7 +19,7 @@ steps:
   - name: list_driver_exchange
     operation: list_driver_exchange
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
-    params: {}
+    params: { city: "Москва" }
     expect: { status_code: 200 }
     capture:
       from_city: data.directions.0.from_city

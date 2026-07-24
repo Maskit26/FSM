@@ -9,7 +9,8 @@
 #   take_courier_order, assign_executor, remove_executor, cancel_courier_order,
 #   list_courier_exchange, list_courier_orders
 #
-# Требования к сидам: user 3 = client, user 1 = driver с city=Москва.
+# Требования к сидам: user 3 = client, user 1 = driver.
+# Биржа: params.city (не users.city водителя).
 
 name: client_self_pickup
 service_id: svc_courier_01
@@ -124,7 +125,7 @@ steps:
       actor_type: user
       actor_id: "{{driver_id}}"
       channel: api
-    params: {}
+    params: { city: "Москва" }
     expect:
       status_code: 200
     capture:

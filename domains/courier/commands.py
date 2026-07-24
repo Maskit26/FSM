@@ -991,3 +991,76 @@ def complete_trip(
             "status": "pending_fsm",
         },
     }
+
+
+def confirm_courier2_delivery(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Курьер2 подтверждает доставку кодом получателя.
+    params: order_id, pin.
+    FSM: order_courier2_parcel_delivered → order_completed.
+    """
+    from domains.courier.context import build_invoke_order_context
+    from domains.courier.guards import can_confirm_courier2_delivery
+
+    try:
+        actor_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not actor_id:
+        raise ValueError("actor.actor_id required")
+
+    order_id = int(params.get("order_id") or params.get("entity_id") or 0)
+    if not order_id:
+        raise ValueError("order_id required")
+
+    pin = params.get("pin")
+    if pin is None or str(pin).strip() == "":
+        raise ValueError("pin required")
+    pin = str(pin).strip()
+
+    ctx, _instance = build_invoke_order_context(
+        domain_session,
+        order_id=order_id,
+        actor_id=actor_id,
+        payload={"leg": "delivery", "pin": pin},
+    )
+    gate = can_confirm_courier2_delivery(
+        domain_session,
+        None,
+        ctx,
+        _instance,
+        {
+            "leg": "delivery",
+            "user_role": "courier",
+            "required_status": "order_courier2_parcel_delivered",
+            "type_field": "delivery_type",
+            "type_value": "courier",
+            "stage_must_be": "owned",
+            "require_pin": True,
+        },
+    )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
+
+    return {
+        "entity_type": "order",
+        "entity_id": order_id,
+        "initial_state": "order_courier2_parcel_delivered",
+        "enqueue": {
+            "process_name": "confirm_courier2_delivery",
+            "payload": {
+                "leg": "delivery",
+                "pin": pin,
+                "executor_user_id": actor_id,
+                "courier_user_id": actor_id,
+                "source": "confirm_courier2_delivery",
+            },
+        },
+        "data": {
+            "order_id": order_id,
+            "leg": "delivery",
+            "status": "pending_fsm",
+        },
+    }

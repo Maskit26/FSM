@@ -154,10 +154,10 @@ def list_driver_exchange(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Биржа водителя: коридоры (from_city → to_city) с суммой available
-    по всем парам постаматов. В directions[].pairs — разбивка по парам.
+    Биржа водителя: коридоры из выбранного города (params.city).
+    Город задаёт фронт/актёр; users.city водителя не используется.
+    В directions[].pairs — разбивка по парам постаматов.
     """
-    _ = params
     try:
         driver_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
@@ -171,9 +171,9 @@ def list_driver_exchange(
     if str(user.get("role_name") or "") != "driver":
         raise DomainError("NOT_A_DRIVER", "User is not a driver")
 
-    city = str(user.get("city") or "").strip()
+    city = str((params or {}).get("city") or "").strip()
     if not city:
-        raise DomainError("DRIVER_CITY_REQUIRED", "У водителя не указан город")
+        raise ValueError("city required")
 
     directions = db_layer.list_directions_for_driver_exchange(domain_session, city)
     return {

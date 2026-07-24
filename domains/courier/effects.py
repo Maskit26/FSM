@@ -56,6 +56,22 @@ def sync_order_status(session_domain, db, context, instance, effect_params) -> E
     return EffectResult(ok=True, payload={"order_id": order_id, "status": to_state})
 
 
+def confirm_courier2_delivery_effect(
+    session_domain, db, context, instance, effect_params
+) -> EffectResult:
+    """sync_order_status + пометить PIN получателя USED."""
+    result = sync_order_status(
+        session_domain, db, context, instance, effect_params
+    )
+    if not result.ok:
+        return result
+    order_id = int(instance["entity_id"])
+    db_layer.mark_courier2_delivery_code_used(session_domain, order_id)
+    payload = dict(result.payload or {})
+    payload["delivery_code_used"] = True
+    return EffectResult(ok=True, payload=payload)
+
+
 def assign_executor_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
     """
     Общий effect назначения исполнителя на order.

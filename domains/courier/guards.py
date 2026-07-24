@@ -348,8 +348,10 @@ _LOCKER_ACCESS_CODE_RULES: list[dict[str, Any]] = [
         ],
     },
     {
+        # Получатель посылки = client с actor_field=recipient_user_id
+        # (не отдельная роль users.role_name).
         "leg": "delivery",
-        "user_role": "recipient",
+        "user_role": "client",
         "actor_field": "recipient_user_id",
         "stage_must_be": "none",
         "require_city": False,
@@ -423,7 +425,10 @@ def can_complete_loading(
 def can_reserve_direction_slot(
     session_domain, db, context, instance, guard_params=None
 ) -> GuardResult:
-    """Sync reserve: driver + direction + city + capacity + slots + availability."""
+    """Sync reserve: driver + corridor + capacity + slots + availability.
+
+    Город старта — из params/коридора (from_city), не из users.city водителя.
+    """
     _ = db
     _ = session_domain
     _ = instance
@@ -446,13 +451,6 @@ def can_reserve_direction_slot(
 
     if ctx.get("direction") is None:
         return GuardResult(ok=False, reason="DIRECTION_NOT_FOUND")
-
-    executor_city = str(ctx.get("executor_city") or "").strip()
-    from_city = str(ctx.get("from_city") or "").strip()
-    if executor_city and from_city and executor_city != from_city:
-        return GuardResult(
-            ok=False, reason=f"CITY_MISMATCH:{executor_city}->{from_city}"
-        )
 
     max_slots = int(params.get("max_active_slots") or 3)
     if int(ctx.get("active_slots") or 0) >= max_slots:
@@ -583,6 +581,46 @@ def can_start_trip(
 
     if not ctx.get("order_ids"):
         return GuardResult(ok=False, reason="NO_ORDERS_ON_TRIP")
+    return GuardResult(ok=True)
+
+
+def can_confirm_courier2_delivery(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """
+    Курьер2 подтверждает доставку PIN-ом получателя:
+    owned delivery stage + order_courier2_parcel_delivered + validate_courier2_delivery_code.
+    """
+    _ = db
+    _ = instance
+    params = dict(guard_params or {})
+    params.setdefault("leg", "delivery")
+    params.setdefault("user_role", "courier")
+    params.setdefault("required_status", "order_courier2_parcel_delivered")
+    params.setdefault("type_field", "delivery_type")
+    params.setdefault("type_value", "courier")
+    params.setdefault("stage_must_be", "owned")
+    # PIN проверяем отдельно — токен принадлежит recipient, не courier.
+    params["require_pin"] = False
+    params.setdefault("require_cell", False)
+    params.setdefault("require_city", False)
+
+    base = _match_locker_actor_edge(session_domain, context, instance, params)
+    if not base.ok:
+        return base
+
+    ctx = context or {}
+    pin = ctx.get("pin")
+    if not pin:
+        return GuardResult(ok=False, reason="MISSING_PIN")
+
+    order_id = int(ctx.get("order_id") or instance["entity_id"])
+    actor_id = int(ctx["executor_id"])
+    ok, err = db_layer.validate_courier2_delivery_code(
+        session_domain, order_id, actor_id, str(pin)
+    )
+    if not ok:
+        return GuardResult(ok=False, reason=err or "INVALID_DELIVERY_CODE")
     return GuardResult(ok=True)
 
 

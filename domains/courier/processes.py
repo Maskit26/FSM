@@ -17,6 +17,7 @@ from domains.courier.commands import (
     close_cell,
     complete_loading,
     complete_trip,
+    confirm_courier2_delivery,
     create_order,
     open_cell,
     remove_executor,
@@ -36,6 +37,7 @@ from domains.courier.effects import (
     assign_executor_effect,
     cancel_reservation_effect,
     close_cell_effect,
+    confirm_courier2_delivery_effect,
     open_cell_effect,
     remove_executor_effect,
     reserve_locker_cell_effect,
@@ -50,6 +52,7 @@ from domains.courier.guards import (
     can_close_cell,
     can_complete_loading,
     can_complete_trip,
+    can_confirm_courier2_delivery,
     can_create_trip,
     can_expire_reservation,
     can_open_cell,
@@ -120,6 +123,12 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "complete_trip", "command", complete_trip
+    )
+    default_operation_registry.register(
+        service_id,
+        "confirm_courier2_delivery",
+        "command",
+        confirm_courier2_delivery,
     )
     default_operation_registry.register(
         service_id, "list_client_orders", "query", list_client_orders
@@ -253,6 +262,16 @@ def register_all(service_id: str) -> None:
     default_process_registry.register(
         ProcessDef(
             service_id=service_id,
+            process_name="confirm_courier2_delivery",
+            entity_type="order",
+            event_name="confirm_courier2_delivery",
+            context_builder=build_order_context,
+            initial_state="order_courier2_parcel_delivered",
+        )
+    )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
             process_name="start_order_transit",
             entity_type="order",
             event_name="start_order_transit",
@@ -269,6 +288,9 @@ def register_all(service_id: str) -> None:
     )
     default_guard_registry.register(service_id, "can_open_cell", can_open_cell)
     default_guard_registry.register(service_id, "can_close_cell", can_close_cell)
+    default_guard_registry.register(
+        service_id, "can_confirm_courier2_delivery", can_confirm_courier2_delivery
+    )
     default_guard_registry.register(
         service_id, "can_start_loading", can_start_loading
     )
@@ -324,4 +346,9 @@ def register_all(service_id: str) -> None:
     )
     default_effect_registry.register(
         service_id, "sync_order_status", sync_order_status
+    )
+    default_effect_registry.register(
+        service_id,
+        "confirm_courier2_delivery_effect",
+        confirm_courier2_delivery_effect,
     )

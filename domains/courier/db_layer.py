@@ -826,6 +826,100 @@ def validate_access_code(
     return True, ""
 
 
+def validate_courier2_delivery_code(
+    session: Session,
+    order_id: int,
+    courier_id: int,
+    pin: str,
+) -> Tuple[bool, str]:
+    """
+    PIN подтверждения доставки для курьера2.
+    Токен выдан получателю (leg=delivery, actor_user_id=recipient_user_id).
+    Hash: SHA256(f\"{pin}{order_id}{dest_cell_id}\"). Успех → status=USED.
+    """
+    _ = courier_id
+    order = get_order(session, order_id)
+    if order is None:
+        return False, "ORDER_NOT_FOUND"
+
+    recipient_user_id = order.get("recipient_user_id")
+    dest_cell_id = order.get("dest_cell_id")
+    if not recipient_user_id:
+        return False, "RECIPIENT_MISSING"
+    if not dest_cell_id:
+        return False, "DEST_CELL_MISSING"
+
+    row = session.execute(
+        text(
+            """
+            SELECT id, pin_hash, status, expires_at, cell_id
+            FROM cell_access_tokens
+            WHERE order_id = :order_id
+              AND leg = 'delivery'
+              AND actor_user_id = :recipient_id
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"order_id": order_id, "recipient_id": int(recipient_user_id)},
+    ).fetchone()
+    if not row:
+        return False, "DELIVERY_CODE_NOT_FOUND"
+
+    token_id, stored_pin_hash, token_status, expires_at, token_cell_id = row
+    if str(token_status) != "ACTIVE":
+        return False, f"DELIVERY_CODE_NOT_ACTIVE:{token_status}"
+    if expires_at is not None and expires_at < datetime.utcnow():
+        return False, "DELIVERY_CODE_EXPIRED"
+
+    dest_cell_id = int(dest_cell_id)
+    if token_cell_id is not None and int(token_cell_id) != dest_cell_id:
+        return False, "DELIVERY_CODE_WRONG_CELL"
+
+    expected_hash = hashlib.sha256(
+        f"{pin}{order_id}{dest_cell_id}".encode()
+    ).hexdigest()
+    if expected_hash != stored_pin_hash:
+        return False, "DELIVERY_CODE_INVALID"
+    # Не ставим USED здесь: guard вызывается и в invoke, и в worker.
+    return True, ""
+
+
+def mark_courier2_delivery_code_used(
+    session: Session,
+    order_id: int,
+) -> bool:
+    """Помечает ACTIVE delivery-токен получателя как USED (после успешного FSM)."""
+    order = get_order(session, order_id)
+    if order is None or not order.get("recipient_user_id"):
+        return False
+    result = session.execute(
+        text(
+            """
+            UPDATE cell_access_tokens
+            SET status = 'USED', used_at = UTC_TIMESTAMP()
+            WHERE id = (
+                SELECT id FROM (
+                    SELECT id
+                    FROM cell_access_tokens
+                    WHERE order_id = :order_id
+                      AND leg = 'delivery'
+                      AND actor_user_id = :recipient_id
+                      AND status = 'ACTIVE'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                ) AS latest
+            )
+            """
+        ),
+        {
+            "order_id": order_id,
+            "recipient_id": int(order["recipient_user_id"]),
+        },
+    )
+    return int(result.rowcount or 0) >= 1
+
+
 def count_recent_access_code_requests(
     session: Session, order_id: int, leg: str, minutes: int = 15
 ) -> int:

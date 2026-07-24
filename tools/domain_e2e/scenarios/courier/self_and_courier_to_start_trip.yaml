@@ -7,7 +7,9 @@
 # Маршрут: Санкт-Петербург → Москва, разные пары (POST2→POST1 и POST4→POST3).
 # Сиды: user 4 = client (СПб), user 6 = courier (СПб), user 5 = driver (СПб).
 # Перед прогоном: CALL clear_test_data(); + sql/platform/003_clear_test_runtime.sql
-# Миграции: 015/016 (POST4 + P), 017 (complete_trip + delivery require_city).
+# Миграции: 015/016 (POST4 + P), 017 (complete_trip + delivery require_city),
+# 018/019 (client as recipient party + confirm_courier2_delivery).
+# recipient_user_id=3 (client Москва) — сторона заказа, не роль recipient.
 
 name: self_and_courier_to_start_trip
 service_id: svc_courier_01
@@ -31,6 +33,7 @@ steps:
       parcel_type: документы
       sender_delivery: self
       recipient_delivery: self
+      recipient_user_id: 3
     expect:
       status_code: 200
       body:
@@ -76,6 +79,7 @@ steps:
       parcel_type: документы
       sender_delivery: courier
       recipient_delivery: courier
+      recipient_user_id: 3
     expect:
       status_code: 200
       body:
@@ -134,7 +138,7 @@ steps:
   - name: list_driver_exchange
     operation: list_driver_exchange
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
-    params: {}
+    params: { city: "Санкт-Петербург" }
     expect:
       status_code: 200
       body:
