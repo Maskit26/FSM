@@ -319,6 +319,20 @@ _LOCKER_ACCESS_CODE_RULES: list[dict[str, Any]] = [
     },
     {
         "leg": "delivery",
+        "user_role": "driver",
+        "stage_must_be": "driver_reserved",
+        # Водитель едет в другой город — city mismatch не режем.
+        "require_city": False,
+        "require_cell": True,
+        "require_pin": False,
+        "allowed_statuses": [
+            "order_in_transit_to_post2",
+            "order_arrived_at_post2",
+            "order_parcel_confirmed_post2",
+        ],
+    },
+    {
+        "leg": "delivery",
         "user_role": "courier",
         "type_field": "delivery_type",
         "type_value": "courier",
@@ -569,6 +583,57 @@ def can_start_trip(
 
     if not ctx.get("order_ids"):
         return GuardResult(ok=False, reason="NO_ORDERS_ON_TRIP")
+    return GuardResult(ok=True)
+
+
+def can_complete_trip(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """
+    complete_trip: driver + trip_in_progress + все заказы
+    order_parcel_confirmed_post2 + нет открытых dest-ячеек.
+    """
+    _ = db
+    _ = session_domain
+    _ = instance
+    ctx = context or {}
+    params = guard_params or {}
+
+    actor_id = ctx.get("executor_id")
+    if not actor_id:
+        return GuardResult(ok=False, reason="ACTOR_ID_REQUIRED")
+    user = ctx.get("executor")
+    if user is None:
+        return GuardResult(ok=False, reason="USER_NOT_FOUND")
+    expected_role = params.get("user_role") or "driver"
+    if str(user.get("role_name") or "") != str(expected_role):
+        return GuardResult(ok=False, reason=f"ROLE_MISMATCH:{user.get('role_name')}")
+
+    trip = ctx.get("trip")
+    if trip is None:
+        return GuardResult(ok=False, reason="TRIP_NOT_FOUND")
+    if int(trip.get("driver_user_id") or 0) != int(actor_id):
+        return GuardResult(ok=False, reason="NOT_TRIP_OWNER")
+    if int(trip.get("active") or 0) != 1:
+        return GuardResult(ok=False, reason="TRIP_INACTIVE")
+
+    required_status = params.get("required_status") or "trip_in_progress"
+    status = str(trip.get("status") or "")
+    if status != str(required_status):
+        return GuardResult(ok=False, reason=f"INVALID_TRIP_STATUS:{status}")
+
+    if not ctx.get("order_ids"):
+        return GuardResult(ok=False, reason="NO_ORDERS_ON_TRIP")
+
+    open_cells = ctx.get("open_delivery_cells") or []
+    if open_cells:
+        return GuardResult(ok=False, reason=f"OPEN_CELLS_DETECTED:{open_cells}")
+
+    pending = ctx.get("undelivered_order_ids") or []
+    if pending:
+        return GuardResult(
+            ok=False, reason=f"ORDERS_NOT_DELIVERED:{pending}"
+        )
     return GuardResult(ok=True)
 
 

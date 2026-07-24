@@ -16,6 +16,7 @@ from domains.courier.commands import (
     cancel_reservation,
     close_cell,
     complete_loading,
+    complete_trip,
     create_order,
     open_cell,
     remove_executor,
@@ -48,6 +49,7 @@ from domains.courier.guards import (
     can_cancel_reservation,
     can_close_cell,
     can_complete_loading,
+    can_complete_trip,
     can_create_trip,
     can_expire_reservation,
     can_open_cell,
@@ -115,6 +117,9 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "start_trip", "command", start_trip
+    )
+    default_operation_registry.register(
+        service_id, "complete_trip", "command", complete_trip
     )
     default_operation_registry.register(
         service_id, "list_client_orders", "query", list_client_orders
@@ -238,6 +243,16 @@ def register_all(service_id: str) -> None:
     default_process_registry.register(
         ProcessDef(
             service_id=service_id,
+            process_name="complete_trip",
+            entity_type="trip",
+            event_name="complete_trip",
+            context_builder=build_trip_context,
+            initial_state="trip_in_progress",
+        )
+    )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
             process_name="start_order_transit",
             entity_type="order",
             event_name="start_order_transit",
@@ -274,6 +289,9 @@ def register_all(service_id: str) -> None:
     )
     default_guard_registry.register(service_id, "can_create_trip", can_create_trip)
     default_guard_registry.register(service_id, "can_start_trip", can_start_trip)
+    default_guard_registry.register(
+        service_id, "can_complete_trip", can_complete_trip
+    )
     default_guard_registry.register(
         service_id, "can_start_order_transit", can_start_order_transit
     )

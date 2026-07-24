@@ -1,0 +1,107 @@
+# Водитель: разгрузка на post2 + complete_trip.
+# list_driver_trips (in_progress) → pin/open/close delivery ×N → complete_trip.
+#
+# Предусловие: активный trip_in_progress, заказы в order_in_transit_to_post2
+# (после start_trip: например self_and_courier_to_start_trip до list in_progress,
+#  или driver_loading_x3 → driver_trip_lifecycle).
+#
+# Сценарий рассчитан на 2 заказа в рейсе.
+# Сиды СПб-коридора: user 5 = driver (после self_and_courier_*).
+# Для МСК-коридора: driver_id=1.
+
+name: driver_delivery_and_complete_trip
+service_id: svc_courier_01
+vars:
+  driver_id: "5"
+defaults:
+  poll_timeout: 60
+  poll_interval: 0.5
+
+steps:
+  - name: list_driver_trips_in_progress
+    operation: list_driver_trips
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: {}
+    expect:
+      status_code: 200
+      body:
+        data.trips.0.status: trip_in_progress
+    capture:
+      trip_id: data.active_trip_id
+      order_id_1: data.trips.0.order_ids.0
+      order_id_2: data.trips.0.order_ids.1
+
+  # ----- заказ 1: dest-ячейка -----
+  - name: request_pin_delivery_1
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_delivery_1: data.pin }
+
+  - name: open_cell_delivery_1
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params:
+      order_id: "{{order_id_1}}"
+      leg: delivery
+      pin: "{{pin_delivery_1}}"
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cell_delivery_1
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  # ----- заказ 2: dest-ячейка -----
+  - name: request_pin_delivery_2
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_delivery_2: data.pin }
+
+  - name: open_cell_delivery_2
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params:
+      order_id: "{{order_id_2}}"
+      leg: delivery
+      pin: "{{pin_delivery_2}}"
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cell_delivery_2
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: complete_trip
+    operation: complete_trip
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { trip_id: "{{trip_id}}" }
+    expect:
+      status_code: 200
+      body:
+        data.status: pending_fsm
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: list_driver_trips_completed
+    operation: list_driver_trips
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { status: trip_completed }
+    expect:
+      status_code: 200
+      body:
+        data.trips.0.status: trip_completed
+        data.trips.0.id: "{{trip_id}}"

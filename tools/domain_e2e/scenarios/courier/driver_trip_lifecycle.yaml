@@ -5,7 +5,8 @@
 # (после driver_loading_x3.yaml на той же БД).
 #
 # Сиды: user 1 = driver.
-# complete_trip пока не реализован — шаг добавим вместе с командой.
+# Дальше разгрузка: scenarios/courier/driver_delivery_and_complete_trip.yaml
+# (vars.driver_id: "1").
 
 name: driver_trip_lifecycle
 service_id: svc_courier_01

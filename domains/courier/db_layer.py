@@ -1984,13 +1984,106 @@ def set_trip_status(session: Session, trip_id: int, status: str) -> bool:
         text(
             """
             UPDATE trips
-            SET status = :status
+            SET status = :status,
+                active = CASE
+                    WHEN :status IN ('trip_completed', 'trip_canceled', 'trip_failed')
+                    THEN 0 ELSE active END
             WHERE id = :id
             """
         ),
         {"id": trip_id, "status": status},
     )
     return int(result.rowcount or 0) == 1
+
+
+def list_trip_order_statuses(
+    session: Session, trip_id: int
+) -> list[dict[str, Any]]:
+    """Заказы рейса с текущим orders.status (для complete_trip guard)."""
+    rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT o.id AS order_id, o.status,
+                   o.dest_cell_id, o.source_cell_id
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            WHERE so.trip_id = :trip_id
+              AND so.leg = 'pickup'
+            ORDER BY o.id ASC
+            """
+        ),
+        {"trip_id": trip_id},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_open_delivery_cells_for_trip(
+    session: Session, trip_id: int
+) -> list[int]:
+    """Открытые dest-ячейки заказов рейса (нельзя complete_trip)."""
+    rows = session.execute(
+        text(
+            """
+            SELECT DISTINCT o.dest_cell_id
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            JOIN locker_cells lc ON lc.id = o.dest_cell_id
+            WHERE so.trip_id = :trip_id
+              AND so.leg = 'pickup'
+              AND lc.status = 'locker_opened'
+            """
+        ),
+        {"trip_id": trip_id},
+    ).fetchall()
+    return [int(r[0]) for r in rows if r[0] is not None]
+
+
+def list_delivery_stops_for_trip(
+    session: Session, trip_id: int
+) -> list[dict[str, Any]]:
+    """Группировка заказов рейса по dest-постамату (UI разгрузки)."""
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                l.id AS locker_id,
+                l.locker_code,
+                l.city,
+                l.location_address,
+                so.order_id,
+                o.status AS order_status
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            JOIN locker_cells lc ON lc.id = o.dest_cell_id
+            JOIN lockers l ON l.id = lc.locker_id
+            WHERE so.trip_id = :trip_id
+              AND so.leg = 'pickup'
+            ORDER BY l.id ASC, so.order_id ASC
+            """
+        ),
+        {"trip_id": trip_id},
+    ).mappings().all()
+
+    by_locker: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        lid = int(row["locker_id"])
+        stop = by_locker.get(lid)
+        if stop is None:
+            stop = {
+                "locker_id": lid,
+                "locker_code": row.get("locker_code"),
+                "city": row.get("city"),
+                "location_address": row.get("location_address"),
+                "order_ids": [],
+                "orders": [],
+            }
+            by_locker[lid] = stop
+        oid = int(row["order_id"])
+        stop["order_ids"].append(oid)
+        stop["orders"].append(
+            {"order_id": oid, "status": row.get("order_status")}
+        )
+    return list(by_locker.values())
 
 
 def list_trip_order_ids(session: Session, trip_id: int) -> list[int]:
@@ -2089,6 +2182,9 @@ def list_driver_trips(
     placeholders = ", ".join(f":st_{i}" for i in range(len(wanted)))
     params: dict[str, Any] = {f"st_{i}": s for i, s in enumerate(wanted)}
     params["driver_user_id"] = driver_user_id
+    terminal = {"trip_completed", "trip_canceled", "trip_failed"}
+    only_active = not any(str(s) in terminal for s in wanted)
+    active_sql = "AND active = 1" if only_active else ""
     rows = session.execute(
         text(
             f"""
@@ -2097,7 +2193,7 @@ def list_driver_trips(
                    status, description, active, created_at
             FROM trips
             WHERE driver_user_id = :driver_user_id
-              AND active = 1
+              {active_sql}
               AND status IN ({placeholders})
             ORDER BY id DESC
             """

@@ -1,12 +1,13 @@
-# Happy-path: 2 заказа → погрузка → start_trip (saga).
+# Happy-path: 2 заказа → погрузка → start_trip → разгрузка post2 → complete_trip.
 #   1) self / self   — клиент сам сдаёт в постамат
 #   2) courier / courier — курьер1 забирает с биржи и сдаёт в постамат
-# Дальше: коридор СПб→Москва (разные пары постаматов) → reserve ×2 → trip.
+# Дальше: коридор СПб→Москва → reserve → loading → trip → transit →
+# delivery open/close по dest-ячейкам → complete_trip.
 #
 # Маршрут: Санкт-Петербург → Москва, разные пары (POST2→POST1 и POST4→POST3).
 # Сиды: user 4 = client (СПб), user 6 = courier (СПб), user 5 = driver (СПб).
 # Перед прогоном: CALL clear_test_data(); + sql/platform/003_clear_test_runtime.sql
-# Нужна миграция 015 (POST4) + 016 (полный POST4 + 3×P на POST1–3).
+# Миграции: 015/016 (POST4 + P), 017 (complete_trip + delivery require_city).
 
 name: self_and_courier_to_start_trip
 service_id: svc_courier_01
@@ -261,3 +262,77 @@ steps:
       body:
         data.trips.0.status: trip_in_progress
         data.active_trip_id: "{{trip_id}}"
+
+  # ========== разгрузка post2 (leg=delivery) → complete_trip ==========
+  - name: request_pin_delivery_1
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_delivery_1: data.pin }
+
+  - name: open_cell_delivery_1
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params:
+      order_id: "{{order_id_1}}"
+      leg: delivery
+      pin: "{{pin_delivery_1}}"
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cell_delivery_1
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_1}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: request_pin_delivery_2
+    operation: request_locker_access_code
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: delivery }
+    expect: { status_code: 200 }
+    capture: { pin_delivery_2: data.pin }
+
+  - name: open_cell_delivery_2
+    operation: open_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params:
+      order_id: "{{order_id_2}}"
+      leg: delivery
+      pin: "{{pin_delivery_2}}"
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: close_cell_delivery_2
+    operation: close_cell
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { order_id: "{{order_id_2}}", leg: delivery }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: complete_trip
+    operation: complete_trip
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { trip_id: "{{trip_id}}" }
+    expect:
+      status_code: 200
+      body:
+        data.status: pending_fsm
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: list_driver_trips_completed
+    operation: list_driver_trips
+    actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
+    params: { status: trip_completed }
+    expect:
+      status_code: 200
+      body:
+        data.trips.0.status: trip_completed
+        data.trips.0.id: "{{trip_id}}"

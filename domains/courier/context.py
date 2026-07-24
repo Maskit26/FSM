@@ -218,11 +218,25 @@ def build_trip_context(session_domain, db, runtime_ctx, instance) -> dict[str, A
         db_layer.get_user(session_domain, executor_id) if executor_id else None
     )
     order_ids = db_layer.list_trip_order_ids(session_domain, trip_id)
+    order_rows = db_layer.list_trip_order_statuses(session_domain, trip_id)
+    undelivered = [
+        int(r["order_id"])
+        for r in order_rows
+        if str(r.get("status") or "") != "order_parcel_confirmed_post2"
+    ]
+    open_delivery_cells = db_layer.list_open_delivery_cells_for_trip(
+        session_domain, trip_id
+    )
+    delivery_stops = db_layer.list_delivery_stops_for_trip(session_domain, trip_id)
 
     return {
         "trip": trip,
         "trip_id": trip_id,
         "order_ids": order_ids,
+        "order_statuses": order_rows,
+        "undelivered_order_ids": undelivered,
+        "open_delivery_cells": open_delivery_cells,
+        "delivery_stops": delivery_stops,
         "payload": payload,
         "executor_id": executor_id,
         "executor": executor,

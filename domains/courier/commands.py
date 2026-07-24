@@ -932,3 +932,62 @@ def start_trip(
             "status": "saga_pending",
         },
     }
+
+
+def complete_trip(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Завершение рейса после разгрузки всех заказов в post2:
+    context → can_complete_trip → enqueue FSM trip_in_progress→trip_completed.
+    params: trip_id.
+    """
+    from domains.courier.context import build_invoke_trip_context
+    from domains.courier.guards import can_complete_trip
+
+    try:
+        driver_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not driver_id:
+        raise ValueError("actor.actor_id required")
+
+    trip_id = int(params.get("trip_id") or params.get("entity_id") or 0)
+    if not trip_id:
+        raise ValueError("trip_id required")
+
+    ctx, _instance = build_invoke_trip_context(
+        domain_session,
+        trip_id=trip_id,
+        actor_id=driver_id,
+    )
+    gate = can_complete_trip(
+        domain_session,
+        None,
+        ctx,
+        _instance,
+        {"user_role": "driver", "required_status": "trip_in_progress"},
+    )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
+
+    return {
+        "entity_type": "trip",
+        "entity_id": trip_id,
+        "initial_state": "trip_in_progress",
+        "enqueue": {
+            "process_name": "complete_trip",
+            "payload": {
+                "executor_user_id": driver_id,
+                "driver_user_id": driver_id,
+                "source": "complete_trip",
+            },
+        },
+        "data": {
+            "trip_id": trip_id,
+            "driver_user_id": driver_id,
+            "order_ids": list(ctx.get("order_ids") or []),
+            "delivery_stops": list(ctx.get("delivery_stops") or []),
+            "status": "pending_fsm",
+        },
+    }
