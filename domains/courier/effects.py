@@ -8,6 +8,7 @@ from typing import Any, Optional
 from fsm_platform.core.types import EffectResult
 
 from domains.courier import db_layer
+from domains.courier.notifications import enqueue_order_progress_notifications
 
 
 def _payload_dict(instance: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +38,40 @@ def _executor_id(instance: dict[str, Any]) -> Optional[int]:
     return int(raw)
 
 
+def _service_id(instance: dict[str, Any]) -> str:
+    return str(instance.get("service_id") or "svc_courier_01")
+
+
+def _notify_order_progress(
+    session_domain,
+    db,
+    instance: dict[str, Any],
+    *,
+    order_id: int,
+    to_state: str,
+    courier_user_id: Optional[int] = None,
+) -> None:
+    """Best-effort enqueue TG; ошибки не валят effect."""
+    import logging
+
+    try:
+        enqueue_order_progress_notifications(
+            session_domain,
+            db,
+            order_id=int(order_id),
+            to_state=str(to_state),
+            service_id=_service_id(instance),
+            instance_id=int(instance["id"]) if instance.get("id") else None,
+            courier_user_id=courier_user_id,
+        )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "order progress notify failed order_id=%s state=%s",
+            order_id,
+            to_state,
+        )
+
+
 def sync_order_status(session_domain, db, context, instance, effect_params) -> EffectResult:
     """
     Копирует to_state перехода в колонку orders.status.
@@ -53,6 +88,14 @@ def sync_order_status(session_domain, db, context, instance, effect_params) -> E
         return EffectResult(ok=True, payload={"skipped": True, "reason": "no_to_state"})
 
     db_layer.update_order_status(session_domain, order_id, str(to_state))
+    _notify_order_progress(
+        session_domain,
+        db,
+        instance,
+        order_id=order_id,
+        to_state=str(to_state),
+        courier_user_id=_executor_id(instance),
+    )
     return EffectResult(ok=True, payload={"order_id": order_id, "status": to_state})
 
 
@@ -104,6 +147,14 @@ def assign_executor_effect(session_domain, db, context, instance, effect_params)
             "order_courier1_assigned" if leg == "pickup" else "order_courier2_assigned"
         )
     db_layer.update_order_status(session_domain, order_id, str(to_state))
+    _notify_order_progress(
+        session_domain,
+        db,
+        instance,
+        order_id=order_id,
+        to_state=str(to_state),
+        courier_user_id=int(executor_id),
+    )
     return EffectResult(
         ok=True,
         payload={
@@ -179,6 +230,14 @@ def open_cell_effect(session_domain, db, context, instance, effect_params) -> Ef
     if not to_state:
         return EffectResult(ok=False, error="TO_STATE_REQUIRED")
     db_layer.update_order_status(session_domain, order_id, str(to_state))
+    _notify_order_progress(
+        session_domain,
+        db,
+        instance,
+        order_id=order_id,
+        to_state=str(to_state),
+        courier_user_id=_executor_id(instance),
+    )
     return EffectResult(
         ok=True,
         payload={

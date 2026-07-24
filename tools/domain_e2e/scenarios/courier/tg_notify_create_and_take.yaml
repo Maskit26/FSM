@@ -1,0 +1,68 @@
+# Проверка TG-уведомлений: клиент создаёт заказ → курьер берёт с биржи.
+#
+# Ожидаемые сообщения клиенту (user 3):
+#   1) order_created: "Заказ №N успешно создан."
+#   2) order_courier1_assigned: "Заказ №N принял курьер … Ждите, в ближайшие 30 минут…"
+#
+# Перед прогоном:
+#   1) API + fsm_worker запущены (outbox встроен в worker)
+#   2) TELEGRAM_DRY_RUN=0, TELEGRAM_BOT_TOKEN задан
+#   3) привязка TG: открой deep-link из
+#        GET /input/telegram/link?user_id=3
+#      или вручную /start u3_<sig> в боте
+#   4) желательно CALL clear_test_data(); + platform clear runtime
+#
+# Сиды: client 3 = Москва, courier 2 = Москва, recipient 4 = СПб.
+
+name: tg_notify_create_and_take
+service_id: svc_courier_01
+vars:
+  client_id: "3"
+  courier_id: "2"
+  recipient_id: "4"
+defaults:
+  poll_timeout: 60
+  poll_interval: 0.5
+
+steps:
+  - name: create_order_courier
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
+    params:
+      from_address: "Москва, ул. Тверская, д. 1"
+      to_address: "Санкт-Петербург, Невский пр., д. 1"
+      cell_size: M
+      parcel_type: документы
+      sender_delivery: courier
+      recipient_delivery: courier
+      recipient_user_id: 4
+    expect:
+      status_code: 200
+      body:
+        data.status: order_created
+        data.pickup_type: courier
+        data.delivery_type: courier
+    capture:
+      order_id: data.order_id
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: list_courier_exchange
+    operation: list_courier_exchange
+    actor: { actor_type: user, actor_id: "{{courier_id}}", channel: api }
+    params: {}
+    expect: { status_code: 200 }
+
+  - name: take_courier_order
+    operation: take_courier_order
+    actor: { actor_type: user, actor_id: "{{courier_id}}", channel: api }
+    params: { order_id: "{{order_id}}", leg: pickup }
+    expect: { status_code: 200 }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: list_client_orders
+    operation: list_client_orders
+    actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
+    params: {}
+    expect: { status_code: 200 }

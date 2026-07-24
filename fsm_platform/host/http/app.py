@@ -140,3 +140,33 @@ def instance_status(service_id: str, instance_id: int) -> dict[str, Any]:
         if hasattr(v, "isoformat"):
             row[k] = v.isoformat()
     return row
+
+
+@app.post("/input/telegram/webhook")
+def telegram_webhook(update: dict[str, Any]) -> dict[str, Any]:
+    """
+    Входящий Telegram Update (Bot webhook).
+    /start u{user_id}_{sig} → users.telegram_chat_id.
+    """
+    from input.telegram.webhook import handle_telegram_update
+
+    return handle_telegram_update(update)
+
+
+@app.get("/input/telegram/link")
+def telegram_link(user_id: int) -> dict[str, Any]:
+    """
+    Deep-link для фронта: пользователь открывает URL → /start в боте → bind chat_id.
+    Нужны TELEGRAM_BOT_USERNAME и TELEGRAM_BOT_TOKEN (или TELEGRAM_LINK_SECRET).
+    """
+    from input.telegram.webhook import build_bot_start_url, make_start_payload
+
+    try:
+        url = build_bot_start_url(user_id)
+        return {
+            "user_id": user_id,
+            "url": url,
+            "payload": make_start_payload(user_id),
+        }
+    except RuntimeError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc

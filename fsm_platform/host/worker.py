@@ -227,9 +227,16 @@ def process_one() -> bool:
 
 
 def run_loop(poll_seconds: float = 1.0) -> None:
-    """Бесконечный цикл воркера: process_one, при пустой очереди — sleep."""
-    logger.info("fsm worker loop started")
+    """Бесконечный цикл: FSM instances + outbox delivery."""
+    logger.info("fsm worker loop started (fsm + outbox)")
     while True:
-        worked = process_one()
-        if not worked:
+        fsm_worked = process_one()
+        outbox_worked = False
+        try:
+            from fsm_platform.host.outbox_worker import process_one as process_outbox
+
+            outbox_worked = process_outbox()
+        except Exception:
+            logger.exception("outbox process_one failed")
+        if not fsm_worked and not outbox_worked:
             time.sleep(poll_seconds)

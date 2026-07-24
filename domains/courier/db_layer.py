@@ -508,11 +508,49 @@ def get_user(session: Session, user_id: int) -> Optional[dict[str, Any]]:
     row = session.execute(
         text(
             """
-            SELECT id, name, role_name, city, phone
+            SELECT id, name, role_name, city, phone, telegram_chat_id
             FROM users WHERE id = :id
             """
         ),
         {"id": user_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def bind_telegram_chat_id(
+    session: Session, user_id: int, chat_id: str
+) -> bool:
+    """Пишет telegram_chat_id после /start deep-link."""
+    result = session.execute(
+        text(
+            """
+            UPDATE users
+            SET telegram_chat_id = :chat_id
+            WHERE id = :id
+            """
+        ),
+        {"id": int(user_id), "chat_id": str(chat_id)},
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def get_cell_display(session: Session, cell_id: int) -> Optional[dict[str, Any]]:
+    """Адрес постамата и код ячейки для пользовательских уведомлений."""
+    row = session.execute(
+        text(
+            """
+            SELECT
+                lc.id AS cell_id,
+                lc.cell_code,
+                l.location_address AS locker_address,
+                l.city AS locker_city,
+                l.locker_code
+            FROM locker_cells lc
+            JOIN lockers l ON l.id = lc.locker_id
+            WHERE lc.id = :cid
+            """
+        ),
+        {"cid": int(cell_id)},
     ).mappings().first()
     return dict(row) if row else None
 

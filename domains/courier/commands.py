@@ -31,7 +31,12 @@ def _opt_float(params: dict[str, Any], key: str) -> Optional[float]:
     return float(raw)
 
 
-def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+def create_order(
+    domain_session,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    platform_session=None,
+) -> dict[str, Any]:
     """
     Создаёт заказ: ищет свободные ячейки, пишет orders и stage_orders.
     Резерв ячеек — FSM process locker_reserve (locker_free → locker_reserved).
@@ -105,6 +110,17 @@ def create_order(domain_session, params: dict[str, Any], actor: dict[str, Any]) 
 
     db_layer.create_stage_order(domain_session, order_id, "pickup")
     db_layer.create_stage_order(domain_session, order_id, "delivery")
+
+    if platform_session is not None:
+        from domains.courier.notifications import enqueue_order_progress_notifications
+
+        enqueue_order_progress_notifications(
+            domain_session,
+            {"platform": platform_session},
+            order_id=order_id,
+            to_state="order_created",
+            platform_session=platform_session,
+        )
 
     # Ячейки резервирует FSM locker_reserve_cell (effect), не SQL в command.
     locker_bootstrap = [

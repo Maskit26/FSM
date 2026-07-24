@@ -499,11 +499,13 @@ class FsmDbLayer:
         payload: Optional[dict[str, Any]] = None,
         idempotency_key: Optional[str] = None,
     ) -> int:
-        """Добавляет исходящее сообщение в platform_outbox для надёжной доставки. Возвращает id записи outbox."""
+        """Добавляет исходящее сообщение в platform_outbox для надёжной доставки. Возвращает id записи outbox.
+        Дубликат idempotency_key → 0 (без ошибки транзакции).
+        """
         result = session.execute(
             text(
                 """
-                INSERT INTO platform_outbox
+                INSERT IGNORE INTO platform_outbox
                     (service_id, channel, destination, event_type, payload_json,
                      status, attempts, next_attempt_at, idempotency_key, created_at)
                 VALUES
@@ -520,7 +522,91 @@ class FsmDbLayer:
                 "idempotency_key": idempotency_key,
             },
         )
+        if int(result.rowcount or 0) == 0:
+            return 0
         return int(result.lastrowid)
+
+    def claim_pending_outbox(
+        self, session: SessionLike, *, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """
+        Берёт PENDING outbox строки (FOR UPDATE SKIP LOCKED) → PROCESSING.
+        Возвращает список dict с полями строки.
+        """
+        rows = session.execute(
+            text(
+                """
+                SELECT id, service_id, channel, destination, event_type,
+                       payload_json, attempts, idempotency_key
+                FROM platform_outbox
+                WHERE status = 'PENDING'
+                  AND next_attempt_at <= UTC_TIMESTAMP()
+                ORDER BY id ASC
+                LIMIT :lim
+                FOR UPDATE SKIP LOCKED
+                """
+            ),
+            {"lim": int(limit)},
+        ).mappings().all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            session.execute(
+                text(
+                    """
+                    UPDATE platform_outbox
+                    SET status = 'PROCESSING', attempts = attempts + 1
+                    WHERE id = :id AND status = 'PENDING'
+                    """
+                ),
+                {"id": int(item["id"])},
+            )
+            out.append(item)
+        return out
+
+    def mark_outbox_sent(self, session: SessionLike, outbox_id: int) -> None:
+        """Успешная доставка."""
+        session.execute(
+            text(
+                """
+                UPDATE platform_outbox
+                SET status = 'SENT', sent_at = UTC_TIMESTAMP(), last_error = NULL
+                WHERE id = :id
+                """
+            ),
+            {"id": int(outbox_id)},
+        )
+
+    def mark_outbox_retry(
+        self,
+        session: SessionLike,
+        outbox_id: int,
+        *,
+        error: str,
+        backoff_seconds: int,
+        dead: bool = False,
+    ) -> None:
+        """Ошибка доставки: PENDING + backoff или DEAD."""
+        status = "DEAD" if dead else "PENDING"
+        session.execute(
+            text(
+                """
+                UPDATE platform_outbox
+                SET status = :status,
+                    last_error = :err,
+                    next_attempt_at = DATE_ADD(
+                        UTC_TIMESTAMP(), INTERVAL :backoff SECOND
+                    )
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": int(outbox_id),
+                "status": status,
+                "err": (error or "")[:2000],
+                "backoff": int(max(1, backoff_seconds)),
+            },
+        )
 
     def insert_event(
         self,

@@ -38,7 +38,12 @@ def run_operation(
     sp = platform_session()
     sd = domain_session(service_id)
     try:
-        result = handler(sd, params, actor)
+        import inspect
+
+        if "platform_session" in inspect.signature(handler).parameters:
+            result = handler(sd, params, actor, platform_session=sp)
+        else:
+            result = handler(sd, params, actor)
         if kind == "command" and isinstance(result, dict) and result.get("entity_type"):
             _bootstrap_and_maybe_enqueue(sp, service_id, result, actor=actor)
         sd.commit()
