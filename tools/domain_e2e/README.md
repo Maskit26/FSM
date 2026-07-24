@@ -23,10 +23,13 @@ python -m tools.domain_e2e.runner scenarios/courier/client_self_pickup.yaml
 python -m tools.domain_e2e.runner scenarios/courier/client_deposit_x3_to_direction.yaml
 python -m tools.domain_e2e.runner scenarios/courier/driver_loading_x3.yaml
 python -m tools.domain_e2e.runner scenarios/courier/driver_cancel_reservation.yaml
+python -m tools.domain_e2e.runner scenarios/courier/self_and_courier_to_start_trip.yaml
 python -m tools.domain_e2e.runner scenarios/courier/
 ```
 
 Порядок x3: сначала `client_deposit_x3_to_direction` (заказы на бирже), потом `driver_loading_x3` или `driver_cancel_reservation`.
+
+`self_and_courier_to_start_trip` — автономный happy-path (self/self + courier/courier) до `start_trip` включительно; на чистой БД после `clear_test_data`.
 
 Перед прогонами на domain DB: `CALL clear_test_data();` (скрипт `sql/domain/012_clear_test_data.sql`).  
 Сразу после — на **platform** DB: `sql/platform/003_clear_test_runtime.sql` (entity_fsm_state + instances).  

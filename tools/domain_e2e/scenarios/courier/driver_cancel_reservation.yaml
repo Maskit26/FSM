@@ -22,13 +22,15 @@ steps:
     params: {}
     expect: { status_code: 200 }
     capture:
-      direction_id: data.directions.0.id
+      from_city: data.directions.0.from_city
+      to_city: data.directions.0.to_city
 
   - name: reserve_3
     operation: reserve_direction_slot
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
     params:
-      direction_id: "{{direction_id}}"
+      from_city: "{{from_city}}"
+      to_city: "{{to_city}}"
       capacity: 3
     expect:
       status_code: 200
@@ -57,14 +59,16 @@ steps:
       body:
         data.directions.0.orders_available: 3
     capture:
-      direction_id_after: data.directions.0.id
+      from_city_after: data.directions.0.from_city
+      to_city_after: data.directions.0.to_city
 
   # Доказательство, что пул снова берётся: повторный резерв
   - name: reserve_again
     operation: reserve_direction_slot
     actor: { actor_type: user, actor_id: "{{driver_id}}", channel: api }
     params:
-      direction_id: "{{direction_id_after}}"
+      from_city: "{{from_city_after}}"
+      to_city: "{{to_city_after}}"
       capacity: 3
     expect:
       status_code: 200

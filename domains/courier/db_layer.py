@@ -1119,21 +1119,202 @@ def get_direction(session: Session, direction_id: int) -> Optional[dict[str, Any
 def list_directions_for_driver_exchange(
     session: Session, city: str
 ) -> list[dict[str, Any]]:
-    """Биржа водителя: направления из города с orders_available > 0."""
-    rows = session.execute(
+    """
+    Биржа водителя: коридоры (from_city → to_city) с суммой available
+    по всем парам постаматов. Пары — в pairs[] для прозрачности.
+    """
+    corridor_rows = session.execute(
         text(
             """
-            SELECT id, from_city, to_city, pickup_locker_id, delivery_locker_id,
-                   orders_available, orders_reserved
-            FROM directions
-            WHERE from_city = :city
-              AND orders_available > 0
-            ORDER BY id ASC
+            SELECT
+                d.from_city,
+                d.to_city,
+                COUNT(DISTINCT so.order_id) AS orders_available
+            FROM directions d
+            JOIN stage_orders so
+              ON so.direction_id = d.id AND so.leg = 'pickup'
+            JOIN orders o ON o.id = so.order_id
+            WHERE d.from_city = :city
+              AND so.reserved_by_driver_id IS NULL
+              AND so.trip_id IS NULL
+              AND o.status IN ('order_parcel_confirmed', 'order_parcel_submitted')
+            GROUP BY d.from_city, d.to_city
+            HAVING COUNT(DISTINCT so.order_id) > 0
+            ORDER BY d.from_city ASC, d.to_city ASC
             """
         ),
         {"city": city},
     ).mappings().all()
-    return [dict(r) for r in rows]
+
+    pair_rows = session.execute(
+        text(
+            """
+            SELECT
+                d.id AS direction_id,
+                d.from_city,
+                d.to_city,
+                d.pickup_locker_id,
+                d.delivery_locker_id,
+                COUNT(DISTINCT so.order_id) AS orders_available
+            FROM directions d
+            JOIN stage_orders so
+              ON so.direction_id = d.id AND so.leg = 'pickup'
+            JOIN orders o ON o.id = so.order_id
+            WHERE d.from_city = :city
+              AND so.reserved_by_driver_id IS NULL
+              AND so.trip_id IS NULL
+              AND o.status IN ('order_parcel_confirmed', 'order_parcel_submitted')
+            GROUP BY
+                d.id, d.from_city, d.to_city,
+                d.pickup_locker_id, d.delivery_locker_id
+            HAVING COUNT(DISTINCT so.order_id) > 0
+            ORDER BY d.id ASC
+            """
+        ),
+        {"city": city},
+    ).mappings().all()
+
+    pairs_by_corridor: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in pair_rows:
+        key = (str(row["from_city"]), str(row["to_city"]))
+        pairs_by_corridor.setdefault(key, []).append(
+            {
+                "direction_id": int(row["direction_id"]),
+                "pickup_locker_id": int(row["pickup_locker_id"]),
+                "delivery_locker_id": int(row["delivery_locker_id"]),
+                "orders_available": int(row["orders_available"] or 0),
+            }
+        )
+
+    out: list[dict[str, Any]] = []
+    for row in corridor_rows:
+        from_city = str(row["from_city"])
+        to_city = str(row["to_city"])
+        pairs = pairs_by_corridor.get((from_city, to_city), [])
+        reserved = count_reserved_orders_on_corridor(session, from_city, to_city)
+        out.append(
+            {
+                "from_city": from_city,
+                "to_city": to_city,
+                "orders_available": int(row["orders_available"] or 0),
+                "orders_reserved": reserved,
+                "pairs": pairs,
+            }
+        )
+    return out
+
+
+def count_available_orders_on_corridor(
+    session: Session, from_city: str, to_city: str
+) -> int:
+    """Свободные заказы на коридоре (все пары постаматов)."""
+    n = session.execute(
+        text(
+            """
+            SELECT COUNT(DISTINCT so.order_id)
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            JOIN directions d ON d.id = so.direction_id
+            WHERE d.from_city = :from_city
+              AND d.to_city = :to_city
+              AND so.leg = 'pickup'
+              AND so.reserved_by_driver_id IS NULL
+              AND so.trip_id IS NULL
+              AND o.status IN ('order_parcel_confirmed', 'order_parcel_submitted')
+            """
+        ),
+        {"from_city": from_city, "to_city": to_city},
+    ).scalar()
+    return int(n or 0)
+
+
+def count_reserved_orders_on_corridor(
+    session: Session, from_city: str, to_city: str
+) -> int:
+    """Заказы коридора, уже в резерве (ещё без trip)."""
+    n = session.execute(
+        text(
+            """
+            SELECT COUNT(DISTINCT so.order_id)
+            FROM stage_orders so
+            JOIN directions d ON d.id = so.direction_id
+            WHERE d.from_city = :from_city
+              AND d.to_city = :to_city
+              AND so.leg = 'pickup'
+              AND so.reserved_by_driver_id IS NOT NULL
+              AND so.trip_id IS NULL
+            """
+        ),
+        {"from_city": from_city, "to_city": to_city},
+    ).scalar()
+    return int(n or 0)
+
+
+def count_active_driver_slots_on_corridor(
+    session: Session, from_city: str, to_city: str, driver_user_id: int
+) -> int:
+    """Число active|loading резервов водителя на коридоре."""
+    n = session.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM driver_reservations dr
+            JOIN directions d ON d.id = dr.direction_id
+            WHERE dr.driver_user_id = :driver_user_id
+              AND d.from_city = :from_city
+              AND d.to_city = :to_city
+              AND dr.status IN ('reservation_active', 'reservation_loading')
+            """
+        ),
+        {
+            "driver_user_id": driver_user_id,
+            "from_city": from_city,
+            "to_city": to_city,
+        },
+    ).scalar()
+    return int(n or 0)
+
+
+def list_pickup_stops_for_reservation(
+    session: Session, reservation_id: int
+) -> list[dict[str, Any]]:
+    """Группировка заказов резерва по pickup-постамату (для UI погрузки)."""
+    rows = session.execute(
+        text(
+            """
+            SELECT
+                l.id AS locker_id,
+                l.locker_code,
+                l.city,
+                l.location_address,
+                so.order_id
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            JOIN locker_cells lc ON lc.id = o.source_cell_id
+            JOIN lockers l ON l.id = lc.locker_id
+            WHERE so.reservation_id = :reservation_id
+              AND so.leg = 'pickup'
+            ORDER BY l.id ASC, so.order_id ASC
+            """
+        ),
+        {"reservation_id": reservation_id},
+    ).mappings().all()
+
+    by_locker: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        lid = int(row["locker_id"])
+        stop = by_locker.get(lid)
+        if stop is None:
+            stop = {
+                "locker_id": lid,
+                "locker_code": row.get("locker_code"),
+                "city": row.get("city"),
+                "location_address": row.get("location_address"),
+                "order_ids": [],
+            }
+            by_locker[lid] = stop
+        stop["order_ids"].append(int(row["order_id"]))
+    return list(by_locker.values())
 
 
 def reserve_orders_for_direction(
@@ -1141,47 +1322,74 @@ def reserve_orders_for_direction(
     direction_id: int,
     driver_user_id: int,
     capacity: int,
-) -> tuple[int, int, datetime]:
+) -> tuple[int, int, datetime, list[int]]:
+    """Compat: direction_id → коридор (from_city/to_city) → reserve."""
+    direction = get_direction(session, direction_id)
+    if direction is None:
+        raise ValueError("DIRECTION_NOT_FOUND")
+    return reserve_orders_for_corridor(
+        session,
+        str(direction["from_city"]),
+        str(direction["to_city"]),
+        driver_user_id,
+        capacity,
+    )
+
+
+def reserve_orders_for_corridor(
+    session: Session,
+    from_city: str,
+    to_city: str,
+    driver_user_id: int,
+    capacity: int,
+) -> tuple[int, int, datetime, list[int]]:
     """
-    Резерв до capacity заказов за водителем (как old reserve_orders_for_direction).
+    Резерв до capacity заказов по коридору (все пары постаматов).
     Returns (reservation_id, reserved_count, expires_at, order_ids).
-    Raises ValueError with code-like message on business failure.
+    reservation.direction_id = anchor (direction первого взятого заказа).
     """
     if capacity <= 0:
         raise ValueError("INVALID_CAPACITY")
+    from_city = str(from_city or "").strip()
+    to_city = str(to_city or "").strip()
+    if not from_city or not to_city:
+        raise ValueError("CITY_REQUIRED")
 
-    active_slots = session.execute(
-        text(
-            """
-            SELECT COUNT(*)
-            FROM driver_reservations
-            WHERE driver_user_id = :driver_user_id
-              AND direction_id = :direction_id
-              AND status IN ('reservation_active', 'reservation_loading')
-            """
-        ),
-        {"driver_user_id": driver_user_id, "direction_id": direction_id},
-    ).scalar()
-    if int(active_slots or 0) >= 3:
+    if count_active_driver_slots_on_corridor(
+        session, from_city, to_city, driver_user_id
+    ) >= 3:
         raise ValueError("LIMIT_EXCEEDED")
 
-    available = session.execute(
+    if count_available_orders_on_corridor(session, from_city, to_city) <= 0:
+        raise ValueError("NO_AVAILABLE_ORDERS")
+
+    order_rows = session.execute(
         text(
-            """
-            SELECT COUNT(DISTINCT so.order_id)
+            f"""
+            SELECT so.order_id, so.direction_id
             FROM stage_orders so
             JOIN orders o ON o.id = so.order_id
-            WHERE so.direction_id = :direction_id
+            JOIN directions d ON d.id = so.direction_id
+            WHERE d.from_city = :from_city
+              AND d.to_city = :to_city
               AND so.leg = 'pickup'
               AND so.reserved_by_driver_id IS NULL
               AND so.trip_id IS NULL
               AND o.status IN ('order_parcel_confirmed', 'order_parcel_submitted')
+            ORDER BY so.order_id ASC
+            LIMIT {int(capacity)}
+            FOR UPDATE
             """
         ),
-        {"direction_id": direction_id},
-    ).scalar()
-    if int(available or 0) == 0:
-        raise ValueError("NO_AVAILABLE_ORDERS")
+        {"from_city": from_city, "to_city": to_city},
+    ).fetchall()
+    if not order_rows:
+        raise ValueError("RESERVATION_FAILED")
+
+    order_ids = [int(r[0]) for r in order_rows]
+    anchor_direction_id = int(order_rows[0][1])
+    affected_direction_ids = sorted({int(r[1]) for r in order_rows})
+    reserved_count = len(order_ids)
 
     expires_at = datetime.utcnow() + timedelta(hours=1)
     session.execute(
@@ -1191,49 +1399,27 @@ def reserve_orders_for_direction(
                 driver_user_id, direction_id, reserved_count,
                 requested_count, expires_at, status
             ) VALUES (
-                :driver_user_id, :direction_id, 0,
+                :driver_user_id, :direction_id, :reserved_count,
                 :requested_count, :expires_at, 'reservation_active'
             )
             """
         ),
         {
             "driver_user_id": driver_user_id,
-            "direction_id": direction_id,
+            "direction_id": anchor_direction_id,
+            "reserved_count": reserved_count,
             "requested_count": capacity,
             "expires_at": expires_at,
         },
     )
     reservation_id = int(session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one())
 
-    order_rows = session.execute(
-        text(
-            f"""
-            SELECT so.order_id
-            FROM stage_orders so
-            JOIN orders o ON o.id = so.order_id
-            WHERE so.direction_id = :direction_id
-              AND so.leg = 'pickup'
-              AND so.reserved_by_driver_id IS NULL
-              AND so.trip_id IS NULL
-              AND o.status IN ('order_parcel_confirmed', 'order_parcel_submitted')
-            ORDER BY so.order_id ASC
-            LIMIT {int(capacity)}
-            """
-        ),
-        {"direction_id": direction_id},
-    ).fetchall()
-    if not order_rows:
-        raise ValueError("RESERVATION_FAILED")
-
-    order_ids = [int(r[0]) for r in order_rows]
-    reserved_count = len(order_ids)
     placeholders = ", ".join(f":order_{i}" for i in range(len(order_ids)))
     params: dict[str, Any] = {
         f"order_{i}": oid for i, oid in enumerate(order_ids)
     }
     params["driver_user_id"] = driver_user_id
     params["reservation_id"] = reservation_id
-    params["direction_id"] = direction_id
 
     session.execute(
         text(
@@ -1241,24 +1427,14 @@ def reserve_orders_for_direction(
             UPDATE stage_orders
             SET reserved_by_driver_id = :driver_user_id,
                 reservation_id = :reservation_id
-            WHERE direction_id = :direction_id
-              AND order_id IN ({placeholders})
+            WHERE order_id IN ({placeholders})
               AND leg IN ('pickup', 'delivery')
             """
         ),
         params,
     )
-    session.execute(
-        text(
-            """
-            UPDATE driver_reservations
-            SET reserved_count = :count
-            WHERE id = :reservation_id
-            """
-        ),
-        {"count": reserved_count, "reservation_id": reservation_id},
-    )
-    recalculate_direction_counters(session, direction_id)
+    for did in affected_direction_ids:
+        recalculate_direction_counters(session, did)
     return reservation_id, reserved_count, expires_at, order_ids
 
 
@@ -1318,19 +1494,40 @@ def set_reservation_status(
 def get_driver_loading_reservations(
     session: Session, direction_id: int, driver_user_id: int
 ) -> list[int]:
-    """Активные резервы водителя на направлении (active|loading)."""
+    """Compat: direction_id → коридор → резервы водителя."""
+    direction = get_direction(session, direction_id)
+    if direction is None:
+        return []
+    return get_driver_loading_reservations_for_corridor(
+        session,
+        str(direction["from_city"]),
+        str(direction["to_city"]),
+        driver_user_id,
+    )
+
+
+def get_driver_loading_reservations_for_corridor(
+    session: Session, from_city: str, to_city: str, driver_user_id: int
+) -> list[int]:
+    """Активные резервы водителя на коридоре (active|loading)."""
     rows = session.execute(
         text(
             """
-            SELECT id
-            FROM driver_reservations
-            WHERE direction_id = :direction_id
-              AND driver_user_id = :driver_user_id
-              AND status IN ('reservation_active', 'reservation_loading')
-            ORDER BY id ASC
+            SELECT dr.id
+            FROM driver_reservations dr
+            JOIN directions d ON d.id = dr.direction_id
+            WHERE dr.driver_user_id = :driver_user_id
+              AND d.from_city = :from_city
+              AND d.to_city = :to_city
+              AND dr.status IN ('reservation_active', 'reservation_loading')
+            ORDER BY dr.id ASC
             """
         ),
-        {"direction_id": direction_id, "driver_user_id": driver_user_id},
+        {
+            "driver_user_id": driver_user_id,
+            "from_city": from_city,
+            "to_city": to_city,
+        },
     ).fetchall()
     return [int(r[0]) for r in rows]
 
@@ -1632,7 +1829,6 @@ def release_orders_from_reservation(session: Session, reservation_id: int) -> in
     reservation = get_driver_reservation(session, reservation_id)
     if reservation is None:
         raise ValueError("RESERVATION_NOT_FOUND")
-    direction_id = int(reservation["direction_id"])
 
     count = session.execute(
         text(
@@ -1649,6 +1845,18 @@ def release_orders_from_reservation(session: Session, reservation_id: int) -> in
     if released == 0:
         return 0
 
+    affected = session.execute(
+        text(
+            """
+            SELECT DISTINCT direction_id
+            FROM stage_orders
+            WHERE reservation_id = :reservation_id
+              AND direction_id IS NOT NULL
+            """
+        ),
+        {"reservation_id": reservation_id},
+    ).fetchall()
+
     session.execute(
         text(
             """
@@ -1661,7 +1869,8 @@ def release_orders_from_reservation(session: Session, reservation_id: int) -> in
         ),
         {"reservation_id": reservation_id},
     )
-    recalculate_direction_counters(session, direction_id)
+    for row in affected:
+        recalculate_direction_counters(session, int(row[0]))
     return released
 
 
@@ -1671,17 +1880,33 @@ def create_trip_with_orders(
     direction_id: int,
     driver_user_id: int,
     order_ids: list[int],
+    from_city: Optional[str] = None,
+    to_city: Optional[str] = None,
 ) -> int:
     """
     Создаёт trip (status=trip_assigned) и пишет trip_id в stage_orders
     для переданных заказов (pickup+delivery).
+    Коридор: from_city/to_city; lockers — из первого заказа (multi-stop UI отдельно).
     """
     if not order_ids:
         raise ValueError("NO_ORDERS_FOR_TRIP")
 
     direction = get_direction(session, direction_id)
-    if direction is None:
+    if direction is None and (not from_city or not to_city):
         raise ValueError("DIRECTION_NOT_FOUND")
+
+    trip_from = str(from_city or (direction or {}).get("from_city") or "").strip()
+    trip_to = str(to_city or (direction or {}).get("to_city") or "").strip()
+    if not trip_from or not trip_to:
+        raise ValueError("CITY_REQUIRED")
+
+    first = get_order(session, int(order_ids[0]))
+    if first is None:
+        raise ValueError("ORDER_NOT_FOUND")
+    pickup_locker_id = get_locker_id_by_cell(session, int(first["source_cell_id"]))
+    delivery_locker_id = get_locker_id_by_cell(session, int(first["dest_cell_id"]))
+    if not pickup_locker_id or not delivery_locker_id:
+        raise ValueError("LOCKER_MISSING")
 
     session.execute(
         text(
@@ -1699,10 +1924,10 @@ def create_trip_with_orders(
         ),
         {
             "driver_user_id": driver_user_id,
-            "from_city": direction["from_city"],
-            "to_city": direction["to_city"],
-            "pickup_locker_id": direction["pickup_locker_id"],
-            "delivery_locker_id": direction["delivery_locker_id"],
+            "from_city": trip_from,
+            "to_city": trip_to,
+            "pickup_locker_id": pickup_locker_id,
+            "delivery_locker_id": delivery_locker_id,
         },
     )
     trip_id = int(session.execute(text("SELECT LAST_INSERT_ID()")).scalar_one())
@@ -1721,7 +1946,20 @@ def create_trip_with_orders(
         ),
         params,
     )
-    recalculate_direction_counters(session, direction_id)
+
+    affected = session.execute(
+        text(
+            f"""
+            SELECT DISTINCT direction_id
+            FROM stage_orders
+            WHERE order_id IN ({placeholders})
+              AND direction_id IS NOT NULL
+            """
+        ),
+        {f"oid_{i}": oid for i, oid in enumerate(order_ids)},
+    ).fetchall()
+    for row in affected:
+        recalculate_direction_counters(session, int(row[0]))
     return trip_id
 
 

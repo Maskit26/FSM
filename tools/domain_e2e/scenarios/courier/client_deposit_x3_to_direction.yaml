@@ -154,4 +154,5 @@ steps:
     expect:
       status_code: 200
     capture:
-      direction_id: data.directions.0.id
+      from_city: data.directions.0.from_city
+      to_city: data.directions.0.to_city

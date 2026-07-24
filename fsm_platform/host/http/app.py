@@ -99,6 +99,7 @@ def invoke(service_id: str, body: InvokeBody) -> dict[str, Any]:
         "entity_id": result.get("entity_id"),
         "instance_id": result.get("instance_id"),
         "instance_ids": result.get("instance_ids"),
+        "saga_id": result.get("saga_id"),
     }
 
 

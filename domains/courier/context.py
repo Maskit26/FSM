@@ -253,45 +253,65 @@ def build_invoke_trip_context(
 def build_invoke_direction_context(
     session_domain,
     *,
-    direction_id: int,
     actor_id: int,
     capacity: int,
+    direction_id: Optional[int] = None,
+    from_city: Optional[str] = None,
+    to_city: Optional[str] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Context для sync reserve_direction_slot."""
+    """Context для sync reserve_direction_slot (коридор или legacy direction_id)."""
     executor = db_layer.get_user(session_domain, actor_id)
-    direction = db_layer.get_direction(session_domain, direction_id)
+    direction = None
+    resolved_from = str(from_city or "").strip() or None
+    resolved_to = str(to_city or "").strip() or None
+    anchor_direction_id = int(direction_id) if direction_id else 0
+
+    if anchor_direction_id:
+        direction = db_layer.get_direction(session_domain, anchor_direction_id)
+        if direction is not None:
+            resolved_from = str(direction.get("from_city") or "").strip() or None
+            resolved_to = str(direction.get("to_city") or "").strip() or None
+    elif resolved_from and resolved_to:
+        # synthetic corridor marker for guard (presence check)
+        direction = {
+            "from_city": resolved_from,
+            "to_city": resolved_to,
+            "id": None,
+        }
+
     available_count = 0
     active_slots = 0
-    if direction is not None:
-        available_count = db_layer.count_available_orders_on_direction(
-            session_domain, direction_id
+    if resolved_from and resolved_to:
+        available_count = db_layer.count_available_orders_on_corridor(
+            session_domain, resolved_from, resolved_to
         )
-        active_slots = db_layer.count_active_driver_slots_on_direction(
-            session_domain, direction_id, actor_id
+        active_slots = db_layer.count_active_driver_slots_on_corridor(
+            session_domain, resolved_from, resolved_to, actor_id
         )
 
     instance: dict[str, Any] = {
-        "entity_id": direction_id,
+        "entity_id": anchor_direction_id or 0,
         "actor_id": actor_id,
         "payload_json": {
             "executor_user_id": actor_id,
             "driver_user_id": actor_id,
             "capacity": capacity,
-            "direction_id": direction_id,
+            "direction_id": anchor_direction_id or None,
+            "from_city": resolved_from,
+            "to_city": resolved_to,
         },
     }
     ctx: dict[str, Any] = {
         "direction": direction,
-        "direction_id": direction_id,
+        "direction_id": anchor_direction_id or None,
+        "from_city": resolved_from,
+        "to_city": resolved_to,
         "capacity": capacity,
         "available_count": available_count,
         "active_slots": active_slots,
         "executor_id": actor_id,
         "executor": executor,
         "executor_city": str((executor or {}).get("city") or "").strip() or None,
-        "from_city": (
-            str((direction or {}).get("from_city") or "").strip() or None
-        ),
         "payload": instance["payload_json"],
     }
     return ctx, instance
@@ -300,24 +320,42 @@ def build_invoke_direction_context(
 def build_invoke_create_trip_context(
     session_domain,
     *,
-    direction_id: int,
     actor_id: int,
+    direction_id: Optional[int] = None,
+    from_city: Optional[str] = None,
+    to_city: Optional[str] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Context для sync части complete_loading: создание trip.
-    Факты: open cells, loading reservations, picked orders, bindable legs.
+    Коридор: from_city/to_city (или legacy direction_id → города).
     """
     executor = db_layer.get_user(session_domain, actor_id)
-    direction = db_layer.get_direction(session_domain, direction_id)
+    direction = None
+    resolved_from = str(from_city or "").strip() or None
+    resolved_to = str(to_city or "").strip() or None
+    anchor_direction_id = int(direction_id) if direction_id else 0
+
+    if anchor_direction_id:
+        direction = db_layer.get_direction(session_domain, anchor_direction_id)
+        if direction is not None:
+            resolved_from = str(direction.get("from_city") or "").strip() or None
+            resolved_to = str(direction.get("to_city") or "").strip() or None
+    elif resolved_from and resolved_to:
+        direction = {
+            "from_city": resolved_from,
+            "to_city": resolved_to,
+            "id": None,
+        }
+
     open_cells: list[int] = []
     reservation_ids: list[int] = []
     loading_ids: list[int] = []
     picked_order_ids: list[int] = []
     unbindable_order_ids: list[int] = []
 
-    if direction is not None:
-        reservation_ids = db_layer.get_driver_loading_reservations(
-            session_domain, direction_id, actor_id
+    if resolved_from and resolved_to:
+        reservation_ids = db_layer.get_driver_loading_reservations_for_corridor(
+            session_domain, resolved_from, resolved_to, actor_id
         )
         for rid in reservation_ids:
             row = db_layer.get_driver_reservation(session_domain, rid) or {}
@@ -334,19 +372,29 @@ def build_invoke_create_trip_context(
                 unbindable_order_ids = db_layer.list_orders_missing_trip_legs(
                     session_domain, picked_order_ids
                 )
+            if not anchor_direction_id and loading_ids:
+                anchor = db_layer.get_driver_reservation(
+                    session_domain, loading_ids[0]
+                )
+                if anchor and anchor.get("direction_id") is not None:
+                    anchor_direction_id = int(anchor["direction_id"])
 
     instance: dict[str, Any] = {
-        "entity_id": direction_id,
+        "entity_id": anchor_direction_id or 0,
         "actor_id": actor_id,
         "payload_json": {
             "executor_user_id": actor_id,
             "driver_user_id": actor_id,
-            "direction_id": direction_id,
+            "direction_id": anchor_direction_id or None,
+            "from_city": resolved_from,
+            "to_city": resolved_to,
         },
     }
     ctx: dict[str, Any] = {
         "direction": direction,
-        "direction_id": direction_id,
+        "direction_id": anchor_direction_id or None,
+        "from_city": resolved_from,
+        "to_city": resolved_to,
         "open_cells": open_cells,
         "reservation_ids": reservation_ids,
         "loading_reservation_ids": loading_ids,

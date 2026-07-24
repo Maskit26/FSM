@@ -498,9 +498,9 @@ def reserve_direction_slot(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Водитель резервирует до capacity заказов из направления.
-    context → can_reserve_direction_slot → INSERT + bootstrap.
-    params: direction_id, capacity.
+    Водитель резервирует до capacity заказов по коридору (город→город).
+    params: from_city + to_city + capacity
+    (legacy: direction_id → резолвится в коридор).
     """
     from domains.courier.context import build_invoke_direction_context
     from domains.courier.guards import can_reserve_direction_slot
@@ -512,9 +512,13 @@ def reserve_direction_slot(
     if not driver_id:
         raise ValueError("actor.actor_id required")
 
-    direction_id = int(params.get("direction_id") or params.get("entity_id") or 0)
-    if not direction_id:
-        raise ValueError("direction_id required")
+    raw_dir = params.get("direction_id") or params.get("entity_id")
+    direction_id = int(raw_dir) if raw_dir not in (None, "") else 0
+    from_city = str(params.get("from_city") or "").strip() or None
+    to_city = str(params.get("to_city") or "").strip() or None
+    if not direction_id and (not from_city or not to_city):
+        raise ValueError("from_city+to_city (or direction_id) required")
+
     try:
         capacity = int(params.get("capacity") or 0)
     except (TypeError, ValueError) as exc:
@@ -522,9 +526,11 @@ def reserve_direction_slot(
 
     ctx, _instance = build_invoke_direction_context(
         domain_session,
-        direction_id=direction_id,
         actor_id=driver_id,
         capacity=capacity,
+        direction_id=direction_id or None,
+        from_city=from_city,
+        to_city=to_city,
     )
     gate = can_reserve_direction_slot(
         domain_session, None, ctx, _instance, {"user_role": "driver"}
@@ -532,15 +538,32 @@ def reserve_direction_slot(
     if not gate.ok:
         raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
 
+    resolved_from = str(ctx.get("from_city") or "")
+    resolved_to = str(ctx.get("to_city") or "")
     try:
         reservation_id, reserved_count, expires_at, order_ids = (
-            db_layer.reserve_orders_for_direction(
-                domain_session, direction_id, driver_id, capacity
+            db_layer.reserve_orders_for_corridor(
+                domain_session,
+                resolved_from,
+                resolved_to,
+                driver_id,
+                capacity,
             )
         )
     except ValueError as exc:
         code = str(exc)
         raise DomainError(code, code) from exc
+
+    pickup_stops = db_layer.list_pickup_stops_for_reservation(
+        domain_session, reservation_id
+    )
+    anchor_direction_id = int(ctx.get("direction_id") or 0)
+    if not anchor_direction_id:
+        reservation = db_layer.get_driver_reservation(
+            domain_session, reservation_id
+        )
+        if reservation and reservation.get("direction_id") is not None:
+            anchor_direction_id = int(reservation["direction_id"])
 
     expire_key = f"expire_reservation:{reservation_id}"
     return {
@@ -555,7 +578,9 @@ def reserve_direction_slot(
                 "fire_at": expires_at,
                 "idempotency_key": expire_key,
                 "payload": {
-                    "direction_id": direction_id,
+                    "direction_id": anchor_direction_id or None,
+                    "from_city": resolved_from,
+                    "to_city": resolved_to,
                     "executor_user_id": driver_id,
                     "driver_user_id": driver_id,
                     "source": "expire_timer",
@@ -564,11 +589,14 @@ def reserve_direction_slot(
         ],
         "data": {
             "reservation_id": reservation_id,
-            "direction_id": direction_id,
+            "direction_id": anchor_direction_id or None,
+            "from_city": resolved_from,
+            "to_city": resolved_to,
             "driver_user_id": driver_id,
             "requested_count": capacity,
             "reserved_count": reserved_count,
             "order_ids": order_ids,
+            "pickup_stops": pickup_stops,
             "expires_at": expires_at.isoformat() + "Z",
             "status": "reservation_active",
         },
@@ -614,6 +642,9 @@ def start_loading(
         raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
 
     direction_id = int(ctx.get("direction_id") or 0)
+    pickup_stops = db_layer.list_pickup_stops_for_reservation(
+        domain_session, reservation_id
+    )
     return {
         "entity_type": "driver_reservations",
         "entity_id": reservation_id,
@@ -634,6 +665,7 @@ def start_loading(
             "reservation_id": reservation_id,
             "direction_id": direction_id,
             "driver_user_id": driver_id,
+            "pickup_stops": pickup_stops,
             "status": "pending_fsm",
         },
     }
@@ -715,10 +747,10 @@ def complete_loading(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Завершить погрузку по направлению:
+    Завершить погрузку по коридору:
     context → can_create_trip → release unpicked + INSERT trip + bootstrap,
     затем enqueues[] complete_loading на каждый резерв (FSM).
-    params: direction_id.
+    params: from_city + to_city (legacy: direction_id).
     """
     from domains.courier.context import build_invoke_create_trip_context
     from domains.courier.guards import can_create_trip
@@ -730,14 +762,19 @@ def complete_loading(
     if not driver_id:
         raise ValueError("actor.actor_id required")
 
-    direction_id = int(params.get("direction_id") or params.get("entity_id") or 0)
-    if not direction_id:
-        raise ValueError("direction_id required")
+    raw_dir = params.get("direction_id") or params.get("entity_id")
+    direction_id = int(raw_dir) if raw_dir not in (None, "") else 0
+    from_city = str(params.get("from_city") or "").strip() or None
+    to_city = str(params.get("to_city") or "").strip() or None
+    if not direction_id and (not from_city or not to_city):
+        raise ValueError("from_city+to_city (or direction_id) required")
 
     ctx, _instance = build_invoke_create_trip_context(
         domain_session,
-        direction_id=direction_id,
         actor_id=driver_id,
+        direction_id=direction_id or None,
+        from_city=from_city,
+        to_city=to_city,
     )
     gate = can_create_trip(
         domain_session, None, ctx, _instance, {"user_role": "driver"}
@@ -747,6 +784,11 @@ def complete_loading(
 
     loading_ids = list(ctx["loading_reservation_ids"])
     picked = list(ctx["picked_order_ids"])
+    resolved_from = str(ctx.get("from_city") or "")
+    resolved_to = str(ctx.get("to_city") or "")
+    anchor_direction_id = int(ctx.get("direction_id") or 0)
+    if not anchor_direction_id:
+        raise DomainError("DIRECTION_NOT_FOUND", "DIRECTION_NOT_FOUND")
 
     released = db_layer.release_unpicked_orders_by_reservations(
         domain_session, loading_ids, picked
@@ -755,9 +797,11 @@ def complete_loading(
     try:
         trip_id = db_layer.create_trip_with_orders(
             domain_session,
-            direction_id=direction_id,
+            direction_id=anchor_direction_id,
             driver_user_id=driver_id,
             order_ids=picked,
+            from_city=resolved_from,
+            to_city=resolved_to,
         )
     except ValueError as exc:
         raise DomainError(str(exc), str(exc)) from exc
@@ -778,7 +822,9 @@ def complete_loading(
                 "entity_id": rid,
                 "process_name": "complete_loading",
                 "payload": {
-                    "direction_id": direction_id,
+                    "direction_id": anchor_direction_id,
+                    "from_city": resolved_from,
+                    "to_city": resolved_to,
                     "executor_user_id": driver_id,
                     "driver_user_id": driver_id,
                     "source": "complete_loading",
@@ -791,7 +837,9 @@ def complete_loading(
             for rid in loading_ids
         ],
         "data": {
-            "direction_id": direction_id,
+            "direction_id": anchor_direction_id,
+            "from_city": resolved_from,
+            "to_city": resolved_to,
             "driver_user_id": driver_id,
             "reservation_ids": loading_ids,
             "picked_order_ids": picked,

@@ -154,7 +154,8 @@ def list_driver_exchange(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Биржа водителя: направления из города водителя с свободными заказами.
+    Биржа водителя: коридоры (from_city → to_city) с суммой available
+    по всем парам постаматов. В directions[].pairs — разбивка по парам.
     """
     _ = params
     try:

@@ -146,6 +146,43 @@ def _enqueue_finish(
     )
 
 
+def _heal_desynced_children(
+    db: FsmDbLayer, session: SessionLike, saga_id: int
+) -> None:
+    """
+    Подтягивает child-status из server_fsm_instances, если instance уже
+    терминален, а child ещё PENDING/RUNNING (пропущенный fan-in).
+    """
+    for child in db.list_saga_children(session, saga_id):
+        if str(child.get("status") or "") not in _CHILD_ACTIVE:
+            continue
+        inst = db.get_fsm_instance_by_id(session, int(child["instance_id"]))
+        if inst is None:
+            continue
+        istatus = str(inst.get("status") or "").upper()
+        if istatus == _TERMINAL_OK:
+            db.mark_saga_child_terminal(
+                session, int(child["instance_id"]), _TERMINAL_OK, None
+            )
+            logger.warning(
+                "saga heal child COMPLETED saga_id=%s instance_id=%s",
+                saga_id,
+                child["instance_id"],
+            )
+        elif istatus == _TERMINAL_FAIL:
+            db.mark_saga_child_terminal(
+                session,
+                int(child["instance_id"]),
+                _TERMINAL_FAIL,
+                inst.get("last_error"),
+            )
+            logger.warning(
+                "saga heal child FAILED saga_id=%s instance_id=%s",
+                saga_id,
+                child["instance_id"],
+            )
+
+
 def on_child_terminal(
     session: SessionLike,
     *,
@@ -174,6 +211,10 @@ def on_child_terminal(
         return None
     if str(saga.get("status") or "") != "RUNNING":
         return {"saga_id": saga_id, "saga_status": saga.get("status")}
+
+    # Heal: instance уже COMPLETED/FAILED, а child-row ещё PENDING
+    # (старый воркер / rollback platform после domain commit).
+    _heal_desynced_children(db, session, saga_id)
 
     children = db.list_saga_children(session, saga_id)
     policy = str(saga.get("fail_policy") or "fail_fast").lower()

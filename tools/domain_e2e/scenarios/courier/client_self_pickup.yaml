@@ -128,7 +128,8 @@ steps:
     expect:
       status_code: 200
     capture:
-      direction_id: data.directions.0.id
+      from_city: data.directions.0.from_city
+      to_city: data.directions.0.to_city
 
   - name: reserve_direction_slot
     operation: reserve_direction_slot
@@ -137,7 +138,8 @@ steps:
       actor_id: "{{driver_id}}"
       channel: api
     params:
-      direction_id: "{{direction_id}}"
+      from_city: "{{from_city}}"
+      to_city: "{{to_city}}"
       capacity: 1
     expect:
       status_code: 200
@@ -213,7 +215,8 @@ steps:
       actor_id: "{{driver_id}}"
       channel: api
     params:
-      direction_id: "{{direction_id}}"
+      from_city: "{{from_city}}"
+      to_city: "{{to_city}}"
     expect:
       status_code: 200
     wait_instance: true

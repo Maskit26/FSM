@@ -356,6 +356,24 @@ class FsmDbLayer:
         ).mappings().first()
         return dict(row) if row else None
 
+    def get_fsm_instance_by_id(
+        self, session: SessionLike, instance_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Загружает instance по id (без service_id). Для saga heal/fan-in."""
+        row = session.execute(
+            text(
+                """
+                SELECT id, service_id, process_name, entity_type, entity_id,
+                       status, attempts, last_error, payload_json, actor_id,
+                       created_at, started_at, finished_at
+                FROM server_fsm_instances
+                WHERE id = :id
+                """
+            ),
+            {"id": instance_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
     def claim_pending_instance(
         self, session: SessionLike
     ) -> Optional[dict[str, Any]]:
