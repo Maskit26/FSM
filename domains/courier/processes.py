@@ -48,8 +48,11 @@ from domains.courier.guards import (
     can_cancel_reservation,
     can_close_cell,
     can_complete_loading,
+    can_create_trip,
+    can_expire_reservation,
     can_open_cell,
     can_remove_executor,
+    can_reserve_direction_slot,
     can_reserve_locker_cell,
     can_start_loading,
     can_start_order_transit,
@@ -205,6 +208,16 @@ def register_all(service_id: str) -> None:
     default_process_registry.register(
         ProcessDef(
             service_id=service_id,
+            process_name="expire_reservation",
+            entity_type="driver_reservations",
+            event_name="expire_reservation",
+            context_builder=build_reservation_context,
+            initial_state="reservation_active",
+        )
+    )
+    default_process_registry.register(
+        ProcessDef(
+            service_id=service_id,
             process_name="locker_reserve",
             entity_type="locker",
             event_name="locker_reserve_cell",
@@ -251,8 +264,15 @@ def register_all(service_id: str) -> None:
         service_id, "can_cancel_reservation", can_cancel_reservation
     )
     default_guard_registry.register(
+        service_id, "can_expire_reservation", can_expire_reservation
+    )
+    default_guard_registry.register(
         service_id, "can_reserve_locker_cell", can_reserve_locker_cell
     )
+    default_guard_registry.register(
+        service_id, "can_reserve_direction_slot", can_reserve_direction_slot
+    )
+    default_guard_registry.register(service_id, "can_create_trip", can_create_trip)
     default_guard_registry.register(service_id, "can_start_trip", can_start_trip)
     default_guard_registry.register(
         service_id, "can_start_order_transit", can_start_order_transit

@@ -232,6 +232,72 @@ class FsmDbLayer:
             {"timer_id": timer_id},
         )
 
+    def cancel_timer_by_idempotency_key(
+        self, session: SessionLike, service_id: str, idempotency_key: str
+    ) -> int:
+        """Отмена SCHEDULED-таймера по idempotency_key. Возвращает число строк."""
+        result = session.execute(
+            text(
+                """
+                UPDATE fsm_timers
+                SET status = 'CANCELLED', cancelled_at = UTC_TIMESTAMP()
+                WHERE service_id = :service_id
+                  AND idempotency_key = :idempotency_key
+                  AND status = 'SCHEDULED'
+                """
+            ),
+            {"service_id": service_id, "idempotency_key": idempotency_key},
+        )
+        return int(result.rowcount or 0)
+
+    def claim_due_timers(
+        self, session: SessionLike, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """
+        Забирает due SCHEDULED таймеры (fire_at <= UTC now) и помечает FIRED.
+        Возвращает строки для enqueue процессов.
+        """
+        rows = session.execute(
+            text(
+                """
+                SELECT id, service_id, entity_type, entity_id, process_name,
+                       payload_json
+                FROM fsm_timers
+                WHERE status = 'SCHEDULED'
+                  AND fire_at <= UTC_TIMESTAMP()
+                ORDER BY fire_at ASC
+                LIMIT :limit
+                FOR UPDATE
+                """
+            ),
+            {"limit": int(limit)},
+        ).mappings().all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            session.execute(
+                text(
+                    """
+                    UPDATE fsm_timers
+                    SET status = 'FIRED'
+                    WHERE id = :id AND status = 'SCHEDULED'
+                    """
+                ),
+                {"id": int(item["id"])},
+            )
+            raw = item.get("payload_json")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item["payload"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    item["payload"] = {}
+            elif isinstance(raw, dict):
+                item["payload"] = raw
+            else:
+                item["payload"] = {}
+            out.append(item)
+        return out
+
     # --- server_fsm_instances ---
 
     def insert_fsm_instance(

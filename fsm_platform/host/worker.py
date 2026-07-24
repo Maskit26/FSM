@@ -19,6 +19,51 @@ from fsm_platform.host.engines import domain_session, platform_session
 logger = logging.getLogger(__name__)
 
 
+def _fire_due_timers(*, limit: int = 20) -> bool:
+    """
+    SCHEDULED timers с fire_at<=now → enqueue process + FIRED.
+    True если хотя бы один таймер обработан.
+    """
+    sp = platform_session()
+    try:
+        due = default_db_layer.claim_due_timers(sp, limit=limit)
+        if not due:
+            sp.rollback()
+            return False
+        for timer in due:
+            payload = timer.get("payload") or {}
+            actor_raw = (
+                payload.get("executor_user_id")
+                or payload.get("driver_user_id")
+                or payload.get("actor_id")
+            )
+            actor_id = int(actor_raw) if actor_raw is not None else None
+            default_db_layer.insert_fsm_instance(
+                sp,
+                service_id=str(timer["service_id"]),
+                process_name=str(timer["process_name"]),
+                entity_type=str(timer["entity_type"]),
+                entity_id=int(timer["entity_id"]),
+                payload=payload,
+                actor_id=actor_id,
+            )
+            logger.info(
+                "timer fired id=%s process=%s entity=%s/%s",
+                timer.get("id"),
+                timer.get("process_name"),
+                timer.get("entity_type"),
+                timer.get("entity_id"),
+            )
+        sp.commit()
+        return True
+    except Exception:
+        sp.rollback()
+        logger.exception("fire_due_timers failed")
+        return False
+    finally:
+        sp.close()
+
+
 def _failed_short_tx(instance: dict[str, Any], last_error: str) -> None:
     """
     Короткая отдельная транзакция при FAILED: помечает инстанс и пишет событие.
@@ -88,6 +133,9 @@ def process_one() -> bool:
     Берёт один PENDING-инстанс и прогоняет FSM до COMPLETED или FAILED.
     Возвращает True, если была работа; False, если очередь пуста.
     """
+    if _fire_due_timers():
+        return True
+
     sp = platform_session()
     instance: Optional[dict[str, Any]] = None
     sd = None

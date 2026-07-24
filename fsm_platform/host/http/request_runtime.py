@@ -103,6 +103,8 @@ def _bootstrap_and_maybe_enqueue(
                 sp, service_id, str(r_type), r_id_int, str(r_initial)
             )
 
+    _apply_timers(sp, service_id, result)
+
     enqueues = result.get("enqueues")
     if isinstance(enqueues, list) and enqueues:
         instance_ids: list[int] = []
@@ -158,6 +160,54 @@ def _bootstrap_and_maybe_enqueue(
         actor_id=_actor_id_from_actor(actor),
     )
     result["instance_id"] = instance_id
+
+
+def _apply_timers(sp, service_id: str, result: dict[str, Any]) -> None:
+    """cancel_timers[] / timers[] из ответа command → fsm_timers."""
+    from datetime import datetime
+
+    from fsm_platform.host import side_effects
+
+    for item in result.get("cancel_timers") or []:
+        if not isinstance(item, dict):
+            raise ValueError("cancel_timers items must be objects")
+        key = item.get("idempotency_key")
+        if not key:
+            raise ValueError("cancel_timers[].idempotency_key required")
+        default_db_layer.cancel_timer_by_idempotency_key(
+            sp, service_id, str(key)
+        )
+
+    timer_ids: list[int] = []
+    for item in result.get("timers") or []:
+        if not isinstance(item, dict):
+            raise ValueError("timers items must be objects")
+        process_name = item.get("process_name")
+        e_type = item.get("entity_type") or result.get("entity_type")
+        e_id = item.get("entity_id")
+        fire_at = item.get("fire_at")
+        if not process_name or e_type is None or e_id is None or fire_at is None:
+            raise ValueError(
+                "timers[] require process_name, entity_type, entity_id, fire_at"
+            )
+        if isinstance(fire_at, str):
+            fire_at = datetime.fromisoformat(
+                fire_at.replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+        timer_ids.append(
+            side_effects.schedule_timer(
+                sp,
+                service_id=service_id,
+                entity_type=str(e_type),
+                entity_id=int(e_id),
+                process_name=str(process_name),
+                fire_at=fire_at,
+                payload=item.get("payload") or {},
+                idempotency_key=item.get("idempotency_key"),
+            )
+        )
+    if timer_ids:
+        result["timer_ids"] = timer_ids
 
 
 def enqueue_instance(

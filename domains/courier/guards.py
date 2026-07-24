@@ -406,6 +406,112 @@ def can_complete_loading(
     return _match_reservation_edge(context, guard_params)
 
 
+def can_reserve_direction_slot(
+    session_domain, db, context, instance, guard_params=None
+) -> GuardResult:
+    """Sync reserve: driver + direction + city + capacity + slots + availability."""
+    _ = db
+    _ = session_domain
+    _ = instance
+    ctx = context or {}
+    params = guard_params or {}
+
+    actor_id = ctx.get("executor_id")
+    if not actor_id:
+        return GuardResult(ok=False, reason="ACTOR_ID_REQUIRED")
+    user = ctx.get("executor")
+    if user is None:
+        return GuardResult(ok=False, reason="USER_NOT_FOUND")
+    expected_role = params.get("user_role") or "driver"
+    if str(user.get("role_name") or "") != str(expected_role):
+        return GuardResult(ok=False, reason=f"ROLE_MISMATCH:{user.get('role_name')}")
+
+    capacity = int(ctx.get("capacity") or 0)
+    if capacity <= 0:
+        return GuardResult(ok=False, reason="INVALID_CAPACITY")
+
+    if ctx.get("direction") is None:
+        return GuardResult(ok=False, reason="DIRECTION_NOT_FOUND")
+
+    executor_city = str(ctx.get("executor_city") or "").strip()
+    from_city = str(ctx.get("from_city") or "").strip()
+    if executor_city and from_city and executor_city != from_city:
+        return GuardResult(
+            ok=False, reason=f"CITY_MISMATCH:{executor_city}->{from_city}"
+        )
+
+    max_slots = int(params.get("max_active_slots") or 3)
+    if int(ctx.get("active_slots") or 0) >= max_slots:
+        return GuardResult(ok=False, reason="LIMIT_EXCEEDED")
+
+    if int(ctx.get("available_count") or 0) <= 0:
+        return GuardResult(ok=False, reason="NO_AVAILABLE_ORDERS")
+
+    return GuardResult(ok=True)
+
+
+def can_create_trip(
+    session_domain, db, context, instance, guard_params=None
+) -> GuardResult:
+    """
+    Sync создание trip в complete_loading:
+    driver + direction + нет open cells + loading reserves + picked + bindable.
+    """
+    _ = db
+    _ = session_domain
+    _ = instance
+    ctx = context or {}
+    params = guard_params or {}
+
+    actor_id = ctx.get("executor_id")
+    if not actor_id:
+        return GuardResult(ok=False, reason="ACTOR_ID_REQUIRED")
+    user = ctx.get("executor")
+    if user is None:
+        return GuardResult(ok=False, reason="USER_NOT_FOUND")
+    expected_role = params.get("user_role") or "driver"
+    if str(user.get("role_name") or "") != str(expected_role):
+        return GuardResult(ok=False, reason=f"ROLE_MISMATCH:{user.get('role_name')}")
+
+    if ctx.get("direction") is None:
+        return GuardResult(ok=False, reason="DIRECTION_NOT_FOUND")
+
+    open_cells = ctx.get("open_cells") or []
+    if open_cells:
+        return GuardResult(ok=False, reason=f"OPEN_CELLS_DETECTED:{open_cells}")
+
+    if not ctx.get("loading_reservation_ids"):
+        return GuardResult(ok=False, reason="NO_LOADING_RESERVATIONS")
+
+    picked = ctx.get("picked_order_ids") or []
+    if not picked:
+        return GuardResult(ok=False, reason="NO_PICKED_ORDERS")
+
+    unbindable = ctx.get("unbindable_order_ids") or []
+    if unbindable:
+        return GuardResult(
+            ok=False, reason=f"TRIP_ORDER_NOT_BINDABLE:{unbindable}"
+        )
+
+    return GuardResult(ok=True)
+
+
+def can_expire_reservation(
+    session_domain, db, context, instance, guard_params
+) -> GuardResult:
+    """
+    Таймаут до start_loading: только reservation_active.
+    Effect тот же, что cancel — заказы в пул направления.
+    """
+    _ = db
+    _ = session_domain
+    _ = instance
+    params = dict(guard_params or {})
+    params.setdefault("user_role", "driver")
+    params.setdefault("required_status", "reservation_active")
+    return _match_reservation_edge(context, params)
+
+
 def can_cancel_reservation(
     session_domain, db, context, instance, guard_params
 ) -> GuardResult:

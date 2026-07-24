@@ -1183,7 +1183,7 @@ def reserve_orders_for_direction(
     if int(available or 0) == 0:
         raise ValueError("NO_AVAILABLE_ORDERS")
 
-    expires_at = datetime.utcnow() + timedelta(minutes=30)
+    expires_at = datetime.utcnow() + timedelta(hours=1)
     session.execute(
         text(
             """
@@ -1378,6 +1378,126 @@ def get_picked_orders_by_driver_and_direction(
         {"direction_id": direction_id, "driver_user_id": driver_user_id},
     ).fetchall()
     return [int(r[0]) for r in rows]
+
+
+def get_picked_orders_by_reservations(
+    session: Session, reservation_ids: list[int]
+) -> list[int]:
+    """Picked-заказы только из указанных резервов (loading-слоты)."""
+    if not reservation_ids:
+        return []
+    placeholders = ", ".join(f":rid_{i}" for i in range(len(reservation_ids)))
+    params: dict[str, Any] = {
+        f"rid_{i}": rid for i, rid in enumerate(reservation_ids)
+    }
+    rows = session.execute(
+        text(
+            f"""
+            SELECT DISTINCT so.order_id
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            WHERE so.reservation_id IN ({placeholders})
+              AND so.leg = 'pickup'
+              AND so.trip_id IS NULL
+              AND o.status = 'order_picked_up_from_post1'
+            ORDER BY so.order_id ASC
+            """
+        ),
+        params,
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def list_open_cells_for_reservations(
+    session: Session, reservation_ids: list[int]
+) -> list[int]:
+    """Открытые ячейки только по заказам указанных резервов."""
+    if not reservation_ids:
+        return []
+    placeholders = ", ".join(f":rid_{i}" for i in range(len(reservation_ids)))
+    params: dict[str, Any] = {
+        f"rid_{i}": rid for i, rid in enumerate(reservation_ids)
+    }
+    rows = session.execute(
+        text(
+            f"""
+            SELECT DISTINCT o.source_cell_id
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            JOIN locker_cells lc ON lc.id = o.source_cell_id
+            WHERE so.reservation_id IN ({placeholders})
+              AND so.leg = 'pickup'
+              AND so.trip_id IS NULL
+              AND lc.status = 'locker_opened'
+            """
+        ),
+        params,
+    ).fetchall()
+    return [int(r[0]) for r in rows if r[0] is not None]
+
+
+def release_unpicked_orders_by_reservations(
+    session: Session,
+    reservation_ids: list[int],
+    picked_order_ids: list[int],
+) -> int:
+    """Снять резерв с незабранных заказов только в указанных слотах."""
+    if not reservation_ids:
+        return 0
+    placeholders = ", ".join(f":rid_{i}" for i in range(len(reservation_ids)))
+    params: dict[str, Any] = {
+        f"rid_{i}": rid for i, rid in enumerate(reservation_ids)
+    }
+    reserved = session.execute(
+        text(
+            f"""
+            SELECT DISTINCT so.order_id
+            FROM stage_orders so
+            WHERE so.reservation_id IN ({placeholders})
+              AND so.leg = 'pickup'
+              AND so.trip_id IS NULL
+            """
+        ),
+        params,
+    ).fetchall()
+    reserved_ids = [int(r[0]) for r in reserved]
+    picked = set(int(x) for x in picked_order_ids)
+    to_release = [oid for oid in reserved_ids if oid not in picked]
+    if not to_release:
+        return 0
+
+    oid_ph = ", ".join(f":oid_{i}" for i in range(len(to_release)))
+    release_params: dict[str, Any] = {
+        f"oid_{i}": oid for i, oid in enumerate(to_release)
+    }
+    result = session.execute(
+        text(
+            f"""
+            UPDATE stage_orders
+            SET reserved_by_driver_id = NULL,
+                reservation_id = NULL
+            WHERE order_id IN ({oid_ph})
+              AND leg IN ('pickup', 'delivery')
+            """
+        ),
+        release_params,
+    )
+    # counters: directions of released pickup rows
+    dir_rows = session.execute(
+        text(
+            f"""
+            SELECT DISTINCT direction_id
+            FROM stage_orders
+            WHERE order_id IN ({oid_ph})
+              AND leg = 'pickup'
+              AND direction_id IS NOT NULL
+            """
+        ),
+        release_params,
+    ).fetchall()
+    for row in dir_rows:
+        recalculate_direction_counters(session, int(row[0]))
+    return int(result.rowcount or 0)
 
 
 def release_unpicked_orders_by_driver_and_direction(
@@ -1647,6 +1767,75 @@ def list_trip_order_ids(session: Session, trip_id: int) -> list[int]:
             """
         ),
         {"trip_id": trip_id},
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def count_available_orders_on_direction(session: Session, direction_id: int) -> int:
+    """Свободные заказы на направлении (для reserve guard)."""
+    n = session.execute(
+        text(
+            """
+            SELECT COUNT(DISTINCT so.order_id)
+            FROM stage_orders so
+            JOIN orders o ON o.id = so.order_id
+            WHERE so.direction_id = :direction_id
+              AND so.leg = 'pickup'
+              AND so.reserved_by_driver_id IS NULL
+              AND so.trip_id IS NULL
+              AND o.status IN ('order_parcel_confirmed', 'order_parcel_submitted')
+            """
+        ),
+        {"direction_id": direction_id},
+    ).scalar()
+    return int(n or 0)
+
+
+def count_active_driver_slots_on_direction(
+    session: Session, direction_id: int, driver_user_id: int
+) -> int:
+    """Число active|loading резервов водителя на направлении."""
+    n = session.execute(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM driver_reservations
+            WHERE driver_user_id = :driver_user_id
+              AND direction_id = :direction_id
+              AND status IN ('reservation_active', 'reservation_loading')
+            """
+        ),
+        {"driver_user_id": driver_user_id, "direction_id": direction_id},
+    ).scalar()
+    return int(n or 0)
+
+
+def list_orders_missing_trip_legs(
+    session: Session, order_ids: list[int]
+) -> list[int]:
+    """
+    Заказы без обеих ног pickup+delivery в stage_orders —
+    такие нельзя надёжно привязать к trip.
+    """
+    if not order_ids:
+        return []
+    placeholders = ", ".join(f":oid_{i}" for i in range(len(order_ids)))
+    params: dict[str, Any] = {f"oid_{i}": oid for i, oid in enumerate(order_ids)}
+    rows = session.execute(
+        text(
+            f"""
+            SELECT o.id
+            FROM orders o
+            LEFT JOIN stage_orders sp
+              ON sp.order_id = o.id AND sp.leg = 'pickup'
+            LEFT JOIN stage_orders sd
+              ON sd.order_id = o.id AND sd.leg = 'delivery'
+            WHERE o.id IN ({placeholders})
+              AND (sp.order_id IS NULL OR sd.order_id IS NULL)
+            ORDER BY o.id ASC
+            """
+        ),
+        params,
     ).fetchall()
     return [int(r[0]) for r in rows]
 

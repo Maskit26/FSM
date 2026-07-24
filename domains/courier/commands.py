@@ -498,23 +498,19 @@ def reserve_direction_slot(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Водитель резервирует до capacity заказов из направления
-    (old direction_reserve_slot / reserve_orders_for_direction).
-    Sync: создаёт driver_reservations, без enqueue FSM.
+    Водитель резервирует до capacity заказов из направления.
+    context → can_reserve_direction_slot → INSERT + bootstrap.
     params: direction_id, capacity.
     """
+    from domains.courier.context import build_invoke_direction_context
+    from domains.courier.guards import can_reserve_direction_slot
+
     try:
         driver_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("actor.actor_id required") from exc
     if not driver_id:
         raise ValueError("actor.actor_id required")
-
-    user = db_layer.get_user(domain_session, driver_id)
-    if user is None:
-        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
-    if str(user.get("role_name") or "") != "driver":
-        raise DomainError("ROLE_NOT_ALLOWED", "only driver can reserve direction slot")
 
     direction_id = int(params.get("direction_id") or params.get("entity_id") or 0)
     if not direction_id:
@@ -523,20 +519,18 @@ def reserve_direction_slot(
         capacity = int(params.get("capacity") or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("capacity required") from exc
-    if capacity <= 0:
-        raise DomainError("INVALID_CAPACITY", "capacity must be > 0")
 
-    direction = db_layer.get_direction(domain_session, direction_id)
-    if direction is None:
-        raise DomainError("DIRECTION_NOT_FOUND", f"direction {direction_id} not found")
-
-    driver_city = str(user.get("city") or "").strip()
-    from_city = str(direction.get("from_city") or "").strip()
-    if driver_city and from_city and driver_city != from_city:
-        raise DomainError(
-            "CITY_MISMATCH",
-            f"{driver_city}->{from_city}",
-        )
+    ctx, _instance = build_invoke_direction_context(
+        domain_session,
+        direction_id=direction_id,
+        actor_id=driver_id,
+        capacity=capacity,
+    )
+    gate = can_reserve_direction_slot(
+        domain_session, None, ctx, _instance, {"user_role": "driver"}
+    )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
 
     try:
         reservation_id, reserved_count, expires_at, order_ids = (
@@ -548,10 +542,26 @@ def reserve_direction_slot(
         code = str(exc)
         raise DomainError(code, code) from exc
 
+    expire_key = f"expire_reservation:{reservation_id}"
     return {
         "entity_type": "driver_reservations",
         "entity_id": reservation_id,
         "initial_state": "reservation_active",
+        "timers": [
+            {
+                "entity_type": "driver_reservations",
+                "entity_id": reservation_id,
+                "process_name": "expire_reservation",
+                "fire_at": expires_at,
+                "idempotency_key": expire_key,
+                "payload": {
+                    "direction_id": direction_id,
+                    "executor_user_id": driver_id,
+                    "driver_user_id": driver_id,
+                    "source": "expire_timer",
+                },
+            }
+        ],
         "data": {
             "reservation_id": reservation_id,
             "direction_id": direction_id,
@@ -569,9 +579,12 @@ def start_loading(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Водитель начинает погрузку: enqueue FSM start_loading на driver_reservations.
+    Водитель начинает погрузку: context → can_start_loading → enqueue FSM.
     params: reservation_id.
     """
+    from domains.courier.context import build_invoke_reservation_context
+    from domains.courier.guards import can_start_loading
+
     try:
         driver_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
@@ -579,37 +592,39 @@ def start_loading(
     if not driver_id:
         raise ValueError("actor.actor_id required")
 
-    user = db_layer.get_user(domain_session, driver_id)
-    if user is None:
-        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
-    if str(user.get("role_name") or "") != "driver":
-        raise DomainError("ROLE_NOT_ALLOWED", "only driver can start loading")
-
     reservation_id = int(
         params.get("reservation_id") or params.get("entity_id") or 0
     )
     if not reservation_id:
         raise ValueError("reservation_id required")
 
-    reservation = db_layer.get_driver_reservation(domain_session, reservation_id)
-    if reservation is None:
-        raise DomainError("RESERVATION_NOT_FOUND", f"reservation {reservation_id}")
-    if int(reservation["driver_user_id"]) != driver_id:
-        raise DomainError("NOT_RESERVATION_OWNER", "reservation belongs to another driver")
-    if str(reservation.get("status") or "") != "reservation_active":
-        raise DomainError(
-            "INVALID_RESERVATION_STATUS",
-            f"status={reservation.get('status')}",
-        )
+    ctx, _instance = build_invoke_reservation_context(
+        domain_session,
+        reservation_id=reservation_id,
+        actor_id=driver_id,
+    )
+    gate = can_start_loading(
+        domain_session,
+        None,
+        ctx,
+        _instance,
+        {"user_role": "driver", "required_status": "reservation_active"},
+    )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
 
+    direction_id = int(ctx.get("direction_id") or 0)
     return {
         "entity_type": "driver_reservations",
         "entity_id": reservation_id,
         "initial_state": "reservation_active",
+        "cancel_timers": [
+            {"idempotency_key": f"expire_reservation:{reservation_id}"}
+        ],
         "enqueue": {
             "process_name": "start_loading",
             "payload": {
-                "direction_id": int(reservation["direction_id"]),
+                "direction_id": direction_id,
                 "executor_user_id": driver_id,
                 "driver_user_id": driver_id,
                 "source": "start_loading",
@@ -617,7 +632,7 @@ def start_loading(
         },
         "data": {
             "reservation_id": reservation_id,
-            "direction_id": int(reservation["direction_id"]),
+            "direction_id": direction_id,
             "driver_user_id": driver_id,
             "status": "pending_fsm",
         },
@@ -628,12 +643,12 @@ def cancel_reservation(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Водитель отменяет резерв: заказы возвращаются на направление,
-    FSM driver_reservations → reservation_cancelled.
+    Водитель отменяет резерв: context → can_cancel_reservation → enqueue FSM.
     params: reservation_id.
-    Можно из reservation_active или reservation_loading, пока все заказы
-    ещё order_parcel_confirmed.
     """
+    from domains.courier.context import build_invoke_reservation_context
+    from domains.courier.guards import can_cancel_reservation
+
     try:
         driver_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
@@ -641,42 +656,47 @@ def cancel_reservation(
     if not driver_id:
         raise ValueError("actor.actor_id required")
 
-    user = db_layer.get_user(domain_session, driver_id)
-    if user is None:
-        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
-    if str(user.get("role_name") or "") != "driver":
-        raise DomainError("ROLE_NOT_ALLOWED", "only driver can cancel reservation")
-
     reservation_id = int(
         params.get("reservation_id") or params.get("entity_id") or 0
     )
     if not reservation_id:
         raise ValueError("reservation_id required")
 
-    reservation = db_layer.get_driver_reservation(domain_session, reservation_id)
-    if reservation is None:
-        raise DomainError("RESERVATION_NOT_FOUND", f"reservation {reservation_id}")
-    if int(reservation["driver_user_id"]) != driver_id:
-        raise DomainError("NOT_RESERVATION_OWNER", "reservation belongs to another driver")
-
-    status = str(reservation.get("status") or "")
-    if status not in ("reservation_active", "reservation_loading"):
-        raise DomainError("INVALID_RESERVATION_STATUS", f"status={status}")
-
-    ok, blocked, err = db_layer.validate_reservation_for_cancellation(
-        domain_session, reservation_id
+    ctx, _instance = build_invoke_reservation_context(
+        domain_session,
+        reservation_id=reservation_id,
+        actor_id=driver_id,
     )
-    if not ok:
-        raise DomainError(err or "CANCEL_NOT_ALLOWED", err or "cancel blocked")
+    reservation = ctx.get("reservation") or {}
+    status = str(reservation.get("status") or "")
+    # Edge pick: active|loading — same as FSM graph.
+    required = (
+        status
+        if status in ("reservation_active", "reservation_loading")
+        else "reservation_active"
+    )
+    gate = can_cancel_reservation(
+        domain_session,
+        None,
+        ctx,
+        _instance,
+        {"user_role": "driver", "required_status": required},
+    )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
 
+    direction_id = int(ctx.get("direction_id") or 0)
     return {
         "entity_type": "driver_reservations",
         "entity_id": reservation_id,
         "initial_state": status,
+        "cancel_timers": [
+            {"idempotency_key": f"expire_reservation:{reservation_id}"}
+        ],
         "enqueue": {
             "process_name": "cancel_reservation",
             "payload": {
-                "direction_id": int(reservation["direction_id"]),
+                "direction_id": direction_id,
                 "executor_user_id": driver_id,
                 "driver_user_id": driver_id,
                 "source": "cancel_reservation",
@@ -684,9 +704,8 @@ def cancel_reservation(
         },
         "data": {
             "reservation_id": reservation_id,
-            "direction_id": int(reservation["direction_id"]),
+            "direction_id": direction_id,
             "driver_user_id": driver_id,
-            "blocked_order_ids": blocked,
             "status": "pending_fsm",
         },
     }
@@ -696,10 +715,14 @@ def complete_loading(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Завершить погрузку по направлению: проверки + release unpicked sync,
-    затем enqueues[] complete_loading на каждый резерв (FSM + логи).
+    Завершить погрузку по направлению:
+    context → can_create_trip → release unpicked + INSERT trip + bootstrap,
+    затем enqueues[] complete_loading на каждый резерв (FSM).
     params: direction_id.
     """
+    from domains.courier.context import build_invoke_create_trip_context
+    from domains.courier.guards import can_create_trip
+
     try:
         driver_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
@@ -707,56 +730,26 @@ def complete_loading(
     if not driver_id:
         raise ValueError("actor.actor_id required")
 
-    user = db_layer.get_user(domain_session, driver_id)
-    if user is None:
-        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
-    if str(user.get("role_name") or "") != "driver":
-        raise DomainError("ROLE_NOT_ALLOWED", "only driver can complete loading")
-
     direction_id = int(params.get("direction_id") or params.get("entity_id") or 0)
     if not direction_id:
         raise ValueError("direction_id required")
 
-    direction = db_layer.get_direction(domain_session, direction_id)
-    if direction is None:
-        raise DomainError("DIRECTION_NOT_FOUND", f"direction {direction_id}")
-
-    open_cells = db_layer.list_open_cells_for_driver_direction(
-        domain_session, direction_id, driver_id
+    ctx, _instance = build_invoke_create_trip_context(
+        domain_session,
+        direction_id=direction_id,
+        actor_id=driver_id,
     )
-    if open_cells:
-        raise DomainError(
-            "OPEN_CELLS_DETECTED",
-            f"cells still open: {open_cells}",
-        )
-
-    reservation_ids = db_layer.get_driver_loading_reservations(
-        domain_session, direction_id, driver_id
+    gate = can_create_trip(
+        domain_session, None, ctx, _instance, {"user_role": "driver"}
     )
-    # complete FSM edge is from reservation_loading only
-    loading_ids = [
-        rid
-        for rid in reservation_ids
-        if str(
-            (db_layer.get_driver_reservation(domain_session, rid) or {}).get("status")
-            or ""
-        )
-        == "reservation_loading"
-    ]
-    if not loading_ids:
-        raise DomainError(
-            "NO_LOADING_RESERVATIONS",
-            "no reservations in reservation_loading",
-        )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
 
-    picked = db_layer.get_picked_orders_by_driver_and_direction(
-        domain_session, direction_id, driver_id
-    )
-    if not picked:
-        raise DomainError("NO_PICKED_ORDERS", "no orders picked up from post1")
+    loading_ids = list(ctx["loading_reservation_ids"])
+    picked = list(ctx["picked_order_ids"])
 
-    released = db_layer.release_unpicked_orders_by_driver_and_direction(
-        domain_session, direction_id, driver_id, picked
+    released = db_layer.release_unpicked_orders_by_reservations(
+        domain_session, loading_ids, picked
     )
 
     try:
@@ -793,6 +786,10 @@ def complete_loading(
             }
             for rid in loading_ids
         ],
+        "cancel_timers": [
+            {"idempotency_key": f"expire_reservation:{rid}"}
+            for rid in loading_ids
+        ],
         "data": {
             "direction_id": direction_id,
             "driver_user_id": driver_id,
@@ -810,9 +807,13 @@ def start_trip(
     domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Старт рейса: FSM trip_assigned → trip_in_progress + заказы в transit.
+    Старт рейса: context → can_start_trip → enqueue FSM
+    (trip_assigned → trip_in_progress + заказы в transit).
     params: trip_id.
     """
+    from domains.courier.context import build_invoke_trip_context
+    from domains.courier.guards import can_start_trip
+
     try:
         driver_id = int((actor or {}).get("actor_id") or 0)
     except (TypeError, ValueError) as exc:
@@ -820,32 +821,26 @@ def start_trip(
     if not driver_id:
         raise ValueError("actor.actor_id required")
 
-    user = db_layer.get_user(domain_session, driver_id)
-    if user is None:
-        raise DomainError("USER_NOT_FOUND", f"user {driver_id} not found")
-    if str(user.get("role_name") or "") != "driver":
-        raise DomainError("ROLE_NOT_ALLOWED", "only driver can start trip")
-
     trip_id = int(params.get("trip_id") or params.get("entity_id") or 0)
     if not trip_id:
         raise ValueError("trip_id required")
 
-    trip = db_layer.get_trip(domain_session, trip_id)
-    if trip is None:
-        raise DomainError("TRIP_NOT_FOUND", f"trip {trip_id}")
-    if int(trip.get("driver_user_id") or 0) != driver_id:
-        raise DomainError("NOT_TRIP_OWNER", "trip belongs to another driver")
-    if int(trip.get("active") or 0) != 1:
-        raise DomainError("TRIP_INACTIVE", f"trip {trip_id} inactive")
-    if str(trip.get("status") or "") != "trip_assigned":
-        raise DomainError(
-            "INVALID_TRIP_STATUS",
-            f"status={trip.get('status')}",
-        )
+    ctx, _instance = build_invoke_trip_context(
+        domain_session,
+        trip_id=trip_id,
+        actor_id=driver_id,
+    )
+    gate = can_start_trip(
+        domain_session,
+        None,
+        ctx,
+        _instance,
+        {"user_role": "driver", "required_status": "trip_assigned"},
+    )
+    if not gate.ok:
+        raise DomainError(gate.reason or "NOT_ALLOWED", gate.reason or "denied")
 
-    order_ids = db_layer.list_trip_order_ids(domain_session, trip_id)
-    if not order_ids:
-        raise DomainError("NO_ORDERS_ON_TRIP", f"trip {trip_id} has no orders")
+    order_ids = list(ctx.get("order_ids") or [])
 
     jobs: list[dict[str, Any]] = [
         {

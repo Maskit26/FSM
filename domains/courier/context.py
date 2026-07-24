@@ -228,3 +228,152 @@ def build_trip_context(session_domain, db, runtime_ctx, instance) -> dict[str, A
         "executor": executor,
         "runtime_ctx": runtime_ctx,
     }
+
+
+def build_invoke_trip_context(
+    session_domain,
+    *,
+    trip_id: int,
+    actor_id: int,
+    payload: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Context для sync invoke trip-команд (тот же builder, что у FSM)."""
+    merged: dict[str, Any] = dict(payload or {})
+    merged.setdefault("executor_user_id", actor_id)
+    merged.setdefault("driver_user_id", actor_id)
+    instance: dict[str, Any] = {
+        "entity_id": trip_id,
+        "actor_id": actor_id,
+        "payload_json": merged,
+    }
+    ctx = build_trip_context(session_domain, None, {}, instance)
+    return ctx, instance
+
+
+def build_invoke_direction_context(
+    session_domain,
+    *,
+    direction_id: int,
+    actor_id: int,
+    capacity: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Context для sync reserve_direction_slot."""
+    executor = db_layer.get_user(session_domain, actor_id)
+    direction = db_layer.get_direction(session_domain, direction_id)
+    available_count = 0
+    active_slots = 0
+    if direction is not None:
+        available_count = db_layer.count_available_orders_on_direction(
+            session_domain, direction_id
+        )
+        active_slots = db_layer.count_active_driver_slots_on_direction(
+            session_domain, direction_id, actor_id
+        )
+
+    instance: dict[str, Any] = {
+        "entity_id": direction_id,
+        "actor_id": actor_id,
+        "payload_json": {
+            "executor_user_id": actor_id,
+            "driver_user_id": actor_id,
+            "capacity": capacity,
+            "direction_id": direction_id,
+        },
+    }
+    ctx: dict[str, Any] = {
+        "direction": direction,
+        "direction_id": direction_id,
+        "capacity": capacity,
+        "available_count": available_count,
+        "active_slots": active_slots,
+        "executor_id": actor_id,
+        "executor": executor,
+        "executor_city": str((executor or {}).get("city") or "").strip() or None,
+        "from_city": (
+            str((direction or {}).get("from_city") or "").strip() or None
+        ),
+        "payload": instance["payload_json"],
+    }
+    return ctx, instance
+
+
+def build_invoke_create_trip_context(
+    session_domain,
+    *,
+    direction_id: int,
+    actor_id: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Context для sync части complete_loading: создание trip.
+    Факты: open cells, loading reservations, picked orders, bindable legs.
+    """
+    executor = db_layer.get_user(session_domain, actor_id)
+    direction = db_layer.get_direction(session_domain, direction_id)
+    open_cells: list[int] = []
+    reservation_ids: list[int] = []
+    loading_ids: list[int] = []
+    picked_order_ids: list[int] = []
+    unbindable_order_ids: list[int] = []
+
+    if direction is not None:
+        reservation_ids = db_layer.get_driver_loading_reservations(
+            session_domain, direction_id, actor_id
+        )
+        for rid in reservation_ids:
+            row = db_layer.get_driver_reservation(session_domain, rid) or {}
+            if str(row.get("status") or "") == "reservation_loading":
+                loading_ids.append(rid)
+        if loading_ids:
+            open_cells = db_layer.list_open_cells_for_reservations(
+                session_domain, loading_ids
+            )
+            picked_order_ids = db_layer.get_picked_orders_by_reservations(
+                session_domain, loading_ids
+            )
+            if picked_order_ids:
+                unbindable_order_ids = db_layer.list_orders_missing_trip_legs(
+                    session_domain, picked_order_ids
+                )
+
+    instance: dict[str, Any] = {
+        "entity_id": direction_id,
+        "actor_id": actor_id,
+        "payload_json": {
+            "executor_user_id": actor_id,
+            "driver_user_id": actor_id,
+            "direction_id": direction_id,
+        },
+    }
+    ctx: dict[str, Any] = {
+        "direction": direction,
+        "direction_id": direction_id,
+        "open_cells": open_cells,
+        "reservation_ids": reservation_ids,
+        "loading_reservation_ids": loading_ids,
+        "picked_order_ids": picked_order_ids,
+        "unbindable_order_ids": unbindable_order_ids,
+        "executor_id": actor_id,
+        "executor": executor,
+        "payload": instance["payload_json"],
+    }
+    return ctx, instance
+
+
+def build_invoke_reservation_context(
+    session_domain,
+    *,
+    reservation_id: int,
+    actor_id: int,
+    payload: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Context для sync invoke reservation-команд."""
+    merged: dict[str, Any] = dict(payload or {})
+    merged.setdefault("executor_user_id", actor_id)
+    merged.setdefault("driver_user_id", actor_id)
+    instance: dict[str, Any] = {
+        "entity_id": reservation_id,
+        "actor_id": actor_id,
+        "payload_json": merged,
+    }
+    ctx = build_reservation_context(session_domain, None, {}, instance)
+    return ctx, instance
