@@ -9,11 +9,13 @@ from pydantic import BaseModel, Field
 
 from fsm_platform.host.boot import boot
 from fsm_platform.host.http import request_runtime
+from fsm_platform.host.http.exchange_ws import router as exchange_ws_router
 from fsm_platform.host.operations import default_operation_registry
 from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.core.registry import default_process_registry
 
 app = FastAPI(title="FSM Platform", version="0.1.0")
+app.include_router(exchange_ws_router)
 
 
 class Actor(BaseModel):

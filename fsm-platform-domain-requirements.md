@@ -2400,10 +2400,11 @@ HTTP: `400` контракт/валидация, `401`/`403` auth, `404` неи�
 Каталог (вне домена):
 
 ```text
-channels/
+input/          # входящие каналы (webhook, deep-link)
   telegram/
-  whatsapp/
-  web/          # опционально тонкий BFF
+output/         # исходящие senders (Bot API из outbox)
+  telegram/
+# логически это channel adapters; путь channels/ в старых схемах = input/ + output/
 ```
 
 **Обязанности adapter:**
@@ -2417,7 +2418,7 @@ channels/
 
 **Запрещено в adapter:** SQL домена, вызов guards/effects, прямой import модулей домена (только HTTP к Platform API или общий application client).
 
-Пример Telegram:
+Пример Telegram (команда в чате → Public API):
 
 ```text
 message "/orders"
@@ -2425,6 +2426,24 @@ message "/orders"
   → POST /v1/{service_id}/invoke { operation: list_client_orders, actor: … }
   → reply text с списком
 ```
+
+#### Привязка Telegram chat_id (deep-link) — реализовано
+
+Bot API шлёт сообщения только в `chat_id` после того, как пользователь хотя бы раз открыл бота. В домене courier поле `users.telegram_chat_id` заполняется **signed deep-link**, не «голым» `/start`.
+
+| Шаг | Что |
+|-----|-----|
+| 1 | Фронт/ЛК: `GET /input/telegram/link?user_id=<id>` → `{ url, payload }` |
+| 2 | Пользователь открывает `https://t.me/<bot>?start=u{user_id}_{sig12}` |
+| 3 | Telegram шлёт Update на `POST /input/telegram/webhook` |
+| 4 | Adapter проверяет HMAC (`TELEGRAM_LINK_SECRET` или fallback `TELEGRAM_BOT_TOKEN`) |
+| 5 | `UPDATE users SET telegram_chat_id = …` (domain DB) |
+| 6 | Дальше progress-notify: effect/command → `platform.notify(channel=telegram, destination=chat_id)` → `platform_outbox` → outbox в `fsm_worker` → `output/telegram/sender.py` |
+
+Код: `input/telegram/webhook.py` (вход), `output/telegram/sender.py` (выход), `domains/courier/notifications.py` (шаблоны → notify).  
+Каталог: `input/` = входящий канал, `output/` = исходящий; `channels/` в тексте выше — логическая роль adapter/sender, физические пути — `input/` + `output/`.
+
+Env: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `TELEGRAM_LINK_SECRET`, `TELEGRAM_DRY_RUN` (`0` = реальная отправка).
 
 ### 9.11. Как подключаются типы клиентов
 
@@ -2755,9 +2774,64 @@ External-интеграции (Core/ERP) — тот же `platform_outbox` с `c
 
 Браузер external outbox не читает: ему poll / SSE / webhook.
 
-### 10.10. WebSocket (опционально, v2)
+### 10.10. WebSocket (пример: биржи курьера и водителя)
 
-Двусторонний канал для UI. Имеет смысл, если нужны клиент→server команды поверх того же сокета. Для только server→client достаточно SSE. Если внедряется: те же `platform_events`, fan-out в socket hub после commit; auth при connect на `service_id`.
+Двусторонний канал для UI. Имеет смысл, если нужны клиент→server команды поверх того же сокета. Для только server→client достаточно SSE.
+
+**Важно:** WebSocket **не заменяет** domain `queries.py`. Это транспорт. Список биржи по-прежнему строится теми же query (`list_courier_exchange` / `list_driver_exchange`), что и HTTP `POST .../invoke`.
+
+#### Реализованный пример (v1)
+
+Endpoint:
+
+```http
+WS /v1/{service_id}/ws/exchange?kind=courier|driver&actor_id=<id>&city=<город>&interval=<сек>
+```
+
+| Param | Смысл |
+|-------|--------|
+| `kind` | `courier` → `list_courier_exchange`; `driver` → `list_driver_exchange` |
+| `actor_id` | `users.id` (как в HTTP actor) |
+| `city` | обязателен для `kind=driver` (город биржи) |
+| `interval` | период серверного refresh, default `EXCHANGE_WS_POLL_SECONDS` (3) |
+
+Поведение:
+
+1. Connect → сразу `snapshot` (полный ответ query).
+2. Каждые `interval` сек сервер снова вызывает query; если fingerprint данных изменился — новый `snapshot` (без изменений — тишина).
+3. Клиент может прислать `{"op":"refresh"}` / `{"op":"ping"}` / `{"op":"close"}`.
+
+Сообщения server→client:
+
+```json
+{"type":"snapshot","operation":"list_courier_exchange","data":{...},"fp":"..."}
+{"type":"error","detail":"..."}
+{"type":"pong"}
+```
+
+Код: `fsm_platform/host/http/exchange_ws.py` (router подключён в `app.py`).
+
+```text
+SPA / мобильный клиент
+  │  WS connect
+  ▼
+Platform exchange_ws
+  │  run_operation → list_*_exchange (queries.py → db_layer)
+  ▼
+snapshot JSON по сокету
+```
+
+Это **серверный poll поверх query**, упакованный в WebSocket — учебный/рабочий минимум для UI биржи. Следующий шаг (не обязателен для примера): писать `platform.emit_event` при смене биржи и fan-out в socket hub после commit (без периодического SELECT).
+
+Auth v1: query-параметры как у e2e (`actor_id`). Позже — тот же Bearer/API key, что у Public API.
+
+#### Когда брать WS vs HTTP poll
+
+| | HTTP `invoke` list_* | WS `/ws/exchange` |
+|--|----------------------|-------------------|
+| Первый заход / e2e | да | можно |
+| Экран биржи открыт долго | poll каждые N сек | один сокет + snapshot on change |
+| Источник правды | `queries.py` | те же `queries.py` |
 
 ### 10.11. Что выбрать клиенту
 
@@ -2779,8 +2853,10 @@ External-интеграции (Core/ERP) — тот же `platform_outbox` с `c
 | `platform/reconcile/worker.py` | докат platform из `platform_reconcile_queue` (§4.7.1) |
 | `platform/events.py` | реализация `platform.emit_event` → `platform_events` |
 | `fsm_platform/host/http/sse.py` | endpoint stream |
+| `fsm_platform/host/http/exchange_ws.py` | пример WS биржи (courier/driver) |
 | `platform/webhooks/registry.py` | subscriptions |
-| `channels/*/sender.py` | отправка в мессенджер из outbox |
+| `output/*/sender.py` | отправка в мессенджер из outbox |
+| `input/*/webhook.py` | входящий adapter канала |
 
 Worker FSM после `run_instance`: при COMPLETED — fan-out в рабочей tx (§10.6); при FAILED — только short tx после rollback (§4.7). Domain effect мог вызвать `notify` ранее в той же рабочей tx (COMPLETED path).
 
@@ -2810,6 +2886,7 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 - [ ] Webhook subscriptions → outbox channel=webhook.
 - [ ] SSE endpoint для `service_id` + фильтр instance/entity.
 - [ ] Channel sender(s) читают outbox, не вызываются из fsm_core.
+- [ ] (пример) WS биржи: `/v1/{service_id}/ws/exchange` → те же list_*_exchange query.
 - [ ] (опц.) external outbox для Core/ERP.
 - [ ] Smoke: enqueue → SSE или poll COMPLETED; enqueue → webhook 2xx.
 
