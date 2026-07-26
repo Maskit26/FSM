@@ -15,10 +15,11 @@
 | §7 | Accept и Domain Validator: критерии, коды ошибок, отчёт |
 | §8 | модули `fsm_core`: файлы, алгоритмы, таблицы |
 | §9 | публичный API клиентов, channel adapters |
-| §10 | исходящие ответы клиенту: poll, SSE, outbox, webhooks |
+| §10 | исходящие ответы клиенту: poll, SSE/WS, outbox, webhooks |
 | §11–12 | запрещённые решения, примеры доменов |
 | §13–14 | критерии готовности |
 | §15 | глоссарий |
+| §16 | **статус реализации** блоков 0–3 и сопутствующих правок (что сделано в коде) |
 
 ---
 
@@ -201,28 +202,30 @@ Worker открывает `session_platform` + `session_domain`, владеет 
 
 | Таблица | Назначение |
 |---------|------------|
-| `server_fsm_instances` | очередь: `service_id`, process_name, entity_type, entity_id, status, attempts, last_error |
+| `server_fsm_instances` | очередь: process, entity, status, attempts, `next_attempt_at`, `actor_id`, `graph_version` (pin) |
 | `fsm_transition_logs` | аудит FSM-переходов (единственная log-таблица; не `fsm_action_logs`) |
-| `fsm_timers` | отложенные события |
+| `fsm_timers` | one-shot отложенные события; `owner` = `domain`\|`platform` |
+| `fsm_schedules` | периодические процессы (cron-like), не привязаны к бизнес-сущности |
 | `fsm_sagas` / `fsm_saga_children` | async saga: parent + children + fan-in |
 | `entity_fsm_state` | `(service_id, entity_type, entity_id) → current_state` |
 | `domain_services` | Domain Registry + `db_secret_ref` (§6.4); boot → `engine_by_service_id` в RAM |
 | `idempotency_keys` | Idempotency-Key → результат enqueue/invoke (§4.14) |
 | `platform_outbox` | webhooks, channel push, external HTTP (§10) |
-| `platform_events` | события для SSE/подписок (§10) |
+| `platform_events` | события для WS/poll/подписок (§10) |
 | `webhook_subscriptions` | URL клиентов (§4.14, §10) |
 | `platform_reconcile_queue` | докат platform после «domain committed / platform failed» (§4.7.1) |
 
-FSM-граф домена — в **domain DB**.
+FSM-граф домена — в **domain DB** (`fsm_states` / `fsm_transitions` / `fsm_events` или legacy `fsm_actions`), плюс `fsm_graph_meta.current_version` и колонка `fsm_transitions.graph_version` (§16 / §8.10).
 
 ### 4.6. Применение перехода (TransitionExecutor)
 
 Единственный runtime-путь применения перехода — **`TransitionExecutor`** через `fsm_platform/core/db_layer.py`:
 
-- проверка `current_state == from_state`;
-- запись `entity_fsm_state` + INSERT `fsm_transition_logs`;
+- перед выбором перехода runner берёт строку `entity_fsm_state` с `SELECT … FOR UPDATE` (сериализация по сущности);
+- смена state — **CAS**: `UPDATE … SET current_state=:to WHERE current_state=:from`; `rowcount=0` → `STATE_MISMATCH` (не слепой upsert);
+- INSERT `fsm_transition_logs` (UNIQUE `(instance_id, transition_id)`);
 - без UPDATE business-таблиц domain DB;
-- отдельная stored procedure «SQL Core» как параллельный путь **не используется** (ХП допустима лишь как внутренняя реализация db_layer над platform tables).
+- отдельная stored procedure «SQL Core» как параллельный путь **не используется**.
 
 ### 4.7. Worker и транзакции (две БД)
 
@@ -246,19 +249,25 @@ ROLLBACK domain; ROLLBACK platform
 → затем отдельная короткая tx (§ ниже) для FAILED
 ```
 
-**FAILED notify** (чтобы не откатилось вместе с рабочей tx):
+**Ошибка после rollback — retry или FAILED** (`fsm_platform/host/retry_policy.py`):
 
 ```text
 ROLLBACK рабочей tx
-BEGIN  -- только platform session
-  UPDATE server_fsm_instances → FAILED + last_error
-  platform.emit_event(fsm.instance.failed, …)
-  Platform fan-out hook (FAILED) → platform.notify для подписчиков
-COMMIT
+если ошибка transient и attempts < FSM_INSTANCE_MAX_ATTEMPTS:
+  UPDATE instance → PENDING + next_attempt_at (backoff)   -- без fan-out
+иначе:
+  BEGIN  -- короткая platform tx
+    UPDATE instance → FAILED + last_error
+    emit_event(fsm.instance.failed) + webhook fan-out
+    saga on_child_terminal при необходимости
+  COMMIT
+  ProcessDef.on_failed(…)  -- опц. domain recovery (отдельные сессии)
 ```
 
 Fan-out / notify при FAILED **не** выполняются в откатываемой рабочей tx.  
 Внешний HTTP — только `outbox_worker` после commit outbox.
+
+**Цикл worker** (`fsm_platform/host/worker.py`): due timers → due schedules → claim FSM instance → outbox → reconcile.
 
 2PC / XA **не используются**. Порядок COMMIT domain → COMMIT platform сохраняется; разрыв закрывается §4.7.1.
 
@@ -488,12 +497,28 @@ HTTP наружу — `outbox_worker` после commit (§10).
 | `service_id` | экземпляр домена |
 | `process_name` | ключ ProcessDef |
 | `entity_type`, `entity_id` | opaque указатель |
-| `status` | `PENDING` \| `PROCESSING` \| `COMPLETED` \| `FAILED` |
+| `status` | `PENDING` \| `PROCESSING` \| `COMPLETED` \| `FAILED` \| `CANCELLED` |
 | `attempts` | int |
+| `next_attempt_at` | backoff для retry (claim только due) |
 | `last_error` | код/текст |
 | `payload_json` | опц. |
-| `requested_by_user_id` | опц. audit |
+| `actor_id` | opaque id из Public API actor |
+| `graph_version` | pin версии графа domain на момент enqueue; NULL = fallback current |
 | `created_at`, `updated_at`, `started_at`, `finished_at` | |
+
+#### `fsm_schedules`
+
+| Поле | Смысл |
+|------|--------|
+| `id` | PK |
+| `service_id` | |
+| `process_name` | какой FSM enqueue при fire |
+| `entity_type`, `entity_id` | якорь (часто `schedule` / id строки) |
+| `interval_seconds` | период |
+| `payload_json` | |
+| `next_run_at` | следующий due |
+| `status` | `ACTIVE` \| `PAUSED` |
+| `last_error`, `created_at`, `updated_at` | |
 
 #### `fsm_transition_logs`
 
@@ -1418,8 +1443,8 @@ fsm_worker
 | `payload` | `dict \| None` | диагностика: transition_id, from/to, effect payload |
 
 Worker по `new_state` (§4.7):
-- `COMPLETED` → fan-out (`emit_event` + notify) → UPDATE COMPLETED → COMMIT domain → COMMIT platform;
-- `FAILED` → ROLLBACK обеих; затем short tx: UPDATE FAILED + `emit_event` + fan-out `notify`.
+- `COMPLETED` → fan-out (`emit_event` + webhook notify) → UPDATE COMPLETED → COMMIT domain → COMMIT platform;
+- `FAILED` → ROLLBACK обеих; затем retry (PENDING + backoff) **или** short tx: FAILED + `emit_event` + webhooks + опц. `ProcessDef.on_failed`.
 
 #### 8.2.2. `GuardResult` / `EffectResult`
 
@@ -1442,6 +1467,7 @@ Worker по `new_state` (§4.7):
 | `event_name` | да (цель) | событие графа; если пусто — fallback `process_name` (`runtime_event_name`) |
 | `context_builder` | да для реальных процессов | `(session_domain, db, runtime_ctx, instance) → dict` |
 | `initial_state` | нет | опц. подсказка первого `entity_fsm_state.current_state` (§4.12, §6.6.2); иначе — из ответа command или маркер в графе |
+| `on_failed` | нет | `(sp, sd, db, instance, last_error) → None` — domain recovery после терминального FAILED (worker, отдельные сессии) |
 
 Свойство `runtime_event_name` = `event_name or process_name`.
 
@@ -1822,9 +1848,14 @@ def schedule_timer(
 | `status` | `SCHEDULED` / `FIRED` / `CANCELLED` |
 | `payload_json` | опционально |
 | `idempotency_key` | опционально, уникальность |
+| `owner` | `domain` \| `platform` (кто поставил таймер) |
 | `created_at`, `cancelled_at` | аудит |
 
 Возврат: `id` вставленной строки.
+
+**Декларативные таймауты состояния (domain DB):** колонки `fsm_states.timeout_seconds`, `timeout_event`, `timeout_owner`. После успешного apply платформа (`fsm_platform/host/state_timeouts.py`) отменяет предыдущий platform-owned timer сущности и при необходимости ставит новый one-shot → enqueue process по `timeout_event`.
+
+**Claim due timers:** `FOR UPDATE SKIP LOCKED` (как outbox). Периодика «каждые N сек» — не таймеры, а `fsm_schedules` (§4.5, §9.14).
 
 #### 8.6.2. `cancel_timer`
 
@@ -1972,43 +2003,39 @@ class TransitionRepository:
     def list_candidates(
         self,
         session_domain,
-        *,
         entity_type: str,
-        current_state: str,
+        from_state: str,
         event_name: str,
-    ) -> list[dict]:
-        """Строки для TransitionDef; ORDER BY priority ASC, id ASC."""
+        graph_version: int | None = None,
+    ) -> list[TransitionDef]:
+        """Строки графа; ORDER BY priority ASC, id ASC; фильтр graph_version при pin."""
+
+    def list_outgoing(...) -> list[TransitionDef]:
+        """Все рёбра из from_state — для available actions (§9.14)."""
+
+    def current_graph_version(session_domain) -> int | None: ...
 ```
 
 #### 8.10.2. SQL (норматив)
 
 ```sql
-SELECT
-  ft.id,
-  ft.entity_type,
-  fs_from.name AS from_state,
-  fs_to.name   AS to_state,
-  fe.name      AS event_name,
-  ft.guard_name,
-  ft.guard_params,
-  ft.priority,
-  ft.effect_name,
-  ft.effect_params
-FROM fsm_transitions ft
-JOIN fsm_states fs_from ON fs_from.id = ft.from_state_id
-JOIN fsm_states fs_to   ON fs_to.id   = ft.to_state_id
-JOIN fsm_events fe      ON fe.id      = ft.event_id
-WHERE ft.entity_type = :entity_type
-  AND fs_from.name   = :current_state
-  AND fe.name        = :event_name
-ORDER BY ft.priority ASC, ft.id ASC
+SELECT … FROM fsm_transitions t
+JOIN fsm_states fs ON …
+JOIN fsm_events e ON …   -- либо legacy fsm_actions / action_id
+WHERE t.entity_type = :entity_type
+  AND fs.name = :from_state
+  AND e.name = :event_name
+  AND t.graph_version = :graph_version   -- если версионирование включено
+ORDER BY t.priority ASC, t.id ASC
 ```
+
+Pin: при enqueue platform пишет `server_fsm_instances.graph_version = fsm_graph_meta.current_version`. Публикация новой версии: `POST /v1/{service_id}/graph/publish` копирует рёбра current→+1 в **domain DB** (счётчик `fsm_graph_meta` рядом с графом, не в platform DB).
 
 Session = connection к domain DB данного `service_id` (worker уже открыл).
 
 #### 8.10.3. Таблицы domain DB
 
-`fsm_transitions`, `fsm_states`, `fsm_events` — только чтение в этом модуле.
+`fsm_transitions`, `fsm_states`, `fsm_events` (или legacy `fsm_actions`), `fsm_graph_meta` — чтение (и publish — запись копий) в этом контуре.
 
 Колонки `guard_params` / `effect_params` парсятся в `dict` и попадают в `TransitionDef` (§8.2.5).
 
@@ -2034,10 +2061,10 @@ class TransitionExecutor:
         user_id: int,
     ) -> None:
         """
-        1) Проверить, что entity_fsm_state.current_state == transition.from_state
-           (иначе ошибка CONCURRENT_STATE_MISMATCH / TRANSITION_APPLY_FAILED)
-        2) state_store.set(…, new_state=transition.to_state)
-        3) INSERT в fsm_transition_logs
+        1) CAS: UPDATE entity_fsm_state SET current_state=:to
+               WHERE … AND current_state=:from  (rowcount=0 → STATE_MISMATCH)
+        2) INSERT в fsm_transition_logs (UNIQUE instance_id+transition_id)
+        Строка state уже должна быть залочена FOR UPDATE runner’ом.
         """
 ```
 
@@ -2173,14 +2200,21 @@ Platform Public API
 | **Sync Invoke** | `POST /v1/{service_id}/invoke` | Query и короткие sync Command | `200` + DTO |
 | **Status** | `GET /v1/{service_id}/fsm/instances/{id}` | результат async | state instance + last_error + payload |
 
-Дополнительно:
+Дополнительно (реализовано / норматив):
 
 | Endpoint | Назначение |
 |----------|------------|
 | `GET /v1/{service_id}/catalog` | discovery: process_name + operation из registry |
-| `GET /v1/{service_id}/events/stream` | SSE (§10.5) |
-| `POST /v1/{service_id}/webhooks` | регистрация callback URL (§10) |
+| `POST /v1/{service_id}/entities/{type}/{id}/actions` | available actions (guards read-only) |
+| `GET /v1/{service_id}/entities/{type}/{id}/history` | таймлайн из `fsm_transition_logs` |
+| `GET /v1/{service_id}/events` | cursor-poll `platform_events` |
+| `WS /v1/{service_id}/ws/events` | realtime events + опц. subscribe на domain operation |
+| `POST/GET /v1/{service_id}/webhooks` | регистрация / список outbound webhooks (§10) |
+| `POST /v1/{service_id}/schedules` | периодические процессы (`fsm_schedules`) |
+| `POST /v1/{service_id}/graph/publish` | bump graph version в domain DB |
+| `GET /v1/metrics` | очереди instances/outbox/reconcile/timers |
 | `GET /v1/health` | liveness platform (без домена) |
+| `GET /v1/auth/token` | dev-выдача Bearer (только `PLATFORM_AUTH_DEV_TOKENS=1`) |
 
 `service_id` в path — уникальный id экземпляра домена (§6.1), не `cartridge_type`.
 
@@ -2368,13 +2402,18 @@ Content-Type: application/json
 
 ### 9.7. Auth и актор
 
-| Механизм | Назначение |
-|----------|------------|
-| API key / JWT | доступ к конкретному `service_id` (+ scopes: enqueue, invoke, admin) |
-| `actor` в теле/claims | user/bot/system; канал `web` / `telegram` / `autotest` / `postman` |
-| Запрет | принимать `user_id` из body как единственный auth |
+**v1 (реализовано, opt-in):** `fsm_platform/host/auth.py`
 
-Автотестер и сайт получают разные ключи; ключ sandbox не пишет в production domain DB (политика деплоя).
+| Режим | Условие | Identity |
+|-------|---------|----------|
+| Dev (по умолчанию) | `PLATFORM_AUTH_SECRET` не задан | `actor` из body (как раньше) |
+| On | секрет задан | только `Authorization: Bearer actor_type:actor_id:sig` (HMAC-SHA256); body actor игнорируется |
+
+- Токен выдаёт **доверенный issuer** (после login / Telegram bind / на локалке `GET /v1/auth/token` при `PLATFORM_AUTH_DEV_TOKENS=1`). Клиент не «узнаёт id из БД» сам.
+- Для разработки auth можно не включать; это блокер для **публичного** API, не для локальной работы и Telegram (пока секрет не задан — TG без изменений).
+- Цель на будущее: полноценный login/JWT + scopes на `service_id` (см. также `platform/auth/` в плане модулей).
+
+| Запрет | принимать голый `actor_id` / `user_id` из body как единственный auth **в prod** |
 
 ### 9.8. Ошибки (единый envelope)
 
@@ -2391,9 +2430,10 @@ HTTP: `400` контракт/валидация, `401`/`403` auth, `404` неи�
 
 ### 9.9. Webhooks (outbound) — кратко
 
-Клиент регистрирует URL (`POST /v1/{service_id}/webhooks`). События после commit доставляются через **platform_outbox** (не из SQL transition).
+Клиент регистрирует URL (`POST /v1/{service_id}/webhooks` + `secret`).  
+Platform fan-out на `fsm.instance.completed` / `failed`: `emit_event` + `notify(channel=webhook)` → `platform_outbox` → `outbox_worker` → `output/webhook/sender.py` (HMAC `X-FSM-Signature`).
 
-Полная модель исходящих каналов (poll, SSE, outbox, channel push, external) — **§10**.
+Полная модель исходящих каналов (poll, WS, outbox, channel push, external) — **§10**.
 
 ### 9.10. Channel adapters
 
@@ -2402,8 +2442,9 @@ HTTP: `400` контракт/валидация, `401`/`403` auth, `404` неи�
 ```text
 input/          # входящие каналы (webhook, deep-link)
   telegram/
-output/         # исходящие senders (Bot API из outbox)
-  telegram/
+output/         # исходящие senders из outbox_worker
+  telegram/     # Bot API sendMessage
+  webhook/      # HTTP POST + HMAC (X-FSM-Signature) на URL подписчика
 # логически это channel adapters; путь channels/ в старых схемах = input/ + output/
 ```
 
@@ -2479,8 +2520,8 @@ OperationRegistry — единственный реестр sync handler'ов (�
 | `fsm_platform/host/http/app.py` | `GET .../fsm/instances/{id}` |
 | `fsm_platform/host/http/app.py` | `GET .../catalog` из RAM-реестров |
 | `fsm_platform/host/http/app.py` | `POST .../invoke` → dispatcher → Request Runtime |
-| `platform/auth/` | API key / JWT → `service_id`, scopes, `actor` |
-| `platform/idempotency/` | таблица `idempotency_keys` (§4.14) |
+| `fsm_platform/host/auth.py` | opt-in HMAC Bearer (`PLATFORM_AUTH_SECRET`); §9.7 |
+| `idempotency_keys` + enqueue | заголовок Idempotency-Key (§4.14, §9.3) — реализовано |
 | OperationRegistry | RAM §6.5; наполняет `register_all` (домен) |
 | Public API routes | фиксированные path §9; код platform |
 | ProcessRegistry (`fsm_core`) | проверка `process_name` при enqueue |
@@ -2492,13 +2533,24 @@ OperationRegistry — единственный реестр sync handler'ов (�
 
 | Метод | Path | Назначение |
 |-------|------|------------|
-| POST | `/v1/{service_id}/fsm/enqueue` | async Command |
+| POST | `/v1/{service_id}/fsm/enqueue` | async Command (+ Idempotency-Key) |
 | GET | `/v1/{service_id}/fsm/instances/{id}` | status instance |
 | POST | `/v1/{service_id}/invoke` | sync Query/Command |
 | GET | `/v1/{service_id}/catalog` | processes + operations |
-| GET | `/v1/{service_id}/events/stream` | SSE (§10.5) |
-| POST | `/v1/{service_id}/webhooks` | регистрация webhook |
+| POST | `/v1/{service_id}/entities/{type}/{id}/actions` | available actions |
+| GET | `/v1/{service_id}/entities/{type}/{id}/history` | history / audit |
+| GET | `/v1/{service_id}/events` | poll platform_events |
+| WS | `/v1/{service_id}/ws/events` | events + subscribe(operation) |
+| POST/GET | `/v1/{service_id}/webhooks` | outbound webhooks |
+| POST | `/v1/{service_id}/webhooks/{id}/deactivate` | выключить подписку |
+| POST/GET | `/v1/{service_id}/schedules` | периодические процессы |
+| POST | `/v1/{service_id}/schedules/{id}/pause\|resume` | пауза schedule |
+| POST | `/v1/{service_id}/graph/publish` | новая версия графа (domain) |
+| GET | `/v1/metrics` | очереди / failed_1h / lag |
 | GET | `/v1/health` | health |
+| GET | `/v1/auth/token` | dev Bearer (opt-in) |
+| POST | `/input/telegram/webhook` | Telegram Update |
+| GET | `/input/telegram/link` | deep-link bind chat_id |
 
 Полный внешний HTTP-контракт. §4.10 — не публичные URL. Admin/Accept — отдельно.
 
@@ -2602,9 +2654,11 @@ COMPLETED / FAILED → взять payload / last_error
 - не использовать poll как единственный канал для тысяч UI-клиентов с интервалом &lt;1s (лучше SSE/webhook);
 - автотесты: poll или `enqueue mode=wait`.
 
-### 10.5. SSE (Server-Sent Events)
+### 10.5. Realtime: WebSocket (реализовано) и SSE (норматив)
 
-Односторонний поток событий от platform к клиенту по длинному HTTP.
+**v1 в коде:** `WS /v1/{service_id}/ws/events` + `GET /v1/{service_id}/events` (cursor poll). Hub читает закоммиченные `platform_events` из platform DB; клиент может `subscribe` на domain operation (повторный invoke → snapshot). Отдельного SSE endpoint пока нет — ниже норматив на будущее.
+
+#### SSE (Server-Sent Events) — норматив
 
 #### Endpoint
 
@@ -2928,43 +2982,53 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 
 | | Courier | Taxi |
 |---|---------|------|
-| Staging | `order_request` | опционально / сразу `taxi_order` |
-| Creation process | `order_creation` | `submit_ride` |
-| entity_type | `order_request` | `taxi_order` |
-| event | `order_create` | `ride_submit` |
-| Первый state | `request_received` | `draft` |
-| Domain DB | FSM-граф + orders, locker_cells, … | FSM-граф + taxi_orders, … |
+| Staging / request | `order_requests` + sync `create_order_request` | опционально / сразу `taxi_order` |
+| Creation | `create_order(request_id)` sync после ready reserves | `submit_ride` |
+| Reserve cells | async FSM `locker_reserve` (2×) до появления `orders` | — |
+| entity_type (заказ) | `order` (после create) | `taxi_order` |
+| Domain DB | FSM-граф + orders, order_requests, locker_cells, … | FSM-граф + taxi_orders, … |
 
-Один `fsm_core`, разные картриджи. Подключение — §6–7; внешние клиенты — Public API §9.
+**Courier: create flow (актуально):**
+
+```text
+1. invoke create_order_request → order_requests(PENDING) + enqueue 2× locker_reserve (request_id)
+2. worker: locker_free → locker_reserved + current_request_id
+3. invoke create_order(request_id) — только если request ready → INSERT order, bind cells, request COMPLETED
+4. провал reserve → ProcessDef.on_failed (recovery): request FAILED, free cells, cancel sibling; order ещё нет
+```
+
+Один `fsm_core`, разные картриджи. Подключение — §6–7; внешние клиенты — Public API §9.  
+Realtime UI (биржа): клиент на `WS …/ws/events` делает `subscribe` на domain operation (`list_courier_exchange` и т.п.) — платформа не хардкодит «биржу».
 
 ---
 
 ## 13. Критерии готовности platform
 
-- [ ] Worker обрабатывает instance через `fsm_core.run_instance` без domain-specific кода в core.
-- [ ] Guard routing по priority работает и логирует reason при отказе.
-- [ ] TransitionExecutor → только `entity_fsm_state` + `fsm_transition_logs`.
-- [ ] Dual-DB commit §4.7; recovery §4.7.1 (`platform_reconcile_queue` + reconcile worker).
-- [ ] Bootstrap state §4.12; side-effect API §4.13.
-- [ ] Guard default §4.4; `list_candidates` через `session_domain` (engine этого `service_id`).
-- [ ] Bootstrap: active домены из Domain Registry / `FSM_DOMAINS` → `register_all`.
-- [ ] Domain Validator §7: пакет + register_all + SQL/ХП/граф + default-guard + OperationRegistry + согласованность имён; отчёт с кодами.
-- [ ] Accept prod без zip-exec; `engine_by_service_id` из Domain Registry (§4.14).
-- [ ] Домен `failed`/`disabled` не обслуживает REST и FSM.
-- [ ] `idempotency_keys` + `webhook_subscriptions` (§4.14).
-- [ ] Public API routes (platform) + OperationRegistry + Request Runtime (§4.10.1).
-- [ ] Request Runtime владеет session на HTTP-запрос; домен session не открывает.
-- [ ] Query: Gateway → Runtime → domain handler → domain db_layer; без FSM instance.
-- [ ] Command: staging/enqueue через Runtime; lifecycle в worker.
-- [ ] Public API `/v1/{service_id}`: enqueue, invoke, instances status, catalog (§9).
-- [ ] Auth и Idempotency-Key на enqueue; actor не только из body.
-- [ ] Smoke: минимум один домен end-to-end (Command + Query) через Public API.
-- [ ] (опц.) один channel adapter ходит только в Public API.
-- [ ] Исходящий контур §10: poll + outbox_worker; SSE и/или webhooks.
-- [ ] Нет HTTP наружу из fsm_core / effect до commit.
-- [ ] Outbox/events только через notify/emit_event; FAILED fan-out в short tx; без `depends_on_outbox_id`.
-- [ ] `mode=wait` = poll-in-request (без claim в HTTP).
-- [ ] SSE hub — чтение platform DB (вариант A), не in-process pub/sub.
+Статус по блокам 0–3 и детальный журнал — **§16**. Ниже — чеклист v1 (отмечено то, что уже в коде).
+
+- [x] Worker обрабатывает instance через `fsm_core.run_instance` без domain-specific кода в core.
+- [x] Guard routing по priority работает и логирует reason при отказе.
+- [x] TransitionExecutor → только `entity_fsm_state` + `fsm_transition_logs` (CAS + FOR UPDATE).
+- [x] Dual-DB commit §4.7; recovery §4.7.1 (`platform_reconcile_queue` + reconcile worker).
+- [x] Bootstrap state §4.12; side-effect API §4.13.
+- [x] Guard default §4.4; `list_candidates` через `session_domain` (+ pin `graph_version`).
+- [x] Bootstrap: active домены из Domain Registry / `FSM_DOMAINS` → `register_all`.
+- [ ] Domain Validator §7: полный Accept-контур (частично есть код validator).
+- [ ] Accept prod без zip-exec; полный Domain Registry lifecycle.
+- [ ] Домен `failed`/`disabled` не обслуживает REST и FSM (политика registry).
+- [x] `idempotency_keys` на enqueue + `webhook_subscriptions` + доставка webhook.
+- [x] Public API routes + OperationRegistry + Request Runtime (§4.10.1).
+- [x] Request Runtime владеет session на HTTP-запрос; домен session не открывает.
+- [x] Query / Command через invoke; lifecycle в worker.
+- [x] Public API: enqueue, invoke, instances, catalog, actions, history, events, WS, webhooks, schedules, metrics (§9.14).
+- [x] Idempotency-Key на enqueue; Auth opt-in (`PLATFORM_AUTH_SECRET`) — для prod включать отдельно.
+- [x] Smoke / e2e домен courier через Public API (`tools/domain_e2e`).
+- [x] Channel adapter Telegram (`input/` + `output/`) через / рядом с Public API.
+- [x] Исходящий контур: poll + outbox_worker (telegram + webhook); WS events (вместо обязательного SSE).
+- [x] Нет HTTP наружу из fsm_core / effect до commit.
+- [x] Outbox/events через notify/emit_event; FAILED fan-out в short tx; retry instances.
+- [ ] `mode=wait` = poll-in-request (если ещё не доведён — см. код enqueue).
+- [x] Events hub — чтение platform DB (WS poll), не in-process pub/sub.
 
 ## 14. Критерии готовности домена
 
@@ -3031,4 +3095,101 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 | run_instance | `fsm_platform/core/engine.py` — вход worker в FSM; §8.4 |
 | EntityStateStore | `fsm_platform/core/state_store.py` — API state поверх db_layer; §8.9 |
 | TransitionRepository | `fsm_platform/core/transition_repository.py` — candidates (+ params) из domain DB; §8.10 |
-| TransitionExecutor | `fsm_platform/core/transition_executor.py` — apply через db_layer; §8.11 |
+| TransitionExecutor | `fsm_platform/core/transition_executor.py` — apply через db_layer (CAS); §8.11 |
+| CAS state | `UPDATE entity_fsm_state … WHERE current_state=:from`; проигрыш гонки → `STATE_MISMATCH` |
+| graph_version / pin | версия рёбер графа на instance; фильтр `list_candidates`; meta в domain DB |
+| fsm_schedules | периодический enqueue process (не one-shot timer) |
+| ProcessDef.on_failed | domain recovery после терминального FAILED instance |
+| available actions | read-only прогон guards → кнопки UI без дублирования правил |
+| PLATFORM_AUTH_SECRET | opt-in HMAC Bearer; без секрета — actor из body (dev) |
+
+---
+
+## 16. Статус реализации (блоки 0–3 и сопутствующее)
+
+Журнал того, что **уже сделано в коде** относительно плана доработок после аудита гонок. Норматив выше (§4–10) приведён в соответствие с этим статусом.  
+Отложено явно: **3.5 компенсации в сагах**.
+
+### 16.1. Блок 0 — гонки и согласованность
+
+| # | Что | Статус | Где |
+|---|-----|--------|-----|
+| 0.1 | CAS смены `entity_fsm_state` | done | `db_layer.cas_entity_state`, `TransitionExecutor` |
+| 0.2 | `SELECT … FOR UPDATE` state перед candidates | done | `transition_runner` |
+| 0.3 | `claim_due_timers` → `SKIP LOCKED` | done | `db_layer` |
+| 0.4 | Idempotency-Key на enqueue | done | `request_runtime.enqueue_instance`, `idempotency_keys` |
+| 0.5 | Reconcile worker | done | `host/reconcile_worker.py`, цикл `worker.py` |
+| 0.6 | CAS в domain-зеркалах order/cell status | done | `domains/courier/db_layer` |
+| 0.7 | Unit/race тесты CAS | done | tests рядом с platform |
+
+### 16.2. Блок 1 — надёжность выполнения
+
+| # | Что | Статус | Где |
+|---|-----|--------|-----|
+| 1.1 | Retry transient FAILED → PENDING + backoff | done | `next_attempt_at`, `host/retry_policy.py`, worker |
+| 1.2 | `ProcessDef.on_failed` + courier recovery | done | `types.ProcessDef`, `domains/courier/recovery.py` |
+| 1.3 | Метрики очередей | done | `GET /v1/metrics`, `host/metrics.py` |
+
+SQL: `sql/platform/005_instance_retry.sql`.
+
+### 16.3. Сопутствующее: courier Hold → Create (order_requests)
+
+Между блоками 1 и 2 переработан create-order (не из исходного плана 0–3, но обязателен для корректного reserve):
+
+| Шаг | Операция |
+|-----|----------|
+| 1 | `create_order_request` — staging `order_requests`, enqueue 2× `locker_reserve` с `request_id` (заказа ещё нет) |
+| 2 | Worker резервирует ячейки (`current_request_id`) |
+| 3 | `create_order(request_id)` — sync INSERT order + bind; без повторного reserve |
+| 4 | Провал reserve → abort request, free cells, cancel sibling; клиент не получает `order_id` |
+
+SQL: `sql/domain/021_order_requests_for_hold.sql` (вместо отменённых `cell_holds` / `hold_id`).  
+E2e YAML переведены на request → create.
+
+### 16.4. Блок 2 — новые возможности для доменов
+
+| # | Что | Статус | API / код |
+|---|-----|--------|-----------|
+| 2.1 | Available actions | done | `POST …/entities/…/actions` → `request_runtime.list_available_actions` |
+| 2.2 | Декларативные state timeouts + `fsm_timers.owner` | done | domain `fsm_states.timeout_*`; `host/state_timeouts.py`; `sql/domain/022_*`, `sql/platform/006_*` |
+| 2.3 | History сущности | done | `GET …/entities/…/history` |
+| 2.4 | Event realtime | done | `GET …/events`, `WS …/ws/events` (+ `subscribe` на любую domain operation; без хардкода «биржи» в platform) |
+
+### 16.5. Блок 3 — расширение и эксплуатация
+
+| # | Что | Статус | Заметки |
+|---|-----|--------|---------|
+| 3.1 | Auth | done (opt-in) | `PLATFORM_AUTH_SECRET`; без секрета — режим разработки; `GET /v1/auth/token` при `PLATFORM_AUTH_DEV_TOKENS=1` |
+| 3.2 | Webhooks delivery | done | регистрация + fan-out completed/failed → outbox → `output/webhook` |
+| 3.3 | Graph versioning | done | domain: `fsm_graph_meta` + `fsm_transitions.graph_version`; platform pin на instance; `POST …/graph/publish` |
+| 3.4 | Periodic schedules | done | `fsm_schedules`, `POST …/schedules`, worker fire → enqueue |
+| 3.5 | Saga compensations | **отложено** | сначала нужна сага create_order |
+
+SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_version.sql`.
+
+### 16.6. Инфраструктура / каналы (вне нумерации блоков)
+
+| Что | Статус |
+|-----|--------|
+| `input/telegram` + deep-link `/start` → bind `telegram_chat_id` | done |
+| `output/telegram` из outbox | done |
+| `scripts/apply_sql.py` (в т.ч. DELIMITER) | done |
+| Worker: FSM + timers + schedules + outbox + reconcile в одном цикле | done |
+| Пул соединений domain/platform с учётом `max_user_connections` | учтено в эксплуатации (pool_size) |
+
+### 16.7. Что сознательно не трогаем в ежедневной разработке
+
+- **Auth** — не включать, пока API не публичный; Telegram/e2e работают без секрета.
+- **Graph publish** — нужен при горячих правках графа под нагрузкой; в dev можно править v1 в простое.
+- **Schedules** — нужны доменные process/рёбра на `schedule/{id}`; платформа только крутит интервал.
+
+### 16.8. Миграции SQL (сводка файлов)
+
+| Файл | DB | Назначение |
+|------|-----|------------|
+| `sql/platform/005_instance_retry.sql` | platform | `next_attempt_at` |
+| `sql/platform/006_timer_owner.sql` | platform | `fsm_timers.owner` |
+| `sql/platform/007_graph_version_and_schedules.sql` | platform | `graph_version` на instances, `fsm_schedules` |
+| `sql/domain/021_order_requests_for_hold.sql` | domain | order_requests / `current_request_id` |
+| `sql/domain/022_state_timeouts.sql` | domain | timeout_* на `fsm_states` |
+| `sql/domain/023_graph_version.sql` | domain | `fsm_graph_meta`, `fsm_transitions.graph_version` |
