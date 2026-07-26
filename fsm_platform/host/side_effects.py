@@ -70,6 +70,7 @@ def start_saga(
     fail_policy: str = "fail_fast",
     payload: Optional[dict[str, Any]] = None,
     actor_id: Optional[int] = None,
+    graph_version: Optional[int] = None,
 ) -> tuple[int, list[int]]:
     """Старт async-саги: children instances + fan-in on_success/on_fail."""
     from fsm_platform.core.sagas import start_saga as _start_saga
@@ -83,6 +84,7 @@ def start_saga(
         fail_policy=fail_policy,
         payload=payload,
         actor_id=actor_id,
+        graph_version=graph_version,
     )
 
 

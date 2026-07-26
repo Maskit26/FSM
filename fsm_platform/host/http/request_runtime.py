@@ -10,6 +10,10 @@ from typing import Any, Callable, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.host.engines import domain_session, platform_session
+from fsm_platform.host.graph_version import (
+    current_graph_version,
+    resolve_graph_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +49,9 @@ def run_operation(
         else:
             result = handler(sd, params, actor)
         if kind == "command" and isinstance(result, dict) and result.get("entity_type"):
-            _bootstrap_and_maybe_enqueue(sp, service_id, result, actor=actor)
+            _bootstrap_and_maybe_enqueue(
+                sp, sd, service_id, result, actor=actor
+            )
         sd.commit()
         sp.commit()
         return result if isinstance(result, dict) else {"data": result}
@@ -60,6 +66,7 @@ def run_operation(
 
 def _bootstrap_and_maybe_enqueue(
     sp,
+    sd,
     service_id: str,
     result: dict[str, Any],
     *,
@@ -73,6 +80,7 @@ def _bootstrap_and_maybe_enqueue(
     entity_type = str(result["entity_type"])
     entity_id = int(result["entity_id"])
     initial = result.get("initial_state")
+    graph_version = resolve_graph_version(sd)
 
     existing = default_db_layer.get_entity_state(sp, service_id, entity_type, entity_id)
     if existing is None:
@@ -113,7 +121,9 @@ def _bootstrap_and_maybe_enqueue(
     _apply_timers(sp, service_id, result)
 
     if result.get("saga"):
-        _apply_saga(sp, service_id, result, actor=actor)
+        _apply_saga(
+            sp, service_id, result, actor=actor, graph_version=graph_version
+        )
         return
 
     enqueues = result.get("enqueues")
@@ -149,6 +159,7 @@ def _bootstrap_and_maybe_enqueue(
                     entity_id=e_id,
                     payload=item.get("payload") or {},
                     actor_id=_actor_id_from_actor(actor),
+                    graph_version=graph_version,
                 )
             )
         result["instance_ids"] = instance_ids
@@ -169,6 +180,7 @@ def _bootstrap_and_maybe_enqueue(
         entity_id=entity_id,
         payload=enqueue.get("payload") or {},
         actor_id=_actor_id_from_actor(actor),
+        graph_version=graph_version,
     )
     result["instance_id"] = instance_id
 
@@ -229,6 +241,7 @@ def _apply_saga(
     result: dict[str, Any],
     *,
     actor: Optional[dict[str, Any]] = None,
+    graph_version: Optional[int] = None,
 ) -> None:
     """result['saga'] → fsm_sagas + child instances."""
     from fsm_platform.host import side_effects
@@ -249,6 +262,7 @@ def _apply_saga(
         fail_policy=str(raw.get("fail_policy") or "fail_fast"),
         payload=raw.get("payload") or {},
         actor_id=_actor_id_from_actor(actor),
+        graph_version=graph_version,
     )
     result["saga_id"] = saga_id
     result["instance_ids"] = instance_ids
@@ -286,6 +300,14 @@ def enqueue_instance(
         state = default_db_layer.get_entity_state(sp, service_id, entity_type, entity_id)
         if state is None:
             raise LookupError("ENTITY_STATE_NOT_FOUND")
+        gv = None
+        sd = None
+        try:
+            sd = domain_session(service_id)
+            gv = resolve_graph_version(sd)
+        finally:
+            if sd is not None:
+                sd.close()
         instance_id = default_db_layer.insert_fsm_instance(
             sp,
             service_id=service_id,
@@ -294,6 +316,7 @@ def enqueue_instance(
             entity_id=entity_id,
             payload=payload or {},
             actor_id=actor_id,
+            graph_version=gv,
         )
         response = {
             "instance_id": instance_id,
@@ -440,7 +463,10 @@ def list_available_actions(
                 "error": "ENTITY_STATE_NOT_FOUND",
             }
 
-        outgoing = repo.list_outgoing(sd, entity_type, str(current))
+        gv = current_graph_version(sd)
+        outgoing = repo.list_outgoing(
+            sd, entity_type, str(current), graph_version=gv
+        )
         by_event: dict[str, list] = {}
         for p in default_process_registry.list_for_service(service_id):
             if str(p.entity_type or "") != entity_type:
@@ -459,6 +485,7 @@ def list_available_actions(
                 "entity_id": entity_id,
                 "actor_id": actor_id or None,
                 "payload_json": merged_payload,
+                "graph_version": gv,
             }
 
             domain_context: dict[str, Any] = {}

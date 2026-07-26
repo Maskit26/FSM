@@ -8,8 +8,8 @@ from typing import Any
 
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.sagas import on_child_terminal
-from fsm_platform.host import side_effects
 from fsm_platform.host.engines import platform_session
+from fsm_platform.host.webhooks import emit_event_with_webhooks
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ def dock_platform(row: dict[str, Any]) -> None:
         if inst is not None and str(inst.get("status")) != "COMPLETED":
             default_db_layer.mark_instance_completed(sp, instance_id)
 
-        side_effects.emit_event(
+        emit_event_with_webhooks(
             sp,
             service_id=service_id,
             event_type="fsm.instance.completed",

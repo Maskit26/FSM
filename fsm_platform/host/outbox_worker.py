@@ -57,6 +57,40 @@ def deliver_one(row: dict[str, Any]) -> None:
         )
         return
 
+    if channel == "webhook":
+        from output.webhook.sender import deliver_webhook
+
+        secret = ""
+        sub_id = payload.get("subscription_id")
+        if sub_id is not None:
+            sp_sec = platform_session()
+            try:
+                sub = default_db_layer.get_webhook_subscription(
+                    sp_sec,
+                    service_id=str(row.get("service_id") or ""),
+                    subscription_id=int(sub_id),
+                )
+                if sub:
+                    secret = str(sub.get("secret") or "")
+            finally:
+                sp_sec.close()
+        body = {
+            "event_id": payload.get("event_id"),
+            "event_type": row.get("event_type") or payload.get("event_type"),
+            "service_id": row.get("service_id") or payload.get("service_id"),
+            "instance_id": payload.get("instance_id"),
+            "entity_type": payload.get("entity_type"),
+            "entity_id": payload.get("entity_id"),
+            "payload": payload.get("payload") or {},
+        }
+        deliver_webhook(
+            url=destination,
+            secret=secret,
+            body=body,
+            event_type=str(row.get("event_type") or ""),
+        )
+        return
+
     raise RuntimeError(f"UNSUPPORTED_CHANNEL:{channel}")
 
 

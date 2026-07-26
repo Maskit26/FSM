@@ -11,6 +11,9 @@ SET @svc := 'svc_courier_01';
 DELETE FROM fsm_timers
  WHERE service_id = @svc;
 
+DELETE FROM fsm_schedules
+ WHERE service_id = @svc;
+
 DELETE FROM fsm_transition_logs
  WHERE service_id = @svc;
 

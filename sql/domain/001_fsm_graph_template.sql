@@ -18,6 +18,14 @@ CREATE TABLE IF NOT EXISTS fsm_events (
     UNIQUE KEY uq_event (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS fsm_graph_meta (
+    id               TINYINT      NOT NULL PRIMARY KEY DEFAULT 1,
+    current_version  INT          NOT NULL DEFAULT 1,
+    updated_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO fsm_graph_meta (id, current_version) VALUES (1, 1);
+
 CREATE TABLE IF NOT EXISTS fsm_transitions (
     id             BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
     entity_type    VARCHAR(128) NOT NULL,
@@ -29,7 +37,9 @@ CREATE TABLE IF NOT EXISTS fsm_transitions (
     priority       INT          NOT NULL DEFAULT 100,
     effect_name    VARCHAR(128) NULL,
     effect_params  JSON         NULL,
+    graph_version  INT          NOT NULL DEFAULT 1,
     KEY idx_candidates (entity_type, from_state_id, event_id, priority, id),
+    KEY idx_tr_graph (entity_type, graph_version, from_state_id, event_id),
     CONSTRAINT fk_tr_from FOREIGN KEY (from_state_id) REFERENCES fsm_states(id),
     CONSTRAINT fk_tr_to   FOREIGN KEY (to_state_id) REFERENCES fsm_states(id),
     CONSTRAINT fk_tr_evt  FOREIGN KEY (event_id) REFERENCES fsm_events(id)

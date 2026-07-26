@@ -15,9 +15,10 @@ from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.registry import default_process_registry
 from fsm_platform.core.sagas import on_child_terminal
 from fsm_platform.core.types import FsmResult
-from fsm_platform.host import side_effects
 from fsm_platform.host.engines import domain_session, platform_session
+from fsm_platform.host.graph_version import resolve_graph_version
 from fsm_platform.host.retry_policy import backoff_seconds, should_retry
+from fsm_platform.host.webhooks import emit_event_with_webhooks
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +42,26 @@ def _fire_due_timers(*, limit: int = 20) -> bool:
                 or payload.get("actor_id")
             )
             actor_id = int(actor_raw) if actor_raw is not None else None
+            svc = str(timer["service_id"])
+            gv = None
+            sd = None
+            try:
+                sd = domain_session(svc)
+                gv = resolve_graph_version(sd)
+            except Exception:
+                logger.exception("timer graph_version resolve failed svc=%s", svc)
+            finally:
+                if sd is not None:
+                    sd.close()
             default_db_layer.insert_fsm_instance(
                 sp,
-                service_id=str(timer["service_id"]),
+                service_id=svc,
                 process_name=str(timer["process_name"]),
                 entity_type=str(timer["entity_type"]),
                 entity_id=int(timer["entity_id"]),
                 payload=payload,
                 actor_id=actor_id,
+                graph_version=gv,
             )
             logger.info(
                 "timer fired id=%s process=%s entity=%s/%s",
@@ -62,6 +75,73 @@ def _fire_due_timers(*, limit: int = 20) -> bool:
     except Exception:
         sp.rollback()
         logger.exception("fire_due_timers failed")
+        return False
+    finally:
+        sp.close()
+
+
+def _fire_due_schedules(*, limit: int = 20) -> bool:
+    """
+    ACTIVE fsm_schedules с next_run_at<=now → enqueue process + сдвиг next_run_at.
+    True если хотя бы один schedule обработан.
+    """
+    if not hasattr(default_db_layer, "claim_due_schedules"):
+        return False
+    sp = platform_session()
+    try:
+        # таблица может ещё не быть применена
+        try:
+            due = default_db_layer.claim_due_schedules(sp, limit=limit)
+        except Exception as exc:
+            sp.rollback()
+            if "fsm_schedules" in str(exc) or "1146" in str(exc):
+                return False
+            raise
+        if not due:
+            sp.rollback()
+            return False
+        for sched in due:
+            svc = str(sched["service_id"])
+            etype = str(sched.get("entity_type") or "schedule")
+            eid = int(sched.get("entity_id") or sched["id"])
+            if default_db_layer.get_entity_state(sp, svc, etype, eid) is None:
+                default_db_layer.insert_entity_state_initial(
+                    sp, svc, etype, eid, "idle"
+                )
+            gv = None
+            sd = None
+            try:
+                sd = domain_session(svc)
+                gv = resolve_graph_version(sd)
+            except Exception:
+                logger.exception("schedule graph_version resolve failed svc=%s", svc)
+            finally:
+                if sd is not None:
+                    sd.close()
+            payload = dict(sched.get("payload") or {})
+            payload.setdefault("schedule_id", int(sched["id"]))
+            default_db_layer.insert_fsm_instance(
+                sp,
+                service_id=svc,
+                process_name=str(sched["process_name"]),
+                entity_type=etype,
+                entity_id=eid,
+                payload=payload,
+                actor_id=None,
+                graph_version=gv,
+            )
+            logger.info(
+                "schedule fired id=%s process=%s entity=%s/%s",
+                sched.get("id"),
+                sched.get("process_name"),
+                etype,
+                eid,
+            )
+        sp.commit()
+        return True
+    except Exception:
+        sp.rollback()
+        logger.exception("fire_due_schedules failed")
         return False
     finally:
         sp.close()
@@ -146,7 +226,7 @@ def _finish_failure(instance: dict[str, Any], last_error: str) -> None:
         default_db_layer.mark_instance_failed(
             sp, int(instance["id"]), err, attempts=attempts_after
         )
-        side_effects.emit_event(
+        emit_event_with_webhooks(
             sp,
             service_id=str(instance["service_id"]),
             event_type="fsm.instance.failed",
@@ -215,6 +295,8 @@ def process_one() -> bool:
     """
     if _fire_due_timers():
         return True
+    if _fire_due_schedules():
+        return True
 
     sp = platform_session()
     instance: Optional[dict[str, Any]] = None
@@ -244,7 +326,7 @@ def process_one() -> bool:
         result = run_instance(sp, sd, db, runtime_ctx, instance)
 
         if result.new_state == "COMPLETED":
-            side_effects.emit_event(
+            emit_event_with_webhooks(
                 sp,
                 service_id=service_id,
                 event_type="fsm.instance.completed",

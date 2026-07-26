@@ -30,6 +30,7 @@ from starlette.concurrency import run_in_threadpool
 
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.domain_errors import DomainError
+from fsm_platform.host.auth import AuthError, auth_enabled, resolve_actor
 from fsm_platform.host.engines import platform_session
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.operations import default_operation_registry
@@ -229,20 +230,43 @@ async def events_ws(
                         {"type": "error", "detail": "operation required"}
                     )
                     continue
-                actor = msg.get("actor")
-                if not isinstance(actor, dict) or not actor.get("actor_id"):
+                actor = msg.get("actor") if isinstance(msg.get("actor"), dict) else None
+                auth_header = (
+                    websocket.headers.get("authorization")
+                    or msg.get("authorization")
+                )
+                try:
+                    if auth_enabled():
+                        resolved = resolve_actor(
+                            authorization=auth_header,
+                            body_actor=actor,
+                        )
+                    else:
+                        if not actor or not actor.get("actor_id"):
+                            raise AuthError(
+                                "ACTOR_REQUIRED", "actor.actor_id required"
+                            )
+                        resolved = {
+                            "actor_type": str(actor.get("actor_type") or "user"),
+                            "actor_id": str(actor["actor_id"]),
+                            "channel": str(
+                                actor.get("channel") or "websocket"
+                            ),
+                        }
+                except AuthError as exc:
                     await websocket.send_json(
-                        {"type": "error", "detail": "actor.actor_id required"}
+                        {
+                            "type": "error",
+                            "detail": exc.code,
+                            "message": str(exc),
+                        }
                     )
                     continue
+                resolved["channel"] = "websocket"
                 params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
                 sub_operation = operation
                 sub_params = params
-                sub_actor = {
-                    "actor_type": str(actor.get("actor_type") or "user"),
-                    "actor_id": str(actor["actor_id"]),
-                    "channel": str(actor.get("channel") or "websocket"),
-                }
+                sub_actor = resolved
                 last_fp = None
                 await push_snapshot(force=True)
             elif op in ("", "refresh"):

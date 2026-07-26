@@ -297,8 +297,19 @@ class TransitionRunner:
                 )
             }
 
+        gv_raw = instance.get("graph_version")
+        try:
+            graph_version = int(gv_raw) if gv_raw is not None else None
+        except (TypeError, ValueError):
+            graph_version = None
+        if graph_version is None:
+            graph_version = self._repo.current_graph_version(session_domain)
         candidates = self._repo.list_candidates(
-            session_domain, entity_type, current_state, event_name
+            session_domain,
+            entity_type,
+            current_state,
+            event_name,
+            graph_version=graph_version,
         )
         if not candidates:
             return {

@@ -24,6 +24,7 @@ def start_saga(
     fail_policy: str = "fail_fast",
     payload: Optional[dict[str, Any]] = None,
     actor_id: Optional[int] = None,
+    graph_version: Optional[int] = None,
     db_layer: FsmDbLayer | None = None,
 ) -> tuple[int, list[int]]:
     """
@@ -79,6 +80,7 @@ def start_saga(
             entity_id=e_id_i,
             payload=item.get("payload") or {},
             actor_id=actor_id,
+            graph_version=graph_version,
         )
         db.insert_saga_child(
             session,
@@ -143,6 +145,7 @@ def _enqueue_finish(
         entity_id=e_id_i,
         payload=payload,
         actor_id=actor_id if actor_id is not None else spec.get("actor_id"),
+        graph_version=spec.get("graph_version"),
     )
 
 

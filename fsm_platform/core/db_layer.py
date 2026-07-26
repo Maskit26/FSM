@@ -387,29 +387,56 @@ class FsmDbLayer:
         entity_id: int,
         payload: Optional[dict[str, Any]] = None,
         actor_id: Optional[int] = None,
+        graph_version: Optional[int] = None,
     ) -> int:
         """Создаёт PENDING server_fsm_instances. actor_id — opaque id из Public API actor (не колонка домена)."""
-        result = session.execute(
-            text(
-                """
-                INSERT INTO server_fsm_instances
-                    (service_id, process_name, entity_type, entity_id, status,
-                     attempts, payload_json, actor_id,
-                     created_at, updated_at)
-                VALUES
-                    (:service_id, :process_name, :entity_type, :entity_id, 'PENDING',
-                     0, :payload_json, :actor_id, UTC_TIMESTAMP(), UTC_TIMESTAMP())
-                """
-            ),
-            {
-                "service_id": service_id,
-                "process_name": process_name,
-                "entity_type": entity_type,
-                "entity_id": entity_id,
-                "payload_json": json.dumps(payload or {}),
-                "actor_id": actor_id,
-            },
-        )
+        has_gv = self._has_column(session, "server_fsm_instances", "graph_version")
+        if has_gv:
+            result = session.execute(
+                text(
+                    """
+                    INSERT INTO server_fsm_instances
+                        (service_id, process_name, entity_type, entity_id, status,
+                         attempts, payload_json, actor_id, graph_version,
+                         created_at, updated_at)
+                    VALUES
+                        (:service_id, :process_name, :entity_type, :entity_id, 'PENDING',
+                         0, :payload_json, :actor_id, :graph_version,
+                         UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                    """
+                ),
+                {
+                    "service_id": service_id,
+                    "process_name": process_name,
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "payload_json": json.dumps(payload or {}),
+                    "actor_id": actor_id,
+                    "graph_version": graph_version,
+                },
+            )
+        else:
+            result = session.execute(
+                text(
+                    """
+                    INSERT INTO server_fsm_instances
+                        (service_id, process_name, entity_type, entity_id, status,
+                         attempts, payload_json, actor_id,
+                         created_at, updated_at)
+                    VALUES
+                        (:service_id, :process_name, :entity_type, :entity_id, 'PENDING',
+                         0, :payload_json, :actor_id, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                    """
+                ),
+                {
+                    "service_id": service_id,
+                    "process_name": process_name,
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "payload_json": json.dumps(payload or {}),
+                    "actor_id": actor_id,
+                },
+            )
         return int(result.lastrowid)
 
     def get_fsm_instance(
@@ -419,12 +446,17 @@ class FsmDbLayer:
         instance_id: int,
     ) -> Optional[dict[str, Any]]:
         """Загружает экземпляр FSM по id и service_id. Нужен для статуса, диагностики и повторной обработки."""
+        gv = (
+            ", graph_version"
+            if self._has_column(session, "server_fsm_instances", "graph_version")
+            else ""
+        )
         row = session.execute(
             text(
-                """
+                f"""
                 SELECT id, service_id, process_name, entity_type, entity_id,
-                       status, attempts, last_error, payload_json, actor_id,
-                       created_at, started_at, finished_at
+                       status, attempts, last_error, payload_json, actor_id
+                       {gv}, created_at, started_at, finished_at
                 FROM server_fsm_instances
                 WHERE id = :id AND service_id = :service_id
                 """
@@ -437,12 +469,17 @@ class FsmDbLayer:
         self, session: SessionLike, instance_id: int
     ) -> Optional[dict[str, Any]]:
         """Загружает instance по id (без service_id). Для saga heal/fan-in."""
+        gv = (
+            ", graph_version"
+            if self._has_column(session, "server_fsm_instances", "graph_version")
+            else ""
+        )
         row = session.execute(
             text(
-                """
+                f"""
                 SELECT id, service_id, process_name, entity_type, entity_id,
-                       status, attempts, last_error, payload_json, actor_id,
-                       created_at, started_at, finished_at
+                       status, attempts, last_error, payload_json, actor_id
+                       {gv}, created_at, started_at, finished_at
                 FROM server_fsm_instances
                 WHERE id = :id
                 """
@@ -455,11 +492,16 @@ class FsmDbLayer:
         self, session: SessionLike
     ) -> Optional[dict[str, Any]]:
         """Атомарно захватывает старейший due PENDING (FOR UPDATE SKIP LOCKED) → PROCESSING."""
+        gv = (
+            ", graph_version"
+            if self._has_column(session, "server_fsm_instances", "graph_version")
+            else ""
+        )
         row = session.execute(
             text(
-                """
+                f"""
                 SELECT id, service_id, process_name, entity_type, entity_id,
-                       status, attempts, payload_json, actor_id
+                       status, attempts, payload_json, actor_id{gv}
                 FROM server_fsm_instances
                 WHERE status = 'PENDING'
                   AND (next_attempt_at IS NULL
@@ -1368,6 +1410,262 @@ class FsmDbLayer:
             {"id": saga_id, "status": status},
         )
         return int(result.rowcount or 0) == 1
+
+    # --- webhook_subscriptions ---
+
+    def list_webhook_subscriptions(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Активные (или все) webhook_subscriptions для service_id."""
+        sql = """
+            SELECT id, service_id, url, secret, event_types, active, created_at
+            FROM webhook_subscriptions
+            WHERE service_id = :service_id
+        """
+        if active_only:
+            sql += " AND active = 1"
+        sql += " ORDER BY id ASC"
+        rows = session.execute(
+            text(sql), {"service_id": service_id}
+        ).mappings().all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.get("event_types")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item["event_types"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+            out.append(item)
+        return out
+
+    def get_webhook_subscription(
+        self, session: SessionLike, *, service_id: str, subscription_id: int
+    ) -> Optional[dict[str, Any]]:
+        row = session.execute(
+            text(
+                """
+                SELECT id, service_id, url, secret, event_types, active, created_at
+                FROM webhook_subscriptions
+                WHERE id = :id AND service_id = :service_id
+                """
+            ),
+            {"id": int(subscription_id), "service_id": service_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def insert_webhook_subscription(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        url: str,
+        secret: str,
+        event_types: Optional[list[str]] = None,
+        active: bool = True,
+    ) -> int:
+        result = session.execute(
+            text(
+                """
+                INSERT INTO webhook_subscriptions
+                    (service_id, url, secret, event_types, active, created_at)
+                VALUES
+                    (:service_id, :url, :secret, :event_types, :active, UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "service_id": service_id,
+                "url": url,
+                "secret": secret,
+                "event_types": (
+                    json.dumps(event_types) if event_types is not None else None
+                ),
+                "active": 1 if active else 0,
+            },
+        )
+        return int(result.lastrowid)
+
+    def set_webhook_subscription_active(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        subscription_id: int,
+        active: bool,
+    ) -> bool:
+        result = session.execute(
+            text(
+                """
+                UPDATE webhook_subscriptions
+                SET active = :active
+                WHERE id = :id AND service_id = :service_id
+                """
+            ),
+            {
+                "id": int(subscription_id),
+                "service_id": service_id,
+                "active": 1 if active else 0,
+            },
+        )
+        return int(result.rowcount or 0) > 0
+
+    # --- fsm_schedules ---
+
+    def insert_schedule(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        process_name: str,
+        interval_seconds: int,
+        entity_type: str = "schedule",
+        entity_id: int = 0,
+        payload: Optional[dict[str, Any]] = None,
+        next_run_at: Optional[datetime] = None,
+    ) -> int:
+        """Создаёт ACTIVE периодический schedule."""
+        result = session.execute(
+            text(
+                """
+                INSERT INTO fsm_schedules
+                    (service_id, process_name, entity_type, entity_id,
+                     interval_seconds, payload_json, next_run_at, status,
+                     created_at, updated_at)
+                VALUES
+                    (:service_id, :process_name, :entity_type, :entity_id,
+                     :interval_seconds, :payload_json,
+                     COALESCE(:next_run_at, UTC_TIMESTAMP()), 'ACTIVE',
+                     UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "service_id": service_id,
+                "process_name": process_name,
+                "entity_type": entity_type,
+                "entity_id": int(entity_id),
+                "interval_seconds": int(interval_seconds),
+                "payload_json": json.dumps(payload or {}),
+                "next_run_at": next_run_at,
+            },
+        )
+        return int(result.lastrowid)
+
+    def claim_due_schedules(
+        self, session: SessionLike, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """
+        ACTIVE schedules с next_run_at<=now → сдвигает next_run_at += interval.
+        Возвращает snapshot строк до сдвига (для enqueue).
+        """
+        rows = session.execute(
+            text(
+                """
+                SELECT id, service_id, process_name, entity_type, entity_id,
+                       interval_seconds, payload_json, next_run_at, status
+                FROM fsm_schedules
+                WHERE status = 'ACTIVE'
+                  AND next_run_at <= UTC_TIMESTAMP()
+                ORDER BY next_run_at ASC, id ASC
+                LIMIT :lim
+                FOR UPDATE SKIP LOCKED
+                """
+            ),
+            {"lim": int(limit)},
+        ).mappings().all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.get("payload_json")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item["payload"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    item["payload"] = {}
+            elif isinstance(raw, dict):
+                item["payload"] = raw
+            else:
+                item["payload"] = {}
+            interval = max(1, int(item.get("interval_seconds") or 60))
+            session.execute(
+                text(
+                    """
+                    UPDATE fsm_schedules
+                    SET next_run_at = DATE_ADD(
+                            UTC_TIMESTAMP(), INTERVAL :interval SECOND
+                        ),
+                        last_error = NULL,
+                        updated_at = UTC_TIMESTAMP()
+                    WHERE id = :id AND status = 'ACTIVE'
+                    """
+                ),
+                {"id": int(item["id"]), "interval": interval},
+            )
+            out.append(item)
+        return out
+
+    def set_schedule_status(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        schedule_id: int,
+        status: str,
+    ) -> bool:
+        result = session.execute(
+            text(
+                """
+                UPDATE fsm_schedules
+                SET status = :status, updated_at = UTC_TIMESTAMP()
+                WHERE id = :id AND service_id = :service_id
+                """
+            ),
+            {
+                "id": int(schedule_id),
+                "service_id": service_id,
+                "status": status,
+            },
+        )
+        return int(result.rowcount or 0) > 0
+
+    def list_schedules(
+        self, session: SessionLike, *, service_id: str
+    ) -> list[dict[str, Any]]:
+        rows = session.execute(
+            text(
+                """
+                SELECT id, service_id, process_name, entity_type, entity_id,
+                       interval_seconds, payload_json, next_run_at, status,
+                       last_error, created_at, updated_at
+                FROM fsm_schedules
+                WHERE service_id = :service_id
+                ORDER BY id ASC
+                """
+            ),
+            {"service_id": service_id},
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+    # --- schema helpers ---
+
+    @staticmethod
+    def _has_column(session: SessionLike, table: str, column: str) -> bool:
+        row = session.execute(
+            text(
+                """
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = DATABASE()
+                  AND table_name = :t AND column_name = :c
+                LIMIT 1
+                """
+            ),
+            {"t": table, "c": column},
+        ).first()
+        return row is not None
 
     # --- domain_services (boot) ---
 

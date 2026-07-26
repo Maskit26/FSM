@@ -13,16 +13,47 @@ from .types import TransitionDef
 class TransitionRepository:
     """Загружает transitions из доменной БД. Поддерживает схему fsm_events и legacy fsm_actions."""
 
+    def current_graph_version(self, session_domain: SessionLike) -> Optional[int]:
+        """Текущая published-версия графа или None, если версионирование выключено."""
+        if not self._has_column(session_domain, "fsm_transitions", "graph_version"):
+            return None
+        if self._has_table(session_domain, "fsm_graph_meta"):
+            row = session_domain.execute(
+                text(
+                    "SELECT current_version FROM fsm_graph_meta WHERE id = 1 LIMIT 1"
+                )
+            ).mappings().first()
+            if row is not None:
+                try:
+                    return max(1, int(row["current_version"]))
+                except (TypeError, ValueError):
+                    return 1
+        return 1
+
     def list_candidates(
         self,
         session_domain: SessionLike,
         entity_type: str,
         from_state: str,
         event_name: str,
+        graph_version: Optional[int] = None,
     ) -> list[TransitionDef]:
         """Возвращает кандидаты переходов, отсортированные по priority. TransitionRunner перебирает их и применяет guards."""
+        ver_sql = ""
+        params: dict = {
+            "entity_type": entity_type,
+            "from_state": from_state,
+            "event_name": event_name,
+        }
+        if (
+            graph_version is not None
+            and self._has_column(session_domain, "fsm_transitions", "graph_version")
+        ):
+            ver_sql = " AND t.graph_version = :graph_version"
+            params["graph_version"] = int(graph_version)
+
         if self._has_table(session_domain, "fsm_events"):
-            sql = """
+            sql = f"""
                 SELECT
                     t.id,
                     t.entity_type,
@@ -41,11 +72,12 @@ class TransitionRepository:
                 WHERE t.entity_type = :entity_type
                   AND fs.name = :from_state
                   AND e.name = :event_name
+                  {ver_sql}
                 ORDER BY t.priority ASC, t.id ASC
             """
         else:
             # Legacy: fsm_actions / action_id
-            sql = """
+            sql = f"""
                 SELECT
                     t.id,
                     t.entity_type,
@@ -64,17 +96,11 @@ class TransitionRepository:
                 WHERE t.entity_type = :entity_type
                   AND fs.name = :from_state
                   AND a.name = :event_name
+                  {ver_sql}
                 ORDER BY t.priority ASC, t.id ASC
             """
 
-        rows = session_domain.execute(
-            text(sql),
-            {
-                "entity_type": entity_type,
-                "from_state": from_state,
-                "event_name": event_name,
-            },
-        ).mappings().all()
+        rows = session_domain.execute(text(sql), params).mappings().all()
         return [TransitionDef.from_row(dict(r)) for r in rows]
 
     def get_initial_state(
@@ -130,10 +156,20 @@ class TransitionRepository:
         session_domain: SessionLike,
         entity_type: str,
         from_state: str,
+        graph_version: Optional[int] = None,
     ) -> list[TransitionDef]:
         """Все рёбра из from_state (без фильтра event) — для available actions."""
+        ver_sql = ""
+        params: dict = {"entity_type": entity_type, "from_state": from_state}
+        if (
+            graph_version is not None
+            and self._has_column(session_domain, "fsm_transitions", "graph_version")
+        ):
+            ver_sql = " AND t.graph_version = :graph_version"
+            params["graph_version"] = int(graph_version)
+
         if self._has_table(session_domain, "fsm_events"):
-            sql = """
+            sql = f"""
                 SELECT
                     t.id,
                     t.entity_type,
@@ -151,10 +187,11 @@ class TransitionRepository:
                 JOIN fsm_events e ON e.id = t.event_id
                 WHERE t.entity_type = :entity_type
                   AND fs.name = :from_state
+                  {ver_sql}
                 ORDER BY e.name ASC, t.priority ASC, t.id ASC
             """
         else:
-            sql = """
+            sql = f"""
                 SELECT
                     t.id,
                     t.entity_type,
@@ -172,12 +209,10 @@ class TransitionRepository:
                 JOIN fsm_actions a ON a.id = t.action_id
                 WHERE t.entity_type = :entity_type
                   AND fs.name = :from_state
+                  {ver_sql}
                 ORDER BY a.name ASC, t.priority ASC, t.id ASC
             """
-        rows = session_domain.execute(
-            text(sql),
-            {"entity_type": entity_type, "from_state": from_state},
-        ).mappings().all()
+        rows = session_domain.execute(text(sql), params).mappings().all()
         return [TransitionDef.from_row(dict(r)) for r in rows]
 
     def get_state_timeout(
