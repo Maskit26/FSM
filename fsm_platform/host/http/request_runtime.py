@@ -205,6 +205,7 @@ def _apply_timers(sp, service_id: str, result: dict[str, Any]) -> None:
             fire_at = datetime.fromisoformat(
                 fire_at.replace("Z", "+00:00")
             ).replace(tzinfo=None)
+        owner = str(item.get("owner") or "domain").strip().lower()
         timer_ids.append(
             side_effects.schedule_timer(
                 sp,
@@ -215,6 +216,7 @@ def _apply_timers(sp, service_id: str, result: dict[str, Any]) -> None:
                 fire_at=fire_at,
                 payload=item.get("payload") or {},
                 idempotency_key=item.get("idempotency_key"),
+                owner=owner,
             )
         )
     if timer_ids:
@@ -342,3 +344,185 @@ def get_instance(service_id: str, instance_id: int) -> Optional[dict[str, Any]]:
         return data
     finally:
         sp.close()
+
+
+def list_entity_history(
+    service_id: str,
+    *,
+    entity_type: str,
+    entity_id: int,
+    limit: int = 50,
+    before_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Таймлайн сущности из fsm_transition_logs."""
+    sp = platform_session()
+    try:
+        rows = default_db_layer.list_transition_logs(
+            sp,
+            service_id=service_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            limit=limit,
+            before_id=before_id,
+        )
+        return {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "items": rows,
+        }
+    finally:
+        sp.close()
+
+
+def list_platform_events(
+    service_id: str, *, after_id: int = 0, limit: int = 100
+) -> dict[str, Any]:
+    """Cursor-poll platform_events (id > after_id)."""
+    sp = platform_session()
+    try:
+        items = default_db_layer.list_events_after(
+            sp, service_id=service_id, after_id=after_id, limit=limit
+        )
+        next_after = int(items[-1]["id"]) if items else int(after_id)
+        return {
+            "service_id": service_id,
+            "after_id": int(after_id),
+            "next_after_id": next_after,
+            "items": items,
+        }
+    finally:
+        sp.close()
+
+
+def list_available_actions(
+    service_id: str,
+    *,
+    entity_type: str,
+    entity_id: int,
+    actor: dict[str, Any],
+    payload: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Исходящие переходы + read-only прогон guards (без apply/effect).
+    Собирает domain context тем же context_builder, что и worker.
+    """
+    from fsm_platform.core.registry import (
+        default_guard_registry,
+        default_process_registry,
+    )
+    from fsm_platform.core.transition_repository import TransitionRepository
+    from fsm_platform.core.types import normalize_guard_result
+
+    try:
+        actor_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError):
+        actor_id = 0
+
+    merged_payload = dict(payload or {})
+    if actor_id and "executor_user_id" not in merged_payload:
+        merged_payload.setdefault("executor_user_id", actor_id)
+        merged_payload.setdefault("courier_user_id", actor_id)
+        merged_payload.setdefault("driver_user_id", actor_id)
+
+    repo = TransitionRepository()
+    sp = platform_session()
+    sd = domain_session(service_id)
+    try:
+        current = default_db_layer.get_entity_state(
+            sp, service_id, entity_type, entity_id
+        )
+        if current is None:
+            return {
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "current_state": None,
+                "actions": [],
+                "error": "ENTITY_STATE_NOT_FOUND",
+            }
+
+        outgoing = repo.list_outgoing(sd, entity_type, str(current))
+        by_event: dict[str, list] = {}
+        for p in default_process_registry.list_for_service(service_id):
+            if str(p.entity_type or "") != entity_type:
+                continue
+            by_event.setdefault(p.runtime_event_name, []).append(p)
+
+        actions: list[dict[str, Any]] = []
+        for edge in outgoing:
+            procs = by_event.get(edge.event_name) or []
+            process_name = procs[0].process_name if procs else None
+            context_builder = procs[0].context_builder if procs else None
+
+            instance: dict[str, Any] = {
+                "service_id": service_id,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "actor_id": actor_id or None,
+                "payload_json": merged_payload,
+            }
+
+            domain_context: dict[str, Any] = {}
+            context_error: Optional[str] = None
+            if context_builder is not None:
+                try:
+                    domain_context = context_builder(sd, None, {}, instance) or {}
+                except Exception as exc:  # noqa: BLE001
+                    context_error = f"CONTEXT_FAILED:{exc}"
+                    logger.warning(
+                        "available_actions context failed event=%s: %s",
+                        edge.event_name,
+                        exc,
+                    )
+
+            allowed = False
+            reason: Optional[str] = None
+            if context_error:
+                reason = context_error
+            elif edge.guard_name is None or str(edge.guard_name).strip() == "":
+                allowed = True
+            else:
+                guard_fn = default_guard_registry.get(
+                    service_id, str(edge.guard_name)
+                )
+                if guard_fn is None:
+                    reason = f"UNKNOWN_GUARD:{edge.guard_name}"
+                else:
+                    try:
+                        gr = normalize_guard_result(
+                            guard_fn(
+                                sd,
+                                None,
+                                domain_context,
+                                instance,
+                                edge.guard_params or {},
+                            )
+                        )
+                        allowed = bool(gr.ok)
+                        reason = gr.reason
+                    except Exception as exc:  # noqa: BLE001
+                        reason = f"GUARD_ERROR:{exc}"
+
+            actions.append(
+                {
+                    "transition_id": edge.id,
+                    "event_name": edge.event_name,
+                    "process_name": process_name,
+                    "from_state": edge.from_state,
+                    "to_state": edge.to_state,
+                    "guard_name": edge.guard_name,
+                    "priority": edge.priority,
+                    "allowed": allowed,
+                    "reason": reason,
+                }
+            )
+
+        return {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "current_state": str(current),
+            "actor_id": actor_id or None,
+            "actions": actions,
+        }
+    finally:
+        sp.close()
+        sd.close()

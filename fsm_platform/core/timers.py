@@ -18,6 +18,7 @@ def schedule_timer(
     fire_at: datetime,
     payload: Optional[dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    owner: str = "domain",
     db_layer: FsmDbLayer | None = None,
 ) -> int:
     """Планирует отложенный запуск процесса в fsm_timers. Возвращает id таймера для последующей отмены или трассировки."""
@@ -31,6 +32,7 @@ def schedule_timer(
         fire_at=fire_at,
         payload=payload,
         idempotency_key=idempotency_key,
+        owner=owner,
     )
 
 

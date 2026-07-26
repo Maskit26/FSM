@@ -378,6 +378,27 @@ class TransitionRunner:
             logger.exception("transition apply failed")
             return {"error": f"{FsmErrorCodes.APPLY_FAILED}: {exc}"}
 
+        # Декларативный timeout нового state (граф fsm_states.timeout_*).
+        try:
+            from fsm_platform.host.state_timeouts import reschedule_after_transition
+
+            reschedule_after_transition(
+                session_platform,
+                session_domain,
+                service_id=service_id,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                to_state=selected.to_state,
+                actor_id=user_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "state timeout reschedule failed entity=%s/%s state=%s",
+                entity_type,
+                entity_id,
+                selected.to_state,
+            )
+
         domain_context = {
             **(domain_context or {}),
             "from_state": selected.from_state,

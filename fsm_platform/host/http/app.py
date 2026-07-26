@@ -9,13 +9,13 @@ from pydantic import BaseModel, Field
 
 from fsm_platform.host.boot import boot
 from fsm_platform.host.http import request_runtime
-from fsm_platform.host.http.exchange_ws import router as exchange_ws_router
+from fsm_platform.host.http.events_ws import router as events_ws_router
 from fsm_platform.host.operations import default_operation_registry
 from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.core.registry import default_process_registry
 
 app = FastAPI(title="FSM Platform", version="0.1.0")
-app.include_router(exchange_ws_router)
+app.include_router(events_ws_router)
 
 
 class Actor(BaseModel):
@@ -156,6 +156,66 @@ def instance_status(service_id: str, instance_id: int) -> dict[str, Any]:
         if hasattr(v, "isoformat"):
             row[k] = v.isoformat()
     return row
+
+
+class ActionsBody(BaseModel):
+    """Тело POST .../entities/.../actions: actor + опциональный payload для guards."""
+
+    actor: Actor
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/v1/{service_id}/entities/{entity_type}/{entity_id}/actions")
+def entity_actions(
+    service_id: str,
+    entity_type: str,
+    entity_id: int,
+    body: ActionsBody,
+) -> dict[str, Any]:
+    """
+    Available actions: исходящие переходы + read-only прогон guards.
+    Фронт рисует кнопки по allowed/reason, без дублирования правил.
+    """
+    try:
+        return request_runtime.list_available_actions(
+            service_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            actor=body.actor.model_dump(),
+            payload=body.payload,
+        )
+    except Exception as exc:
+        raise HTTPException(500, detail=str(exc)) from exc
+
+
+@app.get("/v1/{service_id}/entities/{entity_type}/{entity_id}/history")
+def entity_history(
+    service_id: str,
+    entity_type: str,
+    entity_id: int,
+    limit: int = 50,
+    before_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Таймлайн сущности из fsm_transition_logs (поддержка / аудит)."""
+    return request_runtime.list_entity_history(
+        service_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        limit=limit,
+        before_id=before_id,
+    )
+
+
+@app.get("/v1/{service_id}/events")
+def list_events(
+    service_id: str,
+    after_id: int = 0,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Cursor-poll platform_events (id > after_id)."""
+    return request_runtime.list_platform_events(
+        service_id, after_id=after_id, limit=limit
+    )
 
 
 @app.post("/input/telegram/webhook")

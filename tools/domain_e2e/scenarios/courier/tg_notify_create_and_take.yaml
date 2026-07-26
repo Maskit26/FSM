@@ -31,7 +31,7 @@ steps:
     params:
       from_address: "Москва, ул. Тверская, д. 1"
       to_address: "Санкт-Петербург, Невский пр., д. 1"
-      cell_size: M
+      cell_size: S
       parcel_type: документы
       sender_delivery: courier
       recipient_delivery: courier

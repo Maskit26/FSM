@@ -125,6 +125,116 @@ class TransitionRepository:
             ).mappings().all()
         return [str(r["name"]) for r in rows]
 
+    def list_outgoing(
+        self,
+        session_domain: SessionLike,
+        entity_type: str,
+        from_state: str,
+    ) -> list[TransitionDef]:
+        """Все рёбра из from_state (без фильтра event) — для available actions."""
+        if self._has_table(session_domain, "fsm_events"):
+            sql = """
+                SELECT
+                    t.id,
+                    t.entity_type,
+                    fs.name AS from_state,
+                    ts.name AS to_state,
+                    e.name AS event_name,
+                    t.guard_name,
+                    t.guard_params,
+                    t.priority,
+                    t.effect_name,
+                    t.effect_params
+                FROM fsm_transitions t
+                JOIN fsm_states fs ON fs.id = t.from_state_id
+                JOIN fsm_states ts ON ts.id = t.to_state_id
+                JOIN fsm_events e ON e.id = t.event_id
+                WHERE t.entity_type = :entity_type
+                  AND fs.name = :from_state
+                ORDER BY e.name ASC, t.priority ASC, t.id ASC
+            """
+        else:
+            sql = """
+                SELECT
+                    t.id,
+                    t.entity_type,
+                    fs.name AS from_state,
+                    ts.name AS to_state,
+                    a.name AS event_name,
+                    t.guard_name,
+                    t.guard_params,
+                    t.priority,
+                    t.effect_name,
+                    t.effect_params
+                FROM fsm_transitions t
+                JOIN fsm_states fs ON fs.id = t.from_state_id
+                JOIN fsm_states ts ON ts.id = t.to_state_id
+                JOIN fsm_actions a ON a.id = t.action_id
+                WHERE t.entity_type = :entity_type
+                  AND fs.name = :from_state
+                ORDER BY a.name ASC, t.priority ASC, t.id ASC
+            """
+        rows = session_domain.execute(
+            text(sql),
+            {"entity_type": entity_type, "from_state": from_state},
+        ).mappings().all()
+        return [TransitionDef.from_row(dict(r)) for r in rows]
+
+    def get_state_timeout(
+        self,
+        session_domain: SessionLike,
+        entity_type: str,
+        state_name: str,
+    ) -> Optional[dict]:
+        """
+        Декларативный таймаут состояния из fsm_states (если колонки есть).
+        {timeout_seconds, timeout_event, timeout_owner} или None.
+        """
+        if not self._has_table(session_domain, "fsm_states"):
+            return None
+        if not self._has_column(session_domain, "fsm_states", "timeout_seconds"):
+            return None
+        has_etype = self._has_column(session_domain, "fsm_states", "entity_type")
+        has_owner = self._has_column(session_domain, "fsm_states", "timeout_owner")
+        has_event = self._has_column(session_domain, "fsm_states", "timeout_event")
+        if not has_event:
+            return None
+        cols = "timeout_seconds, timeout_event"
+        if has_owner:
+            cols += ", timeout_owner"
+        if has_etype:
+            sql = f"""
+                SELECT {cols} FROM fsm_states
+                WHERE name = :name AND entity_type = :entity_type
+                LIMIT 1
+            """
+            params = {"name": state_name, "entity_type": entity_type}
+        else:
+            sql = f"SELECT {cols} FROM fsm_states WHERE name = :name LIMIT 1"
+            params = {"name": state_name}
+        row = session_domain.execute(text(sql), params).mappings().fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        seconds = data.get("timeout_seconds")
+        event = data.get("timeout_event")
+        if seconds is None or not event:
+            return None
+        try:
+            sec = int(seconds)
+        except (TypeError, ValueError):
+            return None
+        if sec <= 0:
+            return None
+        owner = str(data.get("timeout_owner") or "domain").strip().lower()
+        if owner not in ("domain", "platform"):
+            owner = "domain"
+        return {
+            "timeout_seconds": sec,
+            "timeout_event": str(event).strip(),
+            "timeout_owner": owner,
+        }
+
     def list_transitions_for_event(
         self,
         session_domain: SessionLike,

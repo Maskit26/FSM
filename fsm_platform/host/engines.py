@@ -22,7 +22,10 @@ def get_platform_engine() -> Engine:
         url = os.environ.get("PLATFORM_DATABASE_URL") or os.environ.get("DATABASE_URL")
         if not url:
             raise RuntimeError("PLATFORM_DATABASE_URL (or DATABASE_URL) is not set")
-        _platform_engine = create_engine(url, pool_pre_ping=True)
+        # Хостинг часто даёт max_user_connections≈5 на юзера (API+worker делят лимит).
+        _platform_engine = create_engine(
+            url, pool_pre_ping=True, pool_size=1, max_overflow=0
+        )
         _platform_sessionmaker = sessionmaker(bind=_platform_engine, autoflush=False)
     return _platform_engine
 
@@ -36,7 +39,9 @@ def platform_session() -> Session:
 
 def register_domain_engine(service_id: str, url: str, **engine_kwargs: object) -> Engine:
     """Регистрирует domain engine для service_id. Нужен до любых domain_session вызовов."""
-    engine = create_engine(url, pool_pre_ping=True, **engine_kwargs)  # type: ignore[arg-type]
+    kwargs = {"pool_pre_ping": True, "pool_size": 1, "max_overflow": 0}
+    kwargs.update(engine_kwargs)
+    engine = create_engine(url, **kwargs)  # type: ignore[arg-type]
     _engine_by_service_id[service_id] = engine
     _sessionmaker_by_service_id[service_id] = sessionmaker(bind=engine, autoflush=False)
     return engine

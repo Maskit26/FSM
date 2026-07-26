@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS fsm_timers (
     status           VARCHAR(32)  NOT NULL DEFAULT 'SCHEDULED',
     payload_json     JSON         NULL,
     idempotency_key  VARCHAR(128) NULL,
+    owner            VARCHAR(16)  NOT NULL DEFAULT 'domain',
     created_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     cancelled_at     DATETIME     NULL,
     UNIQUE KEY uq_timer_idem (service_id, idempotency_key),

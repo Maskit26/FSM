@@ -263,17 +263,24 @@ class FsmDbLayer:
         fire_at: datetime,
         payload: Optional[dict[str, Any]] = None,
         idempotency_key: Optional[str] = None,
+        owner: str = "domain",
     ) -> int:
-        """Планирует отложенный запуск процесса в fsm_timers со статусом SCHEDULED. Возвращает id созданного таймера."""
+        """
+        Планирует отложенный запуск процесса в fsm_timers (SCHEDULED).
+        owner: domain | platform (чья политика таймера). Нужна миграция 006.
+        """
+        owner_n = str(owner or "domain").strip().lower()
+        if owner_n not in ("domain", "platform"):
+            owner_n = "domain"
         result = session.execute(
             text(
                 """
                 INSERT INTO fsm_timers
                     (service_id, entity_type, entity_id, process_name, fire_at,
-                     status, payload_json, idempotency_key, created_at)
+                     status, payload_json, idempotency_key, owner, created_at)
                 VALUES
                     (:service_id, :entity_type, :entity_id, :process_name, :fire_at,
-                     'SCHEDULED', :payload_json, :idempotency_key, UTC_TIMESTAMP())
+                     'SCHEDULED', :payload_json, :idempotency_key, :owner, UTC_TIMESTAMP())
                 """
             ),
             {
@@ -284,6 +291,7 @@ class FsmDbLayer:
                 "fire_at": fire_at,
                 "payload_json": json.dumps(payload) if payload is not None else None,
                 "idempotency_key": idempotency_key,
+                "owner": owner_n,
             },
         )
         return int(result.lastrowid)
@@ -1008,6 +1016,117 @@ class FsmDbLayer:
             },
         )
         return int(result.lastrowid)
+
+    def latest_event_id(
+        self, session: SessionLike, *, service_id: str
+    ) -> int:
+        """MAX(id) в platform_events для service (0 если пусто)."""
+        row = session.execute(
+            text(
+                """
+                SELECT COALESCE(MAX(id), 0) AS mid
+                FROM platform_events
+                WHERE service_id = :service_id
+                """
+            ),
+            {"service_id": service_id},
+        ).mappings().fetchone()
+        return int((row or {}).get("mid") or 0)
+
+    def list_events_after(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        after_id: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """События platform_events с id > after_id (для WS/poll fan-out)."""
+        rows = session.execute(
+            text(
+                """
+                SELECT id, service_id, event_type, instance_id,
+                       entity_type, entity_id, payload_json,
+                       correlation_id, client_request_id, created_at
+                FROM platform_events
+                WHERE service_id = :service_id
+                  AND id > :after_id
+                ORDER BY id ASC
+                LIMIT :limit
+                """
+            ),
+            {
+                "service_id": service_id,
+                "after_id": int(after_id),
+                "limit": int(max(1, min(limit, 500))),
+            },
+        ).mappings().all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.get("payload_json")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item["payload"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    item["payload"] = {}
+            elif isinstance(raw, dict):
+                item["payload"] = raw
+            else:
+                item["payload"] = {}
+            item.pop("payload_json", None)
+            created = item.get("created_at")
+            if hasattr(created, "isoformat"):
+                item["created_at"] = created.isoformat()
+            out.append(item)
+        return out
+
+    def list_transition_logs(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        entity_type: str,
+        entity_id: int,
+        limit: int = 50,
+        before_id: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """История переходов сущности из fsm_transition_logs (новые сверху)."""
+        params: dict[str, Any] = {
+            "service_id": service_id,
+            "entity_type": entity_type,
+            "entity_id": int(entity_id),
+            "limit": int(max(1, min(limit, 200))),
+        }
+        before_sql = ""
+        if before_id is not None:
+            before_sql = "AND id < :before_id"
+            params["before_id"] = int(before_id)
+        rows = session.execute(
+            text(
+                f"""
+                SELECT id, service_id, entity_type, entity_id,
+                       from_state, to_state, event_name, transition_id,
+                       instance_id, user_id, created_at
+                FROM fsm_transition_logs
+                WHERE service_id = :service_id
+                  AND entity_type = :entity_type
+                  AND entity_id = :entity_id
+                  {before_sql}
+                ORDER BY id DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            created = item.get("created_at")
+            if hasattr(created, "isoformat"):
+                item["created_at"] = created.isoformat()
+            out.append(item)
+        return out
 
     # --- fsm_sagas ---
 

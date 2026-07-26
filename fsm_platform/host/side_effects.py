@@ -19,8 +19,9 @@ def schedule_timer(
     fire_at: datetime,
     payload: Optional[dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    owner: str = "domain",
 ) -> int:
-    """Планирует таймер FSM на platform. По срабатыванию можно снова enqueue процесс."""
+    """Планирует таймер FSM на platform. owner=domain|platform."""
     return _schedule_timer(
         session_platform,
         service_id=service_id,
@@ -30,6 +31,7 @@ def schedule_timer(
         fire_at=fire_at,
         payload=payload,
         idempotency_key=idempotency_key,
+        owner=owner,
     )
 
 

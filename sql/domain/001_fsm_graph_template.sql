@@ -2,10 +2,13 @@
 -- Adjust entity_type / names for your domain. Platform does NOT own this DB.
 
 CREATE TABLE IF NOT EXISTS fsm_states (
-    id          BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    entity_type VARCHAR(128) NOT NULL,
-    name        VARCHAR(128) NOT NULL,
-    is_initial  TINYINT(1)   NOT NULL DEFAULT 0,
+    id               BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    entity_type      VARCHAR(128) NOT NULL,
+    name             VARCHAR(128) NOT NULL,
+    timeout_seconds  INT          NULL,
+    timeout_event    VARCHAR(128) NULL,
+    timeout_owner    VARCHAR(16)  NULL DEFAULT 'domain',
+    is_initial       TINYINT(1)   NOT NULL DEFAULT 0,
     UNIQUE KEY uq_state (entity_type, name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
