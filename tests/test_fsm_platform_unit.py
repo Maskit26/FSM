@@ -52,7 +52,8 @@ class _MemStateStore:
     def __init__(self, states: dict[tuple[str, str, int], str]):
         self.states = dict(states)
 
-    def get(self, _sp, service_id, entity_type, entity_id):
+    def get(self, _sp, service_id, entity_type, entity_id, *, for_update: bool = False):
+        _ = for_update
         return self.states.get((service_id, entity_type, int(entity_id)))
 
 
@@ -235,3 +236,130 @@ def test_transition_runner_companion_fail_returns_failed():
     assert result.new_state == "FAILED"
     assert FsmErrorCodes.COMPANION_FAILED in (result.last_error or "")
     assert FsmErrorCodes.ENTITY_STATE_NOT_FOUND in (result.last_error or "")
+# --- Block 0: CAS / race tests ---
+
+class _CasDbLayer:
+    """In-memory db_layer stub for TransitionExecutor CAS tests."""
+
+    def __init__(self, state: str):
+        self.state = state
+        self.cas_calls: list[tuple[str, str]] = []
+        self.logs: list[dict] = []
+
+    def get_entity_state(self, _sp, service_id, entity_type, entity_id, *, for_update=False):
+        _ = (service_id, entity_type, entity_id, for_update)
+        return self.state
+
+    def cas_entity_state(
+        self, _sp, service_id, entity_type, entity_id, *, from_state, to_state
+    ):
+        _ = (service_id, entity_type, entity_id)
+        self.cas_calls.append((from_state, to_state))
+        if self.state != from_state:
+            return False
+        self.state = to_state
+        return True
+
+    def insert_transition_log(self, _sp, **kwargs):
+        self.logs.append(kwargs)
+
+    def insert_transition_log_idempotent(self, _sp, **kwargs):
+        self.logs.append(kwargs)
+        return True
+
+
+def test_transition_executor_cas_success():
+    from fsm_platform.core.transition_executor import TransitionExecutor
+    from fsm_platform.core.types import TransitionDef
+
+    db = _CasDbLayer("A")
+    ex = TransitionExecutor(db_layer=db)
+    tr = TransitionDef(
+        id=1,
+        entity_type="order",
+        from_state="A",
+        to_state="B",
+        event_name="go",
+    )
+    ex.apply(
+        None,
+        service_id="svc",
+        entity_type="order",
+        entity_id=1,
+        transition=tr,
+        event_name="go",
+        instance_id=10,
+    )
+    assert db.state == "B"
+    assert db.cas_calls == [("A", "B")]
+    assert len(db.logs) == 1
+
+
+def test_transition_executor_cas_race_loses():
+    from fsm_platform.core.errors import FsmErrorCodes
+    from fsm_platform.core.transition_executor import (
+        TransitionApplyError,
+        TransitionExecutor,
+    )
+    from fsm_platform.core.types import TransitionDef
+
+    db = _CasDbLayer("A")
+
+    # Simulate concurrent winner: state moves before our CAS.
+    class _RaceDb(_CasDbLayer):
+        def cas_entity_state(self, *a, **k):
+            self.state = "C"  # other worker won
+            return False
+
+    race = _RaceDb("A")
+    ex = TransitionExecutor(db_layer=race)
+    tr = TransitionDef(
+        id=2,
+        entity_type="order",
+        from_state="A",
+        to_state="B",
+        event_name="go",
+    )
+    try:
+        ex.apply(
+            None,
+            service_id="svc",
+            entity_type="order",
+            entity_id=1,
+            transition=tr,
+            event_name="go",
+            instance_id=11,
+        )
+        assert False, "expected TransitionApplyError"
+    except TransitionApplyError as exc:
+        assert exc.code == FsmErrorCodes.STATE_MISMATCH
+    assert race.state == "C"
+    assert race.logs == []
+
+
+def test_transition_executor_idempotent_already_to_state():
+    from fsm_platform.core.transition_executor import TransitionExecutor
+    from fsm_platform.core.types import TransitionDef
+
+    db = _CasDbLayer("B")
+    ex = TransitionExecutor(db_layer=db)
+    tr = TransitionDef(
+        id=3,
+        entity_type="order",
+        from_state="A",
+        to_state="B",
+        event_name="go",
+    )
+    ex.apply(
+        None,
+        service_id="svc",
+        entity_type="order",
+        entity_id=1,
+        transition=tr,
+        event_name="go",
+        instance_id=12,
+        allow_idempotent=True,
+    )
+    assert db.state == "B"
+    assert db.cas_calls == []
+    assert len(db.logs) == 1

@@ -25,16 +25,22 @@ class FsmDbLayer:
         service_id: str,
         entity_type: str,
         entity_id: int,
+        *,
+        for_update: bool = False,
     ) -> Optional[str]:
-        """Возвращает текущее FSM-состояние сущности из entity_fsm_state. Используется перед переходом и при проверке согласованности."""
+        """Возвращает текущее FSM-состояние сущности из entity_fsm_state.
+        for_update=True — SELECT … FOR UPDATE (сериализация apply по сущности).
+        """
+        lock = " FOR UPDATE" if for_update else ""
         row = session.execute(
             text(
-                """
+                f"""
                 SELECT current_state
                 FROM entity_fsm_state
                 WHERE service_id = :service_id
                   AND entity_type = :entity_type
                   AND entity_id = :entity_id
+                {lock}
                 """
             ),
             {
@@ -53,7 +59,9 @@ class FsmDbLayer:
         entity_id: int,
         current_state: str,
     ) -> None:
-        """Создаёт или обновляет запись состояния сущности (INSERT … ON DUPLICATE KEY UPDATE). Вызывается после успешного применения перехода."""
+        """Создаёт или обновляет запись состояния сущности (INSERT … ON DUPLICATE KEY UPDATE).
+        Для переходов FSM используй cas_entity_state — upsert безусловен и гонкоопасен.
+        """
         session.execute(
             text(
                 """
@@ -73,6 +81,42 @@ class FsmDbLayer:
                 "current_state": current_state,
             },
         )
+
+    def cas_entity_state(
+        self,
+        session: SessionLike,
+        service_id: str,
+        entity_type: str,
+        entity_id: int,
+        *,
+        from_state: str,
+        to_state: str,
+    ) -> bool:
+        """
+        Атомарно: current_state = from_state → to_state.
+        True только если строка обновлена (CAS успешен).
+        """
+        result = session.execute(
+            text(
+                """
+                UPDATE entity_fsm_state
+                SET current_state = :to_state,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE service_id = :service_id
+                  AND entity_type = :entity_type
+                  AND entity_id = :entity_id
+                  AND current_state = :from_state
+                """
+            ),
+            {
+                "service_id": service_id,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "from_state": from_state,
+                "to_state": to_state,
+            },
+        )
+        return int(result.rowcount or 0) == 1
 
     def insert_entity_state_initial(
         self,
@@ -267,7 +311,7 @@ class FsmDbLayer:
                   AND fire_at <= UTC_TIMESTAMP()
                 ORDER BY fire_at ASC
                 LIMIT :limit
-                FOR UPDATE
+                FOR UPDATE SKIP LOCKED
                 """
             ),
             {"limit": int(limit)},
@@ -485,6 +529,178 @@ class FsmDbLayer:
                 "payload_json": json.dumps(payload or {}),
             },
         )
+
+    def claim_pending_reconcile(
+        self, session: SessionLike, *, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """PENDING reconcile → PROCESSING (FOR UPDATE SKIP LOCKED)."""
+        rows = session.execute(
+            text(
+                """
+                SELECT id, service_id, instance_id, entity_type, entity_id,
+                       from_state, to_state, event_name, transition_id,
+                       payload_json, attempts
+                FROM platform_reconcile_queue
+                WHERE status = 'PENDING'
+                ORDER BY id ASC
+                LIMIT :lim
+                FOR UPDATE SKIP LOCKED
+                """
+            ),
+            {"lim": int(limit)},
+        ).mappings().all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            session.execute(
+                text(
+                    """
+                    UPDATE platform_reconcile_queue
+                    SET status = 'PROCESSING',
+                        attempts = attempts + 1,
+                        updated_at = UTC_TIMESTAMP()
+                    WHERE id = :id AND status = 'PENDING'
+                    """
+                ),
+                {"id": int(item["id"])},
+            )
+            raw = item.get("payload_json")
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    item["payload"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    item["payload"] = {}
+            elif isinstance(raw, dict):
+                item["payload"] = raw
+            else:
+                item["payload"] = {}
+            out.append(item)
+        return out
+
+    def mark_reconcile_done(self, session: SessionLike, reconcile_id: int) -> None:
+        """Успешный докат platform."""
+        session.execute(
+            text(
+                """
+                UPDATE platform_reconcile_queue
+                SET status = 'DONE',
+                    done_at = UTC_TIMESTAMP(),
+                    last_error = NULL,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                """
+            ),
+            {"id": int(reconcile_id)},
+        )
+
+    def mark_reconcile_retry(
+        self,
+        session: SessionLike,
+        reconcile_id: int,
+        *,
+        error: str,
+        dead: bool = False,
+    ) -> None:
+        """Ошибка доката → PENDING (retry) или DEAD."""
+        status = "DEAD" if dead else "PENDING"
+        session.execute(
+            text(
+                """
+                UPDATE platform_reconcile_queue
+                SET status = :status,
+                    last_error = :err,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": int(reconcile_id),
+                "status": status,
+                "err": (error or "")[:2000],
+            },
+        )
+
+    # --- idempotency_keys ---
+
+    def get_idempotency(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        scope: str,
+        key: str,
+    ) -> Optional[dict[str, Any]]:
+        """Lookup Idempotency-Key. None если нет или истёк."""
+        row = session.execute(
+            text(
+                """
+                SELECT service_id, scope, `key`, instance_id, response_json,
+                       created_at, expires_at
+                FROM idempotency_keys
+                WHERE service_id = :service_id
+                  AND scope = :scope
+                  AND `key` = :key
+                  AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "service_id": service_id,
+                "scope": scope,
+                "key": key,
+            },
+        ).mappings().first()
+        if row is None:
+            return None
+        item = dict(row)
+        raw = item.get("response_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                item["response"] = json.loads(raw)
+            except json.JSONDecodeError:
+                item["response"] = {}
+        elif isinstance(raw, dict):
+            item["response"] = raw
+        else:
+            item["response"] = {}
+        return item
+
+    def put_idempotency(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        scope: str,
+        key: str,
+        response: dict[str, Any],
+        instance_id: Optional[int] = None,
+        ttl_hours: int = 24,
+    ) -> bool:
+        """
+        Сохраняет ответ для повтора. True если вставлено, False если ключ уже был
+        (INSERT IGNORE — гонка двух одинаковых запросов).
+        """
+        result = session.execute(
+            text(
+                """
+                INSERT IGNORE INTO idempotency_keys
+                    (service_id, scope, `key`, instance_id, response_json,
+                     created_at, expires_at)
+                VALUES
+                    (:service_id, :scope, :key, :instance_id, :response_json,
+                     UTC_TIMESTAMP(),
+                     DATE_ADD(UTC_TIMESTAMP(), INTERVAL :ttl HOUR))
+                """
+            ),
+            {
+                "service_id": service_id,
+                "scope": scope,
+                "key": key,
+                "instance_id": instance_id,
+                "response_json": json.dumps(response or {}),
+                "ttl": int(ttl_hours),
+            },
+        )
+        return int(result.rowcount or 0) > 0
 
     # --- platform_outbox / platform_events ---
 

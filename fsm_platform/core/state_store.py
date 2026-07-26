@@ -20,9 +20,19 @@ class EntityStateStore:
         service_id: str,
         entity_type: str,
         entity_id: int,
+        *,
+        for_update: bool = False,
     ) -> Optional[str]:
-        """Возвращает текущее состояние сущности или None, если запись не найдена. Вызывается перед выбором кандидатов перехода."""
-        return self._db.get_entity_state(session, service_id, entity_type, entity_id)
+        """Возвращает текущее состояние сущности или None.
+        for_update=True — блокирует строку до конца транзакции (сериализация apply).
+        """
+        return self._db.get_entity_state(
+            session,
+            service_id,
+            entity_type,
+            entity_id,
+            for_update=for_update,
+        )
 
     def set(
         self,
@@ -35,4 +45,24 @@ class EntityStateStore:
         """Upsert текущего состояния сущности в платформенной БД. Используется при инициализации и ручной установке состояния."""
         self._db.upsert_entity_state(
             session, service_id, entity_type, entity_id, current_state
+        )
+
+    def cas(
+        self,
+        session: SessionLike,
+        service_id: str,
+        entity_type: str,
+        entity_id: int,
+        *,
+        from_state: str,
+        to_state: str,
+    ) -> bool:
+        """CAS current_state: from_state → to_state. True при успехе."""
+        return self._db.cas_entity_state(
+            session,
+            service_id,
+            entity_type,
+            entity_id,
+            from_state=from_state,
+            to_state=to_state,
         )

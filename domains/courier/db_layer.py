@@ -260,8 +260,41 @@ def insert_order(
     return int(result.lastrowid)
 
 
-def update_order_status(session: Session, order_id: int, status: str) -> None:
-    """Обновляет бизнес-статус заказа в таблице orders. Нужен для синхронизации с FSM."""
+def update_order_status(
+    session: Session,
+    order_id: int,
+    status: str,
+    *,
+    expected_from: Optional[str] = None,
+) -> bool:
+    """
+    Обновляет orders.status. При expected_from — CAS (WHERE status = expected_from).
+    Если статус уже равен target — True (идемпотентно).
+    Без expected_from — слепой UPDATE (legacy); предпочтительно передавать from.
+    """
+    target = str(status)
+    if expected_from is not None:
+        exp = str(expected_from)
+        if exp == target:
+            return True
+        result = session.execute(
+            text(
+                """
+                UPDATE orders
+                SET status = :status, updated_at = UTC_TIMESTAMP()
+                WHERE id = :id AND status = :expected_from
+                """
+            ),
+            {"id": order_id, "status": target, "expected_from": exp},
+        )
+        if int(result.rowcount or 0) == 1:
+            return True
+        row = session.execute(
+            text("SELECT status FROM orders WHERE id = :id"),
+            {"id": order_id},
+        ).fetchone()
+        return row is not None and str(row[0]) == target
+
     session.execute(
         text(
             """
@@ -270,8 +303,9 @@ def update_order_status(session: Session, order_id: int, status: str) -> None:
             WHERE id = :id
             """
         ),
-        {"id": order_id, "status": status},
+        {"id": order_id, "status": target},
     )
+    return True
 
 
 def get_order(session: Session, order_id: int) -> Optional[dict[str, Any]]:
@@ -790,8 +824,41 @@ def open_locker_cell(
     return int(result.rowcount or 0) == 1
 
 
-def set_cell_status(session: Session, cell_id: int, status: str) -> bool:
-    """Пишет locker_cells.status = status (зеркало entity_fsm_state после companion)."""
+def set_cell_status(
+    session: Session,
+    cell_id: int,
+    status: str,
+    *,
+    expected_from: Optional[str] = None,
+) -> bool:
+    """
+    Пишет locker_cells.status (зеркало entity_fsm_state после companion).
+    При expected_from — CAS; уже target → True.
+    """
+    target = str(status)
+    if expected_from is not None:
+        exp = str(expected_from)
+        if exp == target:
+            return True
+        result = session.execute(
+            text(
+                """
+                UPDATE locker_cells
+                SET status = :status,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :cell_id AND status = :expected_from
+                """
+            ),
+            {"cell_id": cell_id, "status": target, "expected_from": exp},
+        )
+        if int(result.rowcount or 0) == 1:
+            return True
+        row = session.execute(
+            text("SELECT status FROM locker_cells WHERE id = :id"),
+            {"id": cell_id},
+        ).fetchone()
+        return row is not None and str(row[0]) == target
+
     result = session.execute(
         text(
             """
@@ -801,7 +868,7 @@ def set_cell_status(session: Session, cell_id: int, status: str) -> bool:
             WHERE id = :cell_id
             """
         ),
-        {"cell_id": cell_id, "status": status},
+        {"cell_id": cell_id, "status": target},
     )
     return int(result.rowcount or 0) == 1
 

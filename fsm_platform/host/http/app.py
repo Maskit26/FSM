@@ -115,7 +115,6 @@ def enqueue(
     Ставит FSM-процесс в очередь для существующей сущности.
     Worker потом заберёт PENDING-инстанс и прогонит переход.
     """
-    _ = idempotency_key  # v1: store later
     if not default_process_registry.has(service_id, body.process_name):
         raise HTTPException(400, detail=f"UNKNOWN_PROCESS: {body.process_name}")
     try:
@@ -127,6 +126,7 @@ def enqueue(
             entity_id=body.entity_id,
             payload=body.payload,
             actor_id=uid,
+            idempotency_key=idempotency_key,
         )
     except LookupError as exc:
         raise HTTPException(400, detail=str(exc)) from exc

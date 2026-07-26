@@ -38,7 +38,11 @@ class TransitionExecutor:
         instance_id: Optional[int] = None,
         allow_idempotent: bool = False,
     ) -> None:
-        """Проверяет from_state, upsert to_state и вставляет fsm_transition_logs. При allow_idempotent допускает повторное применение уже достигнутого to_state."""
+        """
+        CAS from_state → to_state + лог перехода.
+        Ожидает, что строка entity_fsm_state уже залочена FOR UPDATE (см. runner).
+        При allow_idempotent: current == to_state → успех без повторного CAS.
+        """
         current = self._db.get_entity_state(
             session_platform, service_id, entity_type, entity_id
         )
@@ -70,13 +74,22 @@ class TransitionExecutor:
                 f"expected={transition.from_state} actual={current}",
             )
 
-        self._db.upsert_entity_state(
+        ok = self._db.cas_entity_state(
             session_platform,
             service_id,
             entity_type,
             entity_id,
-            transition.to_state,
+            from_state=transition.from_state,
+            to_state=transition.to_state,
         )
+        if not ok:
+            actual = self._db.get_entity_state(
+                session_platform, service_id, entity_type, entity_id
+            )
+            raise TransitionApplyError(
+                FsmErrorCodes.STATE_MISMATCH,
+                f"cas_failed expected={transition.from_state} actual={actual}",
+            )
 
         if instance_id is not None and allow_idempotent:
             self._db.insert_transition_log_idempotent(

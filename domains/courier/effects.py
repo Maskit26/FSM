@@ -42,6 +42,22 @@ def _service_id(instance: dict[str, Any]) -> str:
     return str(instance.get("service_id") or "svc_courier_01")
 
 
+def _cas_order_status(
+    session_domain, order_id: int, to_state: str, context: Optional[dict[str, Any]]
+) -> Optional[str]:
+    """CAS orders.status. None = ok, иначе error code."""
+    expected = (context or {}).get("from_state")
+    ok = db_layer.update_order_status(
+        session_domain,
+        order_id,
+        str(to_state),
+        expected_from=str(expected) if expected is not None else None,
+    )
+    if not ok:
+        return "ORDER_STATUS_CAS_FAILED"
+    return None
+
+
 def _notify_order_progress(
     session_domain,
     db,
@@ -87,7 +103,9 @@ def sync_order_status(session_domain, db, context, instance, effect_params) -> E
             return EffectResult(ok=False, error="ORDER_NOT_FOUND")
         return EffectResult(ok=True, payload={"skipped": True, "reason": "no_to_state"})
 
-    db_layer.update_order_status(session_domain, order_id, str(to_state))
+    cas_err = _cas_order_status(session_domain, order_id, str(to_state), context)
+    if cas_err:
+        return EffectResult(ok=False, error=cas_err)
     _notify_order_progress(
         session_domain,
         db,
@@ -146,7 +164,9 @@ def assign_executor_effect(session_domain, db, context, instance, effect_params)
         to_state = (
             "order_courier1_assigned" if leg == "pickup" else "order_courier2_assigned"
         )
-    db_layer.update_order_status(session_domain, order_id, str(to_state))
+    cas_err = _cas_order_status(session_domain, order_id, str(to_state), ctx)
+    if cas_err:
+        return EffectResult(ok=False, error=cas_err)
     _notify_order_progress(
         session_domain,
         db,
@@ -198,7 +218,9 @@ def remove_executor_effect(session_domain, db, context, instance, effect_params)
     to_state = ctx.get("to_state") or params.get("to_state")
     if not to_state:
         to_state = "order_created" if leg == "pickup" else "order_arrived_at_post2"
-    db_layer.update_order_status(session_domain, order_id, str(to_state))
+    cas_err = _cas_order_status(session_domain, order_id, str(to_state), ctx)
+    if cas_err:
+        return EffectResult(ok=False, error=cas_err)
     return EffectResult(
         ok=True,
         payload={
@@ -229,7 +251,9 @@ def open_cell_effect(session_domain, db, context, instance, effect_params) -> Ef
     to_state = ctx.get("to_state") or params.get("to_state")
     if not to_state:
         return EffectResult(ok=False, error="TO_STATE_REQUIRED")
-    db_layer.update_order_status(session_domain, order_id, str(to_state))
+    cas_err = _cas_order_status(session_domain, order_id, str(to_state), ctx)
+    if cas_err:
+        return EffectResult(ok=False, error=cas_err)
     _notify_order_progress(
         session_domain,
         db,
@@ -286,11 +310,17 @@ def sync_locker_cell_status(
     ctx = context or {}
     cell_id = ctx.get("applied_entity_id") or ctx.get("cell_id")
     to_state = ctx.get("to_state")
+    from_state = ctx.get("from_state")
     if not cell_id:
         return EffectResult(ok=False, error="CELL_MISSING")
     if not to_state:
         return EffectResult(ok=False, error="TO_STATE_REQUIRED")
-    ok = db_layer.set_cell_status(session_domain, int(cell_id), str(to_state))
+    ok = db_layer.set_cell_status(
+        session_domain,
+        int(cell_id),
+        str(to_state),
+        expected_from=str(from_state) if from_state is not None else None,
+    )
     if not ok:
         return EffectResult(ok=False, error="SYNC_LOCKER_STATUS_FAILED")
     return EffectResult(

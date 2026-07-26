@@ -260,13 +260,25 @@ def enqueue_instance(
     entity_id: int,
     payload: Optional[dict[str, Any]] = None,
     actor_id: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Кладёт PENDING-инстанс FSM в очередь для уже существующей сущности.
     Сущность должна уже иметь строку в entity_fsm_state.
+    При idempotency_key — повтор возвращает сохранённый ответ без второго instance.
     """
     sp = platform_session()
     try:
+        key = (idempotency_key or "").strip() or None
+        if key:
+            existing = default_db_layer.get_idempotency(
+                sp, service_id=service_id, scope="enqueue", key=key
+            )
+            if existing is not None:
+                resp = existing.get("response") or {}
+                if isinstance(resp, dict) and resp.get("instance_id") is not None:
+                    return resp
+
         state = default_db_layer.get_entity_state(sp, service_id, entity_type, entity_id)
         if state is None:
             raise LookupError("ENTITY_STATE_NOT_FOUND")
@@ -279,13 +291,32 @@ def enqueue_instance(
             payload=payload or {},
             actor_id=actor_id,
         )
-        sp.commit()
-        return {
+        response = {
             "instance_id": instance_id,
             "status": "PENDING",
             "service_id": service_id,
             "status_url": f"/v1/{service_id}/fsm/instances/{instance_id}",
         }
+        if key:
+            inserted = default_db_layer.put_idempotency(
+                sp,
+                service_id=service_id,
+                scope="enqueue",
+                key=key,
+                response=response,
+                instance_id=instance_id,
+            )
+            if not inserted:
+                # Гонка: другой запрос успел записать ключ — отдаём его ответ.
+                sp.rollback()
+                again = default_db_layer.get_idempotency(
+                    sp, service_id=service_id, scope="enqueue", key=key
+                )
+                if again and isinstance(again.get("response"), dict):
+                    return again["response"]
+                raise RuntimeError("IDEM_RACE_UNRESOLVED")
+        sp.commit()
+        return response
     except Exception:
         sp.rollback()
         raise

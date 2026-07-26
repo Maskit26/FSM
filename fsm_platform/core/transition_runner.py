@@ -281,8 +281,13 @@ class TransitionRunner:
         Возвращает dict с selected / domain_context / effect_payload или error.
         """
         _ = role
+        # FOR UPDATE: сериализация двух инстансов одной сущности до конца tx.
         current_state = self._state_store.get(
-            session_platform, service_id, entity_type, entity_id
+            session_platform,
+            service_id,
+            entity_type,
+            entity_id,
+            for_update=True,
         )
         if current_state is None:
             return {
