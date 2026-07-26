@@ -168,45 +168,329 @@ def find_nearest_free_cell(
     return scored[0][1]
 
 
-def reserve_cell_for_order(
+def reserve_cell_for_request(
     session: Session,
     cell_id: int,
-    order_id: int,
+    request_id: int,
 ) -> bool:
     """
-    Атомарно: locker_free → locker_reserved + current_order_id.
-    Возвращает True только если CAS успешен (ячейка была свободна).
+    Атомарно: locker_free → locker_reserved + current_request_id (без order).
+    True только если CAS успешен.
     """
     result = session.execute(
         text(
             """
             UPDATE locker_cells
             SET status = 'locker_reserved',
-                current_order_id = :order_id,
+                current_request_id = :request_id,
+                current_order_id = NULL,
                 updated_at = UTC_TIMESTAMP()
             WHERE id = :cell_id
               AND status = 'locker_free'
             """
         ),
-        {"cell_id": cell_id, "order_id": order_id},
+        {"cell_id": int(cell_id), "request_id": int(request_id)},
     )
     return int(result.rowcount or 0) == 1
 
 
-def reserve_and_bind_cells(
+def insert_order_request(
     session: Session,
-    order_id: int,
+    *,
+    client_user_id: int,
     source_cell_id: int,
     dest_cell_id: int,
-) -> None:
+    from_address: str,
+    to_address: str,
+    cell_size: str,
+    parcel_type: str,
+    pickup_type: str,
+    delivery_type: str,
+    recipient_user_id: Optional[int],
+    ttl_minutes: int = 15,
+) -> int:
+    """Создаёт order_requests PENDING — hold до create_order. Заказа ещё нет."""
+    expires_at = datetime.utcnow() + timedelta(minutes=int(ttl_minutes))
+    result = session.execute(
+        text(
+            """
+            INSERT INTO order_requests
+                (client_user_id, recipient_user_id, parcel_type, cell_size,
+                 sender_delivery, recipient_delivery, status,
+                 from_address, to_address, source_cell_id, dest_cell_id,
+                 expires_at, created_at)
+            VALUES
+                (:client_user_id, :recipient_user_id, :parcel_type, :cell_size,
+                 :sender_delivery, :recipient_delivery, 'PENDING',
+                 :from_address, :to_address, :source_cell_id, :dest_cell_id,
+                 :expires_at, UTC_TIMESTAMP())
+            """
+        ),
+        {
+            "client_user_id": int(client_user_id),
+            "recipient_user_id": recipient_user_id,
+            "parcel_type": parcel_type,
+            "cell_size": cell_size,
+            "sender_delivery": pickup_type,
+            "recipient_delivery": delivery_type,
+            "from_address": from_address,
+            "to_address": to_address,
+            "source_cell_id": int(source_cell_id),
+            "dest_cell_id": int(dest_cell_id),
+            "expires_at": expires_at,
+        },
+    )
+    return int(result.lastrowid)
+
+
+def get_order_request(session: Session, request_id: int) -> Optional[dict[str, Any]]:
+    """Строка order_requests (+ поля hold) по id."""
+    row = session.execute(
+        text(
+            """
+            SELECT id, client_user_id, status,
+                   source_cell_id, dest_cell_id,
+                   from_address, to_address, cell_size, parcel_type,
+                   sender_delivery, recipient_delivery, recipient_user_id,
+                   order_id, error_code, error_message,
+                   expires_at, created_at
+            FROM order_requests
+            WHERE id = :rid
+            """
+        ),
+        {"rid": int(request_id)},
+    ).mappings().fetchone()
+    if row is None:
+        return None
+    data = dict(row)
+    # Единые имена для create_order / guards (как pickup_type/delivery_type в orders).
+    data["pickup_type"] = data.get("sender_delivery")
+    data["delivery_type"] = data.get("recipient_delivery")
+    return data
+
+
+def cell_bound_to_request(session: Session, cell_id: int, request_id: int) -> bool:
+    """True если ячейка reserved под этот order_request."""
+    row = session.execute(
+        text(
+            """
+            SELECT id FROM locker_cells
+            WHERE id = :cell_id
+              AND current_request_id = :request_id
+              AND status = 'locker_reserved'
+            """
+        ),
+        {"cell_id": int(cell_id), "request_id": int(request_id)},
+    ).fetchone()
+    return row is not None
+
+
+def request_cells_ready(session: Session, request_id: int) -> bool:
+    """Обе ячейки заявки зарезервированы под request_id."""
+    req = get_order_request(session, int(request_id))
+    if req is None:
+        return False
+    src = req.get("source_cell_id")
+    dst = req.get("dest_cell_id")
+    if not src or not dst:
+        return False
+    return cell_bound_to_request(
+        session, int(src), int(request_id)
+    ) and cell_bound_to_request(session, int(dst), int(request_id))
+
+
+def mark_request_completed(
+    session: Session, request_id: int, order_id: int
+) -> bool:
+    """PENDING → COMPLETED + order_id."""
+    result = session.execute(
+        text(
+            """
+            UPDATE order_requests
+            SET status = 'COMPLETED',
+                order_id = :order_id,
+                error_code = NULL,
+                error_message = NULL
+            WHERE id = :rid AND status = 'PENDING'
+            """
+        ),
+        {"rid": int(request_id), "order_id": int(order_id)},
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def mark_request_failed(
+    session: Session,
+    request_id: int,
+    *,
+    error_code: str,
+    error_message: str = "",
+) -> bool:
+    """PENDING → FAILED."""
+    result = session.execute(
+        text(
+            """
+            UPDATE order_requests
+            SET status = 'FAILED',
+                error_code = :error_code,
+                error_message = :error_message
+            WHERE id = :rid AND status = 'PENDING'
+            """
+        ),
+        {
+            "rid": int(request_id),
+            "error_code": str(error_code)[:100],
+            "error_message": str(error_message)[:2000],
+        },
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def bind_request_cells_to_order(
+    session: Session,
+    request_id: int,
+    order_id: int,
+) -> bool:
     """
-    Резервирует две ячейки под заказ (sync helper).
-    Для create_order используйте FSM locker_reserve_cell.
+    Привязывает уже reserved-под-request ячейки к order_id.
+    current_request_id → NULL, current_order_id = order_id.
+    True только если обновлены ровно 2 ячейки.
     """
-    ok_src = reserve_cell_for_order(session, source_cell_id, order_id)
-    ok_dst = reserve_cell_for_order(session, dest_cell_id, order_id)
-    if not (ok_src and ok_dst):
-        raise RuntimeError("failed to reserve both cells")
+    result = session.execute(
+        text(
+            """
+            UPDATE locker_cells
+            SET current_order_id = :order_id,
+                current_request_id = NULL,
+                updated_at = UTC_TIMESTAMP()
+            WHERE current_request_id = :request_id
+              AND status = 'locker_reserved'
+            """
+        ),
+        {"request_id": int(request_id), "order_id": int(order_id)},
+    )
+    return int(result.rowcount or 0) == 2
+
+
+def release_cells_for_request(session: Session, request_id: int) -> list[int]:
+    """Освобождает ячейки, bound к order_request. Возвращает list cell_id."""
+    rows = session.execute(
+        text(
+            """
+            SELECT id FROM locker_cells
+            WHERE current_request_id = :request_id
+            """
+        ),
+        {"request_id": int(request_id)},
+    ).fetchall()
+    cell_ids = [int(r[0]) for r in rows]
+    if not cell_ids:
+        return []
+    session.execute(
+        text(
+            """
+            UPDATE locker_cells
+            SET status = 'locker_free',
+                current_request_id = NULL,
+                current_order_id = NULL,
+                updated_at = UTC_TIMESTAMP()
+            WHERE current_request_id = :request_id
+            """
+        ),
+        {"request_id": int(request_id)},
+    )
+    return cell_ids
+
+
+def abort_order_request(
+    session: Session,
+    request_id: int,
+    *,
+    error_code: str = "REQUEST_FAILED",
+    error_message: str = "",
+) -> list[int]:
+    """Провал/истечение заявки: free cells + FAILED. Возвращает освобождённые cell_id."""
+    released = release_cells_for_request(session, int(request_id))
+    mark_request_failed(
+        session,
+        int(request_id),
+        error_code=error_code,
+        error_message=error_message,
+    )
+    return released
+
+
+def is_request_expired(req: dict[str, Any]) -> bool:
+    """True если expires_at уже в прошлом (сравнение в naive UTC)."""
+    exp = req.get("expires_at")
+    if exp is None:
+        return False
+    if isinstance(exp, datetime):
+        return exp.replace(tzinfo=None) <= datetime.utcnow()
+    return False
+
+
+def cell_bound_to_order(session: Session, cell_id: int, order_id: int) -> bool:
+    """True если ячейка reserved/occupied и current_order_id = order_id."""
+    row = session.execute(
+        text(
+            """
+            SELECT id FROM locker_cells
+            WHERE id = :cell_id
+              AND current_order_id = :order_id
+              AND status IN ('locker_reserved', 'locker_occupied', 'locker_opened')
+            """
+        ),
+        {"cell_id": int(cell_id), "order_id": int(order_id)},
+    ).fetchone()
+    return row is not None
+
+
+def release_cell_if_bound_to_order(
+    session: Session, cell_id: int, order_id: int
+) -> bool:
+    """
+    CAS: ячейка bound к order → locker_free, current_order_id=NULL.
+    True если строка обновлена.
+    """
+    result = session.execute(
+        text(
+            """
+            UPDATE locker_cells
+            SET status = 'locker_free',
+                current_order_id = NULL,
+                current_request_id = NULL,
+                updated_at = UTC_TIMESTAMP()
+            WHERE id = :cell_id
+              AND current_order_id = :order_id
+              AND status IN (
+                  'locker_reserved', 'locker_occupied', 'locker_opened',
+                  'locker_parcel_confirmed'
+              )
+            """
+        ),
+        {"cell_id": int(cell_id), "order_id": int(order_id)},
+    )
+    return int(result.rowcount or 0) == 1
+
+
+def release_cells_for_order(session: Session, order_id: int) -> list[int]:
+    """
+    Освобождает source/dest ячейки заказа, если они bound к нему.
+    Возвращает список освобождённых cell_id.
+    """
+    order = get_order(session, int(order_id))
+    if order is None:
+        return []
+    released: list[int] = []
+    for key in ("source_cell_id", "dest_cell_id"):
+        raw = order.get(key)
+        if not raw:
+            continue
+        cid = int(raw)
+        if release_cell_if_bound_to_order(session, cid, int(order_id)):
+            released.append(cid)
+    return released
 
 
 def insert_order(

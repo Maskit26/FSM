@@ -23,8 +23,8 @@ defaults:
 
 steps:
   # ========== заказ 1: self / self (POST2 → POST1) ==========
-  - name: create_order_self
-    operation: create_order
+  - name: create_order_request_self
+    operation: create_order_request
     actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
     params:
       from_address: "Санкт-Петербург, Невский пр., д. 1"
@@ -37,13 +37,24 @@ steps:
     expect:
       status_code: 200
       body:
+        data.status: PENDING
+    capture: { request_self: data.request_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: create_order_self
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
+    params:
+      request_id: "{{request_self}}"
+    expect:
+      status_code: 200
+      body:
         data.status: order_created
         data.pickup_type: self
         data.delivery_type: self
     capture:
       order_id_self: data.order_id
-    wait_instance: true
-    expect_instance: { status: COMPLETED }
 
   - name: request_pin_client
     operation: request_locker_access_code
@@ -69,8 +80,8 @@ steps:
     expect_instance: { status: COMPLETED }
 
   # ========== заказ 2: courier / courier (POST4 → POST3) ==========
-  - name: create_order_courier
-    operation: create_order
+  - name: create_order_request_courier
+    operation: create_order_request
     actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
     params:
       from_address: "Санкт-Петербург, Лиговский пр., д. 1"
@@ -83,13 +94,24 @@ steps:
     expect:
       status_code: 200
       body:
+        data.status: PENDING
+    capture: { request_courier: data.request_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: create_order_courier
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
+    params:
+      request_id: "{{request_courier}}"
+    expect:
+      status_code: 200
+      body:
         data.status: order_created
         data.pickup_type: courier
         data.delivery_type: courier
     capture:
       order_id_courier: data.order_id
-    wait_instance: true
-    expect_instance: { status: COMPLETED }
 
   - name: list_courier_exchange
     operation: list_courier_exchange

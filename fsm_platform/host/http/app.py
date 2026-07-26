@@ -57,6 +57,20 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/v1/metrics")
+def metrics() -> dict[str, Any]:
+    """
+    Снимок очередей platform: instances / outbox / reconcile / timers.
+    Для алертов: pending lag, failed_1h, outbox.dead, reconcile.dead.
+    """
+    from fsm_platform.host.metrics import collect_platform_metrics
+
+    try:
+        return {"status": "ok", **collect_platform_metrics()}
+    except Exception as exc:
+        raise HTTPException(503, detail=f"METRICS_UNAVAILABLE: {exc}") from exc
+
+
 @app.get("/v1/{service_id}/catalog")
 def catalog(service_id: str) -> dict[str, Any]:
     """Каталог операций и процессов домена. Удобно смотреть, что доступно в Swagger."""

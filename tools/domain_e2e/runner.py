@@ -142,7 +142,8 @@ def run_step(
             if errors:
                 break
     elif wait_instance and not instance_ids:
-        errors.append("wait_instance set but response has no instance_id(s)")
+        # Sync command без enqueue (напр. create_order bind по request_id).
+        pass
 
     ok = not errors
     return StepResult(

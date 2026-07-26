@@ -25,8 +25,8 @@ defaults:
   poll_interval: 0.5
 
 steps:
-  - name: create_order_courier
-    operation: create_order
+  - name: create_order_request_courier
+    operation: create_order_request
     actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
     params:
       from_address: "Москва, ул. Тверская, д. 1"
@@ -39,13 +39,24 @@ steps:
     expect:
       status_code: 200
       body:
+        data.status: PENDING
+    capture: { request_courier: data.request_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: create_order_courier
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
+    params:
+      request_id: "{{request_courier}}"
+    expect:
+      status_code: 200
+      body:
         data.status: order_created
         data.pickup_type: courier
         data.delivery_type: courier
     capture:
       order_id: data.order_id
-    wait_instance: true
-    expect_instance: { status: COMPLETED }
 
   - name: list_courier_exchange
     operation: list_courier_exchange

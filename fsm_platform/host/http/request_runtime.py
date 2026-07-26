@@ -95,16 +95,18 @@ def _bootstrap_and_maybe_enqueue(
                 "related_entities require entity_type and entity_id"
             )
         r_id_int = int(r_id)
+        if not r_initial:
+            raise ValueError("related_entities.initial_state required")
         r_existing = default_db_layer.get_entity_state(
             sp, service_id, str(r_type), r_id_int
         )
         if r_existing is None:
-            if not r_initial:
-                raise ValueError(
-                    "related_entities.initial_state required when "
-                    "entity_fsm_state is missing"
-                )
             default_db_layer.insert_entity_state_initial(
+                sp, service_id, str(r_type), r_id_int, str(r_initial)
+            )
+        elif str(r_existing) != str(r_initial):
+            # Sync command уже изменил domain (напр. create_order bind / hold consume).
+            default_db_layer.upsert_entity_state(
                 sp, service_id, str(r_type), r_id_int, str(r_initial)
             )
 

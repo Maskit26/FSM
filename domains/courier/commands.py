@@ -31,16 +31,12 @@ def _opt_float(params: dict[str, Any], key: str) -> Optional[float]:
     return float(raw)
 
 
-def create_order(
-    domain_session,
-    params: dict[str, Any],
-    actor: dict[str, Any],
-    platform_session=None,
+def create_order_request(
+    domain_session, params: dict[str, Any], actor: dict[str, Any]
 ) -> dict[str, Any]:
     """
-    Создаёт заказ: ищет свободные ячейки, пишет orders и stage_orders.
-    Резерв ячеек — FSM process locker_reserve (locker_free → locker_reserved).
-    Клиент берётся из actor.actor_id.
+    Шаг 1: найти свободные ячейки, создать order_requests (PENDING, без orders),
+    enqueue FSM locker_reserve под request_id.
     """
     try:
         client_user_id = int((actor or {}).get("actor_id") or 0)
@@ -51,9 +47,7 @@ def create_order(
 
     from_address = _require_str(params, "from_address")
     to_address = _require_str(params, "to_address")
-
     cell_size = db_layer.normalize_cell_size(domain_session, params.get("cell_size"))
-
     parcel_type = _require_str(params, "parcel_type")
     pickup_type = _delivery_to_type(params.get("sender_delivery"), field="sender_delivery")
     delivery_type = _delivery_to_type(
@@ -93,6 +87,147 @@ def create_order(
     src_id = int(source["cell_id"])
     dst_id = int(dest["cell_id"])
 
+    request_id = db_layer.insert_order_request(
+        domain_session,
+        client_user_id=client_user_id,
+        source_cell_id=src_id,
+        dest_cell_id=dst_id,
+        from_address=from_address,
+        to_address=to_address,
+        cell_size=cell_size,
+        parcel_type=parcel_type,
+        pickup_type=pickup_type,
+        delivery_type=delivery_type,
+        recipient_user_id=recipient_user_id,
+    )
+
+    return {
+        "entity_type": "order_request",
+        "entity_id": request_id,
+        "initial_state": "PENDING",
+        "related_entities": [
+            {
+                "entity_type": "locker",
+                "entity_id": src_id,
+                "initial_state": "locker_free",
+            },
+            {
+                "entity_type": "locker",
+                "entity_id": dst_id,
+                "initial_state": "locker_free",
+            },
+        ],
+        "enqueues": [
+            {
+                "entity_type": "locker",
+                "entity_id": src_id,
+                "process_name": "locker_reserve",
+                "payload": {
+                    "request_id": request_id,
+                    "cell_role": "source",
+                    "source": "create_order_request",
+                },
+            },
+            {
+                "entity_type": "locker",
+                "entity_id": dst_id,
+                "process_name": "locker_reserve",
+                "payload": {
+                    "request_id": request_id,
+                    "cell_role": "dest",
+                    "source": "create_order_request",
+                },
+            },
+        ],
+        "data": {
+            "request_id": request_id,
+            "status": "PENDING",
+            "from_address": from_address,
+            "to_address": to_address,
+            "source_cell_id": src_id,
+            "dest_cell_id": dst_id,
+            "source_locker_id": int(source["locker_id"]),
+            "dest_locker_id": int(dest["locker_id"]),
+            "source_city": source.get("city"),
+            "dest_city": dest.get("city"),
+            "pickup_type": pickup_type,
+            "delivery_type": delivery_type,
+        },
+    }
+
+
+def create_order(
+    domain_session,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    platform_session=None,
+) -> dict[str, Any]:
+    """
+    Шаг 2: создать заказ по готовому request_id (order_requests.id).
+
+    Ячейки уже locker_reserved через FSM; здесь bind
+    (current_request_id → current_order_id). Нет заявки / не ready →
+    DomainError, order_id клиенту не отдаём.
+    """
+    try:
+        client_user_id = int((actor or {}).get("actor_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actor.actor_id required") from exc
+    if not client_user_id:
+        raise ValueError("actor.actor_id required")
+
+    raw = params.get("request_id")
+    if raw in (None, ""):
+        raise DomainError(
+            "REQUEST_ID_REQUIRED",
+            "Сначала create_order_request, затем create_order(request_id)",
+        )
+    request_id = int(raw)
+
+    req = db_layer.get_order_request(domain_session, request_id)
+    if req is None:
+        raise DomainError("REQUEST_NOT_FOUND", f"order_request {request_id} not found")
+    if int(req.get("client_user_id") or 0) != client_user_id:
+        raise DomainError("REQUEST_NOT_OWNER", "заявка принадлежит другому клиенту")
+
+    status = str(req.get("status") or "")
+    if status == "COMPLETED":
+        raise DomainError(
+            "REQUEST_ALREADY_USED", f"request {request_id} уже COMPLETED"
+        )
+    if status == "FAILED":
+        raise DomainError("REQUEST_FAILED", f"request {request_id} FAILED")
+    if db_layer.is_request_expired(req):
+        released = db_layer.abort_order_request(
+            domain_session,
+            request_id,
+            error_code="REQUEST_EXPIRED",
+            error_message="request expired",
+        )
+        raise DomainError(
+            "REQUEST_EXPIRED",
+            f"request {request_id} истёк; освобождено ячеек: {len(released)}",
+        )
+    if status != "PENDING":
+        raise DomainError("REQUEST_INVALID", f"request status={status}")
+    if not db_layer.request_cells_ready(domain_session, request_id):
+        raise DomainError(
+            "REQUEST_NOT_READY",
+            "Ячейки ещё не зарезервированы (дождитесь locker_reserve)",
+        )
+
+    src_id = int(req["source_cell_id"])
+    dst_id = int(req["dest_cell_id"])
+    from_address = str(req["from_address"])
+    to_address = str(req["to_address"])
+    cell_size = str(req["cell_size"])
+    parcel_type = str(req["parcel_type"])
+    pickup_type = str(req["pickup_type"])
+    delivery_type = str(req["delivery_type"])
+    recipient_user_id = req.get("recipient_user_id")
+    if recipient_user_id is not None:
+        recipient_user_id = int(recipient_user_id)
+
     description = f"{parcel_type} ({cell_size})"
     order_id = db_layer.insert_order(
         domain_session,
@@ -108,6 +243,16 @@ def create_order(
         dest_cell_id=dst_id,
     )
 
+    if not db_layer.bind_request_cells_to_order(domain_session, request_id, order_id):
+        raise DomainError(
+            "BIND_REQUEST_FAILED",
+            f"Не удалось привязать ячейки request #{request_id} к заказу",
+        )
+    if not db_layer.mark_request_completed(domain_session, request_id, order_id):
+        raise DomainError(
+            "REQUEST_COMPLETE_FAILED", f"request {request_id} COMPLETED failed"
+        )
+
     db_layer.create_stage_order(domain_session, order_id, "pickup")
     db_layer.create_stage_order(domain_session, order_id, "delivery")
 
@@ -122,65 +267,40 @@ def create_order(
             platform_session=platform_session,
         )
 
-    # Ячейки резервирует FSM locker_reserve_cell (effect), не SQL в command.
-    locker_bootstrap = [
-        {
-            "entity_type": "locker",
-            "entity_id": src_id,
-            "initial_state": "locker_free",
-        },
-        {
-            "entity_type": "locker",
-            "entity_id": dst_id,
-            "initial_state": "locker_free",
-        },
-    ]
-    reserve_jobs = [
-        {
-            "entity_type": "locker",
-            "entity_id": src_id,
-            "initial_state": "locker_free",
-            "process_name": "locker_reserve",
-            "payload": {
-                "order_id": order_id,
-                "cell_role": "source",
-                "source": "create_order",
-            },
-        },
-        {
-            "entity_type": "locker",
-            "entity_id": dst_id,
-            "initial_state": "locker_free",
-            "process_name": "locker_reserve",
-            "payload": {
-                "order_id": order_id,
-                "cell_role": "dest",
-                "source": "create_order",
-            },
-        },
-    ]
-
     return {
         "entity_type": "order",
         "entity_id": order_id,
         "initial_state": "order_created",
-        "related_entities": locker_bootstrap,
-        "enqueues": reserve_jobs,
+        "related_entities": [
+            {
+                "entity_type": "locker",
+                "entity_id": src_id,
+                "initial_state": "locker_reserved",
+            },
+            {
+                "entity_type": "locker",
+                "entity_id": dst_id,
+                "initial_state": "locker_reserved",
+            },
+            {
+                "entity_type": "order_request",
+                "entity_id": request_id,
+                "initial_state": "COMPLETED",
+            },
+        ],
         "data": {
             "order_id": order_id,
+            "request_id": request_id,
             "status": "order_created",
             "from_address": from_address,
             "to_address": to_address,
             "source_cell_id": src_id,
             "dest_cell_id": dst_id,
-            "source_locker_id": int(source["locker_id"]),
-            "dest_locker_id": int(dest["locker_id"]),
-            "source_city": source.get("city"),
-            "dest_city": dest.get("city"),
             "pickup_type": pickup_type,
             "delivery_type": delivery_type,
         },
     }
+
 
 
 def take_courier_order(

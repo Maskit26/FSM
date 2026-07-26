@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS server_fsm_instances (
     entity_id            BIGINT       NOT NULL,
     status               VARCHAR(32)  NOT NULL DEFAULT 'PENDING',
     attempts             INT          NOT NULL DEFAULT 0,
+    next_attempt_at      DATETIME     NULL,
     last_error           TEXT         NULL,
     payload_json         JSON         NULL,
     actor_id             BIGINT       NULL,
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS server_fsm_instances (
     started_at           DATETIME     NULL,
     finished_at          DATETIME     NULL,
     KEY idx_instances_status_id (status, id),
-    KEY idx_instances_service (service_id)
+    KEY idx_instances_service (service_id),
+    KEY idx_instances_claim (status, next_attempt_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS entity_fsm_state (

@@ -22,9 +22,9 @@ defaults:
   poll_interval: 0.5
 
 steps:
-  # --- клиент: создать заказ (self) ---
-  - name: create_order
-    operation: create_order
+  # --- клиент: hold ячеек → создать заказ (self) ---
+  - name: create_order_request
+    operation: create_order_request
     actor:
       actor_type: user
       actor_id: "{{client_id}}"
@@ -39,13 +39,28 @@ steps:
     expect:
       status_code: 200
       body:
+        data.status: PENDING
+    capture:
+      request_id: data.request_id
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: create_order
+    operation: create_order
+    actor:
+      actor_type: user
+      actor_id: "{{client_id}}"
+      channel: api
+    params:
+      request_id: "{{request_id}}"
+    expect:
+      status_code: 200
+      body:
         data.status: order_created
         data.pickup_type: self
     capture:
       order_id: data.order_id
       source_cell_id: data.source_cell_id
-    wait_instance: true
-    expect_instance: { status: COMPLETED }
 
   - name: list_client_orders
     operation: list_client_orders

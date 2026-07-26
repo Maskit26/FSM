@@ -2,7 +2,7 @@
 -- Справочники НЕ трогаем: users, lockers, строки locker_cells, граф fsm_*.
 --
 -- Схема locker_cells (importable dump):
---   id, locker_id, cell_code, cell_type, status, current_order_id, created_at, updated_at
+--   id, locker_id, cell_code, cell_type, status, current_order_id, current_request_id, …
 --
 -- После CALL — обязательно platform: sql/platform/003_clear_test_runtime.sql
 
@@ -19,11 +19,13 @@ BEGIN
     DELETE FROM trips;
 
     DELETE FROM orders;
+    DELETE FROM order_requests;
 
     UPDATE locker_cells
     SET
         status = 'locker_free',
         current_order_id = NULL,
+        current_request_id = NULL,
         updated_at = UTC_TIMESTAMP();
 END;;
 DELIMITER ;

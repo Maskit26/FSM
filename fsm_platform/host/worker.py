@@ -12,10 +12,12 @@ from typing import Any, Optional
 
 from fsm_platform import run_instance
 from fsm_platform.core.db_layer import default_db_layer
+from fsm_platform.core.registry import default_process_registry
 from fsm_platform.core.sagas import on_child_terminal
 from fsm_platform.core.types import FsmResult
 from fsm_platform.host import side_effects
 from fsm_platform.host.engines import domain_session, platform_session
+from fsm_platform.host.retry_policy import backoff_seconds, should_retry
 
 logger = logging.getLogger(__name__)
 
@@ -65,15 +67,84 @@ def _fire_due_timers(*, limit: int = 20) -> bool:
         sp.close()
 
 
-def _failed_short_tx(instance: dict[str, Any], last_error: str) -> None:
+def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
+    """ProcessDef.on_failed — domain recovery после терминального FAILED."""
+    service_id = str(instance["service_id"])
+    process_name = str(instance.get("process_name") or "")
+    process_def = default_process_registry.get(service_id, process_name)
+    if process_def is None or process_def.on_failed is None:
+        return
+
+    sp = platform_session()
+    sd = None
+    try:
+        sd = domain_session(service_id)
+        db = {"platform": sp, "domain": sd}
+        process_def.on_failed(sp, sd, db, instance, last_error or "")
+        sd.commit()
+        sp.commit()
+    except Exception:
+        if sd is not None:
+            try:
+                sd.rollback()
+            except Exception:
+                pass
+        try:
+            sp.rollback()
+        except Exception:
+            pass
+        logger.exception(
+            "on_failed handler crashed process=%s instance_id=%s",
+            process_name,
+            instance.get("id"),
+        )
+    finally:
+        if sd is not None:
+            sd.close()
+        sp.close()
+
+
+def _finish_failure(instance: dict[str, Any], last_error: str) -> None:
     """
-    Короткая отдельная транзакция при FAILED: помечает инстанс и пишет событие.
-    Нужна, чтобы ошибка зафиксировалась даже после rollback основной работы.
+    Retry (PENDING + backoff) или терминальный FAILED + event + on_failed.
+    Domain/platform рабочие tx уже откачены.
     """
+    err = last_error or "FAILED"
+    attempts_after = int(instance.get("attempts") or 0) + 1
+
+    if should_retry(err, attempts_after=attempts_after):
+        delay = backoff_seconds(attempts_after)
+        sp = platform_session()
+        try:
+            default_db_layer.mark_instance_retry(
+                sp,
+                int(instance["id"]),
+                last_error=err,
+                attempts=attempts_after,
+                backoff_seconds=delay,
+            )
+            sp.commit()
+            logger.warning(
+                "instance RETRY id=%s attempts=%s backoff=%ss err=%s",
+                instance.get("id"),
+                attempts_after,
+                delay,
+                err[:300],
+            )
+        except Exception:
+            sp.rollback()
+            logger.exception(
+                "mark_instance_retry failed instance_id=%s", instance.get("id")
+            )
+            raise
+        finally:
+            sp.close()
+        return
+
     sp = platform_session()
     try:
         default_db_layer.mark_instance_failed(
-            sp, int(instance["id"]), last_error or ""
+            sp, int(instance["id"]), err, attempts=attempts_after
         )
         side_effects.emit_event(
             sp,
@@ -82,13 +153,13 @@ def _failed_short_tx(instance: dict[str, Any], last_error: str) -> None:
             instance_id=int(instance["id"]),
             entity_type=instance.get("entity_type"),
             entity_id=instance.get("entity_id"),
-            payload={"last_error": last_error},
+            payload={"last_error": err, "attempts": attempts_after},
         )
         on_child_terminal(
             sp,
             instance_id=int(instance["id"]),
             status="FAILED",
-            last_error=last_error or "",
+            last_error=err,
         )
         sp.commit()
     except Exception:
@@ -97,6 +168,8 @@ def _failed_short_tx(instance: dict[str, Any], last_error: str) -> None:
         raise
     finally:
         sp.close()
+
+    _call_on_failed(instance, err)
 
 
 def _enqueue_reconcile(
@@ -192,7 +265,7 @@ def process_one() -> bool:
                 sd.rollback()
                 sp.rollback()
                 logger.exception("domain commit failed instance_id=%s", instance["id"])
-                _failed_short_tx(instance, "DOMAIN_COMMIT_FAILED")
+                _finish_failure(instance, "DOMAIN_COMMIT_FAILED")
                 return True
             try:
                 sp.commit()
@@ -208,7 +281,7 @@ def process_one() -> bool:
 
         sd.rollback()
         sp.rollback()
-        _failed_short_tx(instance, result.last_error or "FAILED")
+        _finish_failure(instance, result.last_error or "FAILED")
         return True
     except Exception as exc:
         logger.exception("process_one crashed instance_id=%s", instance.get("id"))
@@ -218,7 +291,7 @@ def process_one() -> bool:
             sp.rollback()
         except Exception:
             pass
-        _failed_short_tx(instance, f"WORKER_CRASH: {exc}")
+        _finish_failure(instance, f"WORKER_CRASH: {exc}")
         return True
     finally:
         if sd is not None:

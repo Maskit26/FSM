@@ -19,6 +19,7 @@ from domains.courier.commands import (
     complete_trip,
     confirm_courier2_delivery,
     create_order,
+    create_order_request,
     open_cell,
     remove_executor,
     request_locker_access_code,
@@ -79,6 +80,9 @@ def register_all(service_id: str) -> None:
     Назначение/снятие/открытие/закрытие — процессы assign/remove/open/close_cell;
     цепочки задаются guard_params на рёбрах графа.
     """
+    default_operation_registry.register(
+        service_id, "create_order_request", "command", create_order_request
+    )
     default_operation_registry.register(
         service_id, "create_order", "command", create_order
     )
@@ -229,6 +233,8 @@ def register_all(service_id: str) -> None:
             initial_state="reservation_active",
         )
     )
+    from domains.courier.recovery import on_locker_reserve_failed
+
     default_process_registry.register(
         ProcessDef(
             service_id=service_id,
@@ -237,6 +243,7 @@ def register_all(service_id: str) -> None:
             event_name="locker_reserve_cell",
             context_builder=build_locker_context,
             initial_state="locker_free",
+            on_failed=on_locker_reserve_failed,
         )
     )
     default_process_registry.register(

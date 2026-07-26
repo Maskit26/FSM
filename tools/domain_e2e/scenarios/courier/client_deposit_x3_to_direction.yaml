@@ -18,8 +18,8 @@ defaults:
 
 steps:
   # ========== заказ 1 (S) ==========
-  - name: create_order_1
-    operation: create_order
+  - name: create_order_request_1
+    operation: create_order_request
     actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
     params:
       from_address: "Москва, ул. Тверская, д. 10"
@@ -30,12 +30,23 @@ steps:
       recipient_delivery: self
     expect:
       status_code: 200
+      body:
+        data.status: PENDING
+    capture: { request_1: data.request_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: create_order_1
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
+    params:
+      request_id: "{{request_1}}"
+    expect:
+      status_code: 200
       body: { data.status: order_created }
     capture:
       order_id_1: data.order_id
       cell_1: data.source_cell_id
-    wait_instance: true
-    expect_instance: { status: COMPLETED }
 
   - name: request_pin_1
     operation: request_locker_access_code
@@ -61,8 +72,8 @@ steps:
     expect_instance: { status: COMPLETED }
 
   # ========== заказ 2 (M) ==========
-  - name: create_order_2
-    operation: create_order
+  - name: create_order_request_2
+    operation: create_order_request
     actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
     params:
       from_address: "Москва, ул. Тверская, д. 10"
@@ -73,12 +84,23 @@ steps:
       recipient_delivery: self
     expect:
       status_code: 200
+      body:
+        data.status: PENDING
+    capture: { request_2: data.request_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: create_order_2
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
+    params:
+      request_id: "{{request_2}}"
+    expect:
+      status_code: 200
       body: { data.status: order_created }
     capture:
       order_id_2: data.order_id
       cell_2: data.source_cell_id
-    wait_instance: true
-    expect_instance: { status: COMPLETED }
 
   - name: request_pin_2
     operation: request_locker_access_code
@@ -104,8 +126,8 @@ steps:
     expect_instance: { status: COMPLETED }
 
   # ========== заказ 3 (L) ==========
-  - name: create_order_3
-    operation: create_order
+  - name: create_order_request_3
+    operation: create_order_request
     actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
     params:
       from_address: "Москва, ул. Тверская, д. 10"
@@ -116,12 +138,23 @@ steps:
       recipient_delivery: self
     expect:
       status_code: 200
+      body:
+        data.status: PENDING
+    capture: { request_3: data.request_id }
+    wait_instance: true
+    expect_instance: { status: COMPLETED }
+
+  - name: create_order_3
+    operation: create_order
+    actor: { actor_type: user, actor_id: "{{client_id}}", channel: api }
+    params:
+      request_id: "{{request_3}}"
+    expect:
+      status_code: 200
       body: { data.status: order_created }
     capture:
       order_id_3: data.order_id
       cell_3: data.source_cell_id
-    wait_instance: true
-    expect_instance: { status: COMPLETED }
 
   - name: request_pin_3
     operation: request_locker_access_code

@@ -82,6 +82,31 @@ class FsmDbLayer:
             },
         )
 
+    def delete_entity_state(
+        self,
+        session: SessionLike,
+        service_id: str,
+        entity_type: str,
+        entity_id: int,
+    ) -> bool:
+        """Удаляет строку entity_fsm_state. True если была удалена."""
+        result = session.execute(
+            text(
+                """
+                DELETE FROM entity_fsm_state
+                WHERE service_id = :service_id
+                  AND entity_type = :entity_type
+                  AND entity_id = :entity_id
+                """
+            ),
+            {
+                "service_id": service_id,
+                "entity_type": entity_type,
+                "entity_id": int(entity_id),
+            },
+        )
+        return int(result.rowcount or 0) > 0
+
     def cas_entity_state(
         self,
         session: SessionLike,
@@ -421,7 +446,7 @@ class FsmDbLayer:
     def claim_pending_instance(
         self, session: SessionLike
     ) -> Optional[dict[str, Any]]:
-        """Атомарно захватывает старейший PENDING-экземпляр (FOR UPDATE SKIP LOCKED) и переводит в PROCESSING. Вызывается воркером при опросе очереди."""
+        """Атомарно захватывает старейший due PENDING (FOR UPDATE SKIP LOCKED) → PROCESSING."""
         row = session.execute(
             text(
                 """
@@ -429,6 +454,8 @@ class FsmDbLayer:
                        status, attempts, payload_json, actor_id
                 FROM server_fsm_instances
                 WHERE status = 'PENDING'
+                  AND (next_attempt_at IS NULL
+                       OR next_attempt_at <= UTC_TIMESTAMP())
                 ORDER BY id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -460,7 +487,8 @@ class FsmDbLayer:
                 """
                 UPDATE server_fsm_instances
                 SET status = 'COMPLETED', finished_at = UTC_TIMESTAMP(),
-                    updated_at = UTC_TIMESTAMP(), last_error = NULL
+                    updated_at = UTC_TIMESTAMP(), last_error = NULL,
+                    next_attempt_at = NULL
                 WHERE id = :id
                 """
             ),
@@ -468,21 +496,140 @@ class FsmDbLayer:
         )
 
     def mark_instance_failed(
-        self, session: SessionLike, instance_id: int, last_error: str
+        self,
+        session: SessionLike,
+        instance_id: int,
+        last_error: str,
+        *,
+        attempts: Optional[int] = None,
     ) -> None:
-        """Помечает экземпляр FAILED, сохраняет last_error и увеличивает attempts. Применяется при ошибке контекста, guard, effect или apply."""
+        """Терминальный FAILED. attempts — итоговое значение; иначе attempts+1."""
+        if attempts is None:
+            session.execute(
+                text(
+                    """
+                    UPDATE server_fsm_instances
+                    SET status = 'FAILED', last_error = :err,
+                        finished_at = UTC_TIMESTAMP(),
+                        updated_at = UTC_TIMESTAMP(),
+                        attempts = attempts + 1,
+                        next_attempt_at = NULL
+                    WHERE id = :id
+                    """
+                ),
+                {"id": instance_id, "err": (last_error or "")[:2000]},
+            )
+            return
         session.execute(
             text(
                 """
                 UPDATE server_fsm_instances
                 SET status = 'FAILED', last_error = :err,
-                    finished_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP(),
-                    attempts = attempts + 1
+                    finished_at = UTC_TIMESTAMP(),
+                    updated_at = UTC_TIMESTAMP(),
+                    attempts = :attempts,
+                    next_attempt_at = NULL
                 WHERE id = :id
                 """
             ),
-            {"id": instance_id, "err": (last_error or "")[:2000]},
+            {
+                "id": instance_id,
+                "err": (last_error or "")[:2000],
+                "attempts": int(attempts),
+            },
         )
+
+    def mark_instance_retry(
+        self,
+        session: SessionLike,
+        instance_id: int,
+        *,
+        last_error: str,
+        attempts: int,
+        backoff_seconds: int,
+    ) -> None:
+        """Возвращает инстанс в PENDING с next_attempt_at (временная ошибка)."""
+        session.execute(
+            text(
+                """
+                UPDATE server_fsm_instances
+                SET status = 'PENDING',
+                    last_error = :err,
+                    attempts = :attempts,
+                    next_attempt_at = DATE_ADD(
+                        UTC_TIMESTAMP(), INTERVAL :backoff SECOND
+                    ),
+                    finished_at = NULL,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": int(instance_id),
+                "err": (last_error or "")[:2000],
+                "attempts": int(attempts),
+                "backoff": int(backoff_seconds),
+            },
+        )
+
+    def list_pending_instances(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        process_name: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """PENDING-инстансы сервиса (опц. фильтр process_name). Для domain recovery."""
+        params: dict[str, Any] = {
+            "service_id": service_id,
+            "lim": int(limit),
+        }
+        proc_sql = ""
+        if process_name:
+            proc_sql = "AND process_name = :process_name"
+            params["process_name"] = process_name
+        rows = session.execute(
+            text(
+                f"""
+                SELECT id, service_id, process_name, entity_type, entity_id,
+                       status, attempts, payload_json, actor_id
+                FROM server_fsm_instances
+                WHERE service_id = :service_id
+                  AND status = 'PENDING'
+                  {proc_sql}
+                ORDER BY id ASC
+                LIMIT :lim
+                """
+            ),
+            params,
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def mark_instance_cancelled(
+        self,
+        session: SessionLike,
+        instance_id: int,
+        *,
+        last_error: str = "CANCELLED",
+    ) -> bool:
+        """PENDING|PROCESSING → CANCELLED. True если строка обновлена."""
+        result = session.execute(
+            text(
+                """
+                UPDATE server_fsm_instances
+                SET status = 'CANCELLED',
+                    last_error = :err,
+                    finished_at = UTC_TIMESTAMP(),
+                    updated_at = UTC_TIMESTAMP(),
+                    next_attempt_at = NULL
+                WHERE id = :id
+                  AND status IN ('PENDING', 'PROCESSING')
+                """
+            ),
+            {"id": int(instance_id), "err": (last_error or "CANCELLED")[:2000]},
+        )
+        return int(result.rowcount or 0) == 1
 
     # --- platform_reconcile_queue ---
 

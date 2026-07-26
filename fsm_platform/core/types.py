@@ -46,6 +46,10 @@ class EffectResult:
     payload: Optional[dict[str, Any]] = None
 
 
+# (session_platform, session_domain, db, instance, last_error) -> None
+OnFailedHandler = Callable[..., None]
+
+
 @dataclass
 class ProcessDef:
     """Декларация FSM-процесса: привязка к service_id, сущности, событию и context_builder."""
@@ -56,6 +60,7 @@ class ProcessDef:
     event_name: Optional[str] = None
     context_builder: Optional[ContextBuilder] = None
     initial_state: Optional[str] = None
+    on_failed: Optional[OnFailedHandler] = None
 
     @property
     def runtime_event_name(self) -> str:

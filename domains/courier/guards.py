@@ -698,8 +698,7 @@ def can_reserve_locker_cell(
     session_domain, db, context, instance, guard_params
 ) -> GuardResult:
     """
-    Резерв ячейки под заказ: ячейка свободна в домене и привязана к order
-    как source или dest (order_id в payload / context).
+    Резерв ячейки под order_request: свободна и указана в заявке (source/dest).
     """
     _ = db
     _ = session_domain
@@ -714,18 +713,23 @@ def can_reserve_locker_cell(
     if status != "locker_free":
         return GuardResult(ok=False, reason=f"CELL_NOT_FREE:{status or 'none'}")
 
-    order_id = ctx.get("order_id")
-    order = ctx.get("order")
-    if not order_id or order is None:
-        return GuardResult(ok=False, reason="ORDER_REQUIRED")
+    request_id = ctx.get("request_id")
+    req = ctx.get("order_request")
+    if not request_id or req is None:
+        return GuardResult(ok=False, reason="REQUEST_REQUIRED")
 
-    src = order.get("source_cell_id")
-    dst = order.get("dest_cell_id")
+    if str(req.get("status") or "") != "PENDING":
+        return GuardResult(
+            ok=False, reason=f"REQUEST_INVALID:{req.get('status') or 'none'}"
+        )
+
+    src = req.get("source_cell_id")
+    dst = req.get("dest_cell_id")
     if int(cell_id) not in {
         int(src) if src is not None else -1,
         int(dst) if dst is not None else -1,
     }:
-        return GuardResult(ok=False, reason="CELL_NOT_ON_ORDER")
+        return GuardResult(ok=False, reason="CELL_NOT_ON_REQUEST")
 
     return GuardResult(ok=True)
 
