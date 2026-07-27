@@ -39,19 +39,22 @@ def run_operation(
     Выполняет invoke: открывает domain/platform сессии, вызывает handler, коммитит.
     Для create-command дополнительно пишет entity_fsm_state и опционально enqueue.
     """
+    from fsm_platform.host.runtime_context import service_scope
+
     sp = platform_session()
     sd = domain_session(service_id)
     try:
         import inspect
 
-        if "platform_session" in inspect.signature(handler).parameters:
-            result = handler(sd, params, actor, platform_session=sp)
-        else:
-            result = handler(sd, params, actor)
-        if kind == "command" and isinstance(result, dict) and result.get("entity_type"):
-            _bootstrap_and_maybe_enqueue(
-                sp, sd, service_id, result, actor=actor
-            )
+        with service_scope(service_id):
+            if "platform_session" in inspect.signature(handler).parameters:
+                result = handler(sd, params, actor, platform_session=sp)
+            else:
+                result = handler(sd, params, actor)
+            if kind == "command" and isinstance(result, dict) and result.get("entity_type"):
+                _bootstrap_and_maybe_enqueue(
+                    sp, sd, service_id, result, actor=actor
+                )
         sd.commit()
         sp.commit()
         return result if isinstance(result, dict) else {"data": result}
@@ -447,109 +450,114 @@ def list_available_actions(
         merged_payload.setdefault("courier_user_id", actor_id)
         merged_payload.setdefault("driver_user_id", actor_id)
 
+    from fsm_platform.host.runtime_context import service_scope
+
     repo = TransitionRepository()
     sp = platform_session()
     sd = domain_session(service_id)
     try:
-        current = default_db_layer.get_entity_state(
-            sp, service_id, entity_type, entity_id
-        )
-        if current is None:
+        with service_scope(service_id):
+            current = default_db_layer.get_entity_state(
+                sp, service_id, entity_type, entity_id
+            )
+            if current is None:
+                return {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "current_state": None,
+                    "actions": [],
+                    "error": "ENTITY_STATE_NOT_FOUND",
+                }
+
+            gv = current_graph_version(sd)
+            outgoing = repo.list_outgoing(
+                sd, entity_type, str(current), graph_version=gv
+            )
+            by_event: dict[str, list] = {}
+            for p in default_process_registry.list_for_service(service_id):
+                if str(p.entity_type or "") != entity_type:
+                    continue
+                by_event.setdefault(p.runtime_event_name, []).append(p)
+
+            actions: list[dict[str, Any]] = []
+            for edge in outgoing:
+                procs = by_event.get(edge.event_name) or []
+                process_name = procs[0].process_name if procs else None
+                context_builder = procs[0].context_builder if procs else None
+
+                instance: dict[str, Any] = {
+                    "service_id": service_id,
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "actor_id": actor_id or None,
+                    "payload_json": merged_payload,
+                    "graph_version": gv,
+                }
+
+                domain_context: dict[str, Any] = {}
+                context_error: Optional[str] = None
+                if context_builder is not None:
+                    try:
+                        domain_context = (
+                            context_builder(sd, None, {}, instance) or {}
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        context_error = f"CONTEXT_FAILED:{exc}"
+                        logger.warning(
+                            "available_actions context failed event=%s: %s",
+                            edge.event_name,
+                            exc,
+                        )
+
+                allowed = False
+                reason: Optional[str] = None
+                if context_error:
+                    reason = context_error
+                elif edge.guard_name is None or str(edge.guard_name).strip() == "":
+                    allowed = True
+                else:
+                    guard_fn = default_guard_registry.get(
+                        service_id, str(edge.guard_name)
+                    )
+                    if guard_fn is None:
+                        reason = f"UNKNOWN_GUARD:{edge.guard_name}"
+                    else:
+                        try:
+                            gr = normalize_guard_result(
+                                guard_fn(
+                                    sd,
+                                    None,
+                                    domain_context,
+                                    instance,
+                                    edge.guard_params or {},
+                                )
+                            )
+                            allowed = bool(gr.ok)
+                            reason = gr.reason
+                        except Exception as exc:  # noqa: BLE001
+                            reason = f"GUARD_ERROR:{exc}"
+
+                actions.append(
+                    {
+                        "transition_id": edge.id,
+                        "event_name": edge.event_name,
+                        "process_name": process_name,
+                        "from_state": edge.from_state,
+                        "to_state": edge.to_state,
+                        "guard_name": edge.guard_name,
+                        "priority": edge.priority,
+                        "allowed": allowed,
+                        "reason": reason,
+                    }
+                )
+
             return {
                 "entity_type": entity_type,
                 "entity_id": entity_id,
-                "current_state": None,
-                "actions": [],
-                "error": "ENTITY_STATE_NOT_FOUND",
-            }
-
-        gv = current_graph_version(sd)
-        outgoing = repo.list_outgoing(
-            sd, entity_type, str(current), graph_version=gv
-        )
-        by_event: dict[str, list] = {}
-        for p in default_process_registry.list_for_service(service_id):
-            if str(p.entity_type or "") != entity_type:
-                continue
-            by_event.setdefault(p.runtime_event_name, []).append(p)
-
-        actions: list[dict[str, Any]] = []
-        for edge in outgoing:
-            procs = by_event.get(edge.event_name) or []
-            process_name = procs[0].process_name if procs else None
-            context_builder = procs[0].context_builder if procs else None
-
-            instance: dict[str, Any] = {
-                "service_id": service_id,
-                "entity_type": entity_type,
-                "entity_id": entity_id,
+                "current_state": str(current),
                 "actor_id": actor_id or None,
-                "payload_json": merged_payload,
-                "graph_version": gv,
+                "actions": actions,
             }
-
-            domain_context: dict[str, Any] = {}
-            context_error: Optional[str] = None
-            if context_builder is not None:
-                try:
-                    domain_context = context_builder(sd, None, {}, instance) or {}
-                except Exception as exc:  # noqa: BLE001
-                    context_error = f"CONTEXT_FAILED:{exc}"
-                    logger.warning(
-                        "available_actions context failed event=%s: %s",
-                        edge.event_name,
-                        exc,
-                    )
-
-            allowed = False
-            reason: Optional[str] = None
-            if context_error:
-                reason = context_error
-            elif edge.guard_name is None or str(edge.guard_name).strip() == "":
-                allowed = True
-            else:
-                guard_fn = default_guard_registry.get(
-                    service_id, str(edge.guard_name)
-                )
-                if guard_fn is None:
-                    reason = f"UNKNOWN_GUARD:{edge.guard_name}"
-                else:
-                    try:
-                        gr = normalize_guard_result(
-                            guard_fn(
-                                sd,
-                                None,
-                                domain_context,
-                                instance,
-                                edge.guard_params or {},
-                            )
-                        )
-                        allowed = bool(gr.ok)
-                        reason = gr.reason
-                    except Exception as exc:  # noqa: BLE001
-                        reason = f"GUARD_ERROR:{exc}"
-
-            actions.append(
-                {
-                    "transition_id": edge.id,
-                    "event_name": edge.event_name,
-                    "process_name": process_name,
-                    "from_state": edge.from_state,
-                    "to_state": edge.to_state,
-                    "guard_name": edge.guard_name,
-                    "priority": edge.priority,
-                    "allowed": allowed,
-                    "reason": reason,
-                }
-            )
-
-        return {
-            "entity_type": entity_type,
-            "entity_id": entity_id,
-            "current_state": str(current),
-            "actor_id": actor_id or None,
-            "actions": actions,
-        }
     finally:
         sp.close()
         sd.close()

@@ -28,6 +28,7 @@ _TRANSIENT_SUBSTRINGS = (
     "2013:",  # MySQL lost connection
     "2006:",  # MySQL server gone away
     "1213:",  # deadlock
+    "EXTERNAL_API_TRANSIENT",  # call_api: timeout / 5xx / connection
 )
 
 # Явно постоянные коды — даже если попали под общий EFFECT_FAILED.

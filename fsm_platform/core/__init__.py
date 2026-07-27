@@ -6,6 +6,7 @@ fsm_platform.core — декларативный FSM runtime (в специфи�
 
 from .engine import run_instance
 from .errors import FsmErrorCodes
+from .http_client import ApiResponse, ExternalApiError, call_api, call_api_json
 from .registry import (
     EffectRegistry,
     GuardRegistry,
@@ -32,6 +33,10 @@ from .types import (
 __all__ = [
     "run_instance",
     "FsmErrorCodes",
+    "ApiResponse",
+    "ExternalApiError",
+    "call_api",
+    "call_api_json",
     "ProcessRegistry",
     "GuardRegistry",
     "EffectRegistry",

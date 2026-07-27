@@ -515,6 +515,90 @@ def graph_publish(service_id: str) -> dict[str, Any]:
         sd.close()
 
 
+class SecretBody(BaseModel):
+    key: str
+    value: str
+
+
+def _admin_or_raise(x_admin_token: Optional[str]) -> None:
+    from fsm_platform.host.secrets import SecretsError, require_admin
+
+    try:
+        require_admin(x_admin_token)
+    except SecretsError as exc:
+        code = 403 if exc.code == "ADMIN_FORBIDDEN" else 503
+        raise HTTPException(
+            code, detail={"error_code": exc.code, "message": str(exc)}
+        ) from exc
+
+
+@app.put("/v1/{service_id}/secrets")
+def upsert_secret(
+    service_id: str,
+    body: SecretBody,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """
+    Admin: upsert per-tenant secret (value хранится зашифрованным).
+    Header: X-Admin-Token: <PLATFORM_ADMIN_TOKEN>
+    """
+    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.secrets import SecretsError, set_domain_secret
+
+    _admin_or_raise(x_admin_token)
+    try:
+        with service_scope(service_id):
+            set_domain_secret(body.key, body.value)
+    except SecretsError as exc:
+        raise HTTPException(
+            400, detail={"error_code": exc.code, "message": str(exc)}
+        ) from exc
+    return {"service_id": service_id, "key": body.key.strip(), "ok": True}
+
+
+@app.get("/v1/{service_id}/secrets")
+def list_secrets(
+    service_id: str,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Admin: список имён ключей (значения не отдаём)."""
+    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.secrets import SecretsError, list_domain_secret_keys
+
+    _admin_or_raise(x_admin_token)
+    try:
+        with service_scope(service_id):
+            keys = list_domain_secret_keys()
+    except SecretsError as exc:
+        raise HTTPException(
+            400, detail={"error_code": exc.code, "message": str(exc)}
+        ) from exc
+    return {"service_id": service_id, "keys": keys}
+
+
+@app.delete("/v1/{service_id}/secrets/{key}")
+def delete_secret(
+    service_id: str,
+    key: str,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Admin: удалить секрет по имени ключа."""
+    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.secrets import SecretsError, delete_domain_secret
+
+    _admin_or_raise(x_admin_token)
+    try:
+        with service_scope(service_id):
+            ok = delete_domain_secret(key)
+    except SecretsError as exc:
+        raise HTTPException(
+            400, detail={"error_code": exc.code, "message": str(exc)}
+        ) from exc
+    if not ok:
+        raise HTTPException(404, detail="SECRET_NOT_FOUND")
+    return {"service_id": service_id, "key": key, "deleted": True}
+
+
 @app.post("/input/telegram/webhook")
 def telegram_webhook(update: dict[str, Any]) -> dict[str, Any]:
     """

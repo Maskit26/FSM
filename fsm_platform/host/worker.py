@@ -149,6 +149,8 @@ def _fire_due_schedules(*, limit: int = 20) -> bool:
 
 def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
     """ProcessDef.on_failed — domain recovery после терминального FAILED."""
+    from fsm_platform.host.runtime_context import service_scope
+
     service_id = str(instance["service_id"])
     process_name = str(instance.get("process_name") or "")
     process_def = default_process_registry.get(service_id, process_name)
@@ -160,7 +162,8 @@ def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
     try:
         sd = domain_session(service_id)
         db = {"platform": sp, "domain": sd}
-        process_def.on_failed(sp, sd, db, instance, last_error or "")
+        with service_scope(service_id):
+            process_def.on_failed(sp, sd, db, instance, last_error or "")
         sd.commit()
         sp.commit()
     except Exception:

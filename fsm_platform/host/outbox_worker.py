@@ -35,6 +35,8 @@ def _backoff_seconds(attempts: int) -> int:
 
 def deliver_one(row: dict[str, Any]) -> None:
     """Синхронная доставка одной строки. Raises → retry."""
+    from fsm_platform.host.runtime_context import service_scope
+
     channel = str(row.get("channel") or "").strip().lower()
     destination = str(row.get("destination") or "").strip()
     payload = _payload_dict(row.get("payload_json"))
@@ -42,56 +44,65 @@ def deliver_one(row: dict[str, Any]) -> None:
     if not text:
         text = json.dumps(payload, ensure_ascii=False)[:3500]
 
-    if channel == "telegram":
-        from output.telegram.sender import send_telegram_message
+    service_id = str(row.get("service_id") or payload.get("service_id") or "").strip()
 
-        send_telegram_message(chat_id=destination, text=text)
-        return
+    def _deliver() -> None:
+        if channel == "telegram":
+            from output.telegram.sender import send_telegram_message
 
-    if channel in ("log", "dry_run"):
-        logger.info(
-            "outbox log channel=%s dest=%s text=%s",
-            channel,
-            destination,
-            text[:300],
-        )
-        return
+            send_telegram_message(chat_id=destination, text=text)
+            return
 
-    if channel == "webhook":
-        from output.webhook.sender import deliver_webhook
+        if channel in ("log", "dry_run"):
+            logger.info(
+                "outbox log channel=%s dest=%s text=%s",
+                channel,
+                destination,
+                text[:300],
+            )
+            return
 
-        secret = ""
-        sub_id = payload.get("subscription_id")
-        if sub_id is not None:
-            sp_sec = platform_session()
-            try:
-                sub = default_db_layer.get_webhook_subscription(
-                    sp_sec,
-                    service_id=str(row.get("service_id") or ""),
-                    subscription_id=int(sub_id),
-                )
-                if sub:
-                    secret = str(sub.get("secret") or "")
-            finally:
-                sp_sec.close()
-        body = {
-            "event_id": payload.get("event_id"),
-            "event_type": row.get("event_type") or payload.get("event_type"),
-            "service_id": row.get("service_id") or payload.get("service_id"),
-            "instance_id": payload.get("instance_id"),
-            "entity_type": payload.get("entity_type"),
-            "entity_id": payload.get("entity_id"),
-            "payload": payload.get("payload") or {},
-        }
-        deliver_webhook(
-            url=destination,
-            secret=secret,
-            body=body,
-            event_type=str(row.get("event_type") or ""),
-        )
-        return
+        if channel == "webhook":
+            from output.webhook.sender import deliver_webhook
 
-    raise RuntimeError(f"UNSUPPORTED_CHANNEL:{channel}")
+            secret = ""
+            sub_id = payload.get("subscription_id")
+            if sub_id is not None:
+                sp_sec = platform_session()
+                try:
+                    sub = default_db_layer.get_webhook_subscription(
+                        sp_sec,
+                        service_id=service_id,
+                        subscription_id=int(sub_id),
+                    )
+                    if sub:
+                        secret = str(sub.get("secret") or "")
+                finally:
+                    sp_sec.close()
+            body = {
+                "event_id": payload.get("event_id"),
+                "event_type": row.get("event_type") or payload.get("event_type"),
+                "service_id": service_id or payload.get("service_id"),
+                "instance_id": payload.get("instance_id"),
+                "entity_type": payload.get("entity_type"),
+                "entity_id": payload.get("entity_id"),
+                "payload": payload.get("payload") or {},
+            }
+            deliver_webhook(
+                url=destination,
+                secret=secret,
+                body=body,
+                event_type=str(row.get("event_type") or ""),
+            )
+            return
+
+        raise RuntimeError(f"UNSUPPORTED_CHANNEL:{channel}")
+
+    if service_id:
+        with service_scope(service_id):
+            _deliver()
+    else:
+        _deliver()
 
 
 def process_one(*, batch_size: int = 10) -> bool:

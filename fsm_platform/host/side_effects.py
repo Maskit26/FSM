@@ -6,6 +6,12 @@ from datetime import datetime
 from typing import Any, Optional
 
 from fsm_platform.core.db_layer import SessionLike, default_db_layer
+from fsm_platform.core.http_client import (
+    ApiResponse,
+    ExternalApiError,
+    call_api,
+    call_api_json,
+)
 from fsm_platform.core.timers import schedule_timer as _schedule_timer
 
 
@@ -115,3 +121,16 @@ def emit_event(
         correlation_id=correlation_id,
         client_request_id=client_request_id,
     )
+
+
+# re-export: домен вызывает side_effects.call_api (как notify/schedule_timer)
+__all__ = [
+    "schedule_timer",
+    "notify",
+    "start_saga",
+    "emit_event",
+    "call_api",
+    "call_api_json",
+    "ApiResponse",
+    "ExternalApiError",
+]

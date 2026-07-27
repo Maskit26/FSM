@@ -75,14 +75,17 @@ def run_instance(
         transition_executor=transition_executor or TransitionExecutor(),
     )
 
-    result = runner.run(
-        session_platform,
-        session_domain,
-        db,
-        runtime_ctx,
-        instance,
-        process_def,
-    )
+    from fsm_platform.host.runtime_context import service_scope
+
+    with service_scope(str(service_id)):
+        result = runner.run(
+            session_platform,
+            session_domain,
+            db,
+            runtime_ctx,
+            instance,
+            process_def,
+        )
 
     if result.new_state not in _ALLOWED_INSTANCE_STATES:
         return FsmResult(

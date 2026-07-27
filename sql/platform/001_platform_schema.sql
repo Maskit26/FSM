@@ -16,6 +16,17 @@ CREATE TABLE IF NOT EXISTS domain_services (
     updated_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Per-tenant encrypted secrets (API keys, bot tokens, credentials JSON, …).
+CREATE TABLE IF NOT EXISTS domain_secrets (
+    service_id  VARCHAR(64)  NOT NULL,
+    `key`       VARCHAR(128) NOT NULL,
+    value_enc   TEXT         NOT NULL,
+    created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (service_id, `key`),
+    KEY idx_domain_secrets_service (service_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS server_fsm_instances (
     id                   BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
     service_id           VARCHAR(64)  NOT NULL,

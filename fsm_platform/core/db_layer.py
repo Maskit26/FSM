@@ -1667,6 +1667,81 @@ class FsmDbLayer:
         ).first()
         return row is not None
 
+    # --- domain_secrets ---
+
+    def get_domain_secret(
+        self, session: SessionLike, *, service_id: str, key: str
+    ) -> Optional[dict[str, Any]]:
+        """Одна строка domain_secrets (value_enc ещё зашифрован)."""
+        row = session.execute(
+            text(
+                """
+                SELECT service_id, `key`, value_enc, created_at, updated_at
+                FROM domain_secrets
+                WHERE service_id = :service_id AND `key` = :key
+                """
+            ),
+            {"service_id": service_id, "key": key},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def upsert_domain_secret(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        key: str,
+        value_enc: str,
+    ) -> None:
+        """INSERT … ON DUPLICATE KEY UPDATE value_enc."""
+        session.execute(
+            text(
+                """
+                INSERT INTO domain_secrets (service_id, `key`, value_enc, created_at, updated_at)
+                VALUES (:service_id, :key, :value_enc, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                ON DUPLICATE KEY UPDATE
+                    value_enc = VALUES(value_enc),
+                    updated_at = UTC_TIMESTAMP()
+                """
+            ),
+            {
+                "service_id": service_id,
+                "key": key,
+                "value_enc": value_enc,
+            },
+        )
+
+    def delete_domain_secret(
+        self, session: SessionLike, *, service_id: str, key: str
+    ) -> bool:
+        result = session.execute(
+            text(
+                """
+                DELETE FROM domain_secrets
+                WHERE service_id = :service_id AND `key` = :key
+                """
+            ),
+            {"service_id": service_id, "key": key},
+        )
+        return int(result.rowcount or 0) > 0
+
+    def list_domain_secret_keys(
+        self, session: SessionLike, *, service_id: str
+    ) -> list[str]:
+        """Имена ключей без значений."""
+        rows = session.execute(
+            text(
+                """
+                SELECT `key`
+                FROM domain_secrets
+                WHERE service_id = :service_id
+                ORDER BY `key` ASC
+                """
+            ),
+            {"service_id": service_id},
+        ).mappings().all()
+        return [str(r["key"]) for r in rows]
+
     # --- domain_services (boot) ---
 
     def list_active_domain_services(
