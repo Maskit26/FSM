@@ -96,6 +96,17 @@ def deliver_one(row: dict[str, Any]) -> None:
             )
             return
 
+        if channel in ("core", "http_external"):
+            # Vendor-семантика в домене; platform только роутит outbox.
+            # destination = credential key hint (CORE); payload.op обязателен.
+            from domains.courier.core.deliver import handle_core_outbox
+
+            body = dict(payload)
+            if destination and not body.get("credential_key"):
+                body["credential_key"] = destination
+            handle_core_outbox(body)
+            return
+
         raise RuntimeError(f"UNSUPPORTED_CHANNEL:{channel}")
 
     if service_id:

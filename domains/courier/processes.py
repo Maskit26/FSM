@@ -18,15 +18,20 @@ from domains.courier.commands import (
     complete_loading,
     complete_trip,
     confirm_courier2_delivery,
+    create_car,
     create_order,
     create_order_request,
+    login_user,
+    logout_user,
     open_cell,
+    register_user,
     remove_executor,
     request_locker_access_code,
     reserve_direction_slot,
     start_loading,
     start_trip,
     take_courier_order,
+    verify_user,
 )
 from domains.courier.context import (
     build_locker_context,
@@ -85,6 +90,21 @@ def register_all(service_id: str) -> None:
     )
     default_operation_registry.register(
         service_id, "create_order", "command", create_order
+    )
+    default_operation_registry.register(
+        service_id, "register_user", "command", register_user
+    )
+    default_operation_registry.register(
+        service_id, "login_user", "command", login_user
+    )
+    default_operation_registry.register(
+        service_id, "logout_user", "command", logout_user
+    )
+    default_operation_registry.register(
+        service_id, "create_car", "command", create_car
+    )
+    default_operation_registry.register(
+        service_id, "verify_user", "command", verify_user
     )
     default_operation_registry.register(
         service_id, "assign_executor", "command", assign_executor

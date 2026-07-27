@@ -1,10 +1,12 @@
-"""
-Мапперы данных пользователей между Delivery и Core.
-"""
+"""Мапперы пользователей Delivery ↔ Core."""
+
+from __future__ import annotations
+
 import json
-from typing import Dict, Any, Optional, List
 import logging
-from ..exceptions import CoreMappingError, CoreValidationError
+from typing import Any, Optional
+
+from domains.courier.core.exceptions import CoreMappingError, CoreValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +19,12 @@ ROLE_TO_CORE = {
     "admin": 4,
 }
 
-def to_core_register(user_data: Dict[str, Any]) -> Dict[str, Any]:
+
+def to_core_register(user_data: dict[str, Any]) -> dict[str, Any]:
     role_name = user_data.get("role_name", "client")
     core_role = ROLE_TO_CORE.get(role_name, 1)
 
-    payload = {
+    payload: dict[str, Any] = {
         "u_name": user_data.get("name", "User"),
         "u_role": core_role,
         "st": 1,
@@ -33,63 +36,56 @@ def to_core_register(user_data: Dict[str, Any]) -> Dict[str, Any]:
     if user_data.get("city"):
         payload["u_city"] = user_data["city"]
 
-    u_details = {"source": "fsm_backend"}
-    data_obj = {"u_details": u_details}
+    data_obj: dict[str, Any] = {"u_details": {"source": "fsm_platform"}}
     if user_data.get("password"):
         data_obj["password"] = user_data["password"]
-
-    payload["data"] = json.dumps(data_obj)
-    logger.debug("to_core_register: role=%s → core_role=%s", role_name, core_role)
+    payload["data"] = json.dumps(data_obj, ensure_ascii=False)
     return payload
 
-def from_core_register(core_response: Any) -> Dict[str, Any]:
+
+def from_core_register(core_response: Any) -> dict[str, Any]:
     if isinstance(core_response, list):
         core_response = core_response[0] if core_response else {}
     if not isinstance(core_response, dict):
-        logger.error("Неожиданный тип ответа Core: %s", type(core_response))
-        raise CoreMappingError(f"Неожиданный тип ответа: {type(core_response)}")
+        raise CoreMappingError(f"Unexpected response type: {type(core_response)}")
 
     if core_response.get("status") == "error":
-        error_msg = core_response.get("message", "Unknown error")
-        logger.error("Core вернул ошибку: %s", error_msg)
-        raise CoreValidationError(f"Ошибка Core: {error_msg}")
+        raise CoreValidationError(str(core_response.get("message") or "Core error"))
 
     data = core_response.get("data", {})
     if isinstance(data, str):
         try:
             data = json.loads(data)
-        except json.JSONDecodeError as e:
-            logger.error("Ошибка парсинга data JSON: %s", e)
-            raise CoreMappingError(f"Невалидный JSON в data: {e}")
+        except json.JSONDecodeError as exc:
+            raise CoreMappingError(f"Invalid data JSON: {exc}") from exc
 
-    result = {
+    return {
         "core_u_id": data.get("u_id"),
         "core_role": data.get("u_role"),
         "token": data.get("token"),
         "u_hash": data.get("u_hash"),
     }
-    logger.debug("Парсинг регистрации успешен: core_u_id=%s", result["core_u_id"])
-    return result
 
-# ========================= Авторизация ===============================
 
-def to_core_login(login: str, password: str, type: str = "phone") -> Dict[str, Any]:
-    """Подготовка данных для авторизации в Core."""
+def to_core_login(login: str, password: str, type: str = "phone") -> dict[str, Any]:
     return {"login": login, "password": password, "type": type}
 
-def from_core_login(core_response: Any) -> Dict[str, Any]:
-    """Парсинг ответа Core после авторизации."""
+
+def from_core_login(core_response: Any) -> dict[str, Any]:
     if isinstance(core_response, list):
         core_response = core_response[0] if core_response else {}
     if not isinstance(core_response, dict):
-        raise CoreMappingError(f"Core вернул неожиданный тип: {type(core_response)}")
+        raise CoreMappingError(f"Unexpected response type: {type(core_response)}")
 
     if core_response.get("status") == "error":
-        raise CoreValidationError(f"Core auth error: {core_response.get('message')}")
-    if core_response.get("code") and str(core_response.get("code")).startswith("4"):
-        raise CoreValidationError(f"Core auth error {core_response.get('code')}: {core_response.get('message')}")
+        raise CoreValidationError(str(core_response.get("message") or "auth error"))
+    code = core_response.get("code")
+    if code and str(code).startswith("4"):
+        raise CoreValidationError(
+            f"Core auth {code}: {core_response.get('message')}"
+        )
 
-    auth_user = core_response.get("auth_user", {})
+    auth_user = core_response.get("auth_user", {}) or {}
     return {
         "core_u_id": auth_user.get("u_id"),
         "auth_hash": core_response.get("auth_hash"),
@@ -99,7 +95,7 @@ def from_core_login(core_response: Any) -> Dict[str, Any]:
         "city": auth_user.get("u_city"),
     }
 
-# =================== Создание авто ===================
+
 def to_core_car_payload(
     registration_plate: str,
     car_type: str,
@@ -112,27 +108,21 @@ def to_core_car_payload(
     custom_model_en: Optional[str] = None,
     custom_model_year: Optional[int] = None,
     custom_model_doors: Optional[int] = None,
-) -> Dict[str, Any]:
-    cc_id = 4 if car_type == 'courier' else 5
-    car_data = {
+) -> dict[str, Any]:
+    cc_id = 4 if car_type == "courier" else 5
+    car_data: dict[str, Any] = {
         "registration_plate": registration_plate,
         "seats": seats,
         "cc_id": cc_id,
-        "cm_id": None,        
+        "cm_id": None,
     }
-    details = {}
+    details: dict[str, Any] = {}
     if custom_body_ru or custom_body_en:
-        details["car_bodies"] = {
-            "ru": custom_body_ru or "",
-            "en": custom_body_en or "",
-        }
+        details["car_bodies"] = {"ru": custom_body_ru or "", "en": custom_body_en or ""}
     if custom_make_ru or custom_make_en:
-        details["car_makes"] = {
-            "ru": custom_make_ru or "",
-            "en": custom_make_en or "",
-        }
+        details["car_makes"] = {"ru": custom_make_ru or "", "en": custom_make_en or ""}
     if custom_model_ru or custom_model_en:
-        model_details = {
+        model_details: dict[str, Any] = {
             "ru": custom_model_ru or "",
             "en": custom_model_en or "",
         }
@@ -141,23 +131,23 @@ def to_core_car_payload(
         if custom_model_doors is not None:
             model_details["door"] = custom_model_doors
         details["car_models"] = model_details
-
     if details:
         car_data["details"] = details
     return car_data
 
-# =============== верификация пользователя =============
-def to_core_user_update_payload(u_check_state: int) -> Dict[str, Any]:
-    """Создать payload только с u_check_state."""
+
+def to_core_user_update_payload(u_check_state: int) -> dict[str, Any]:
     return {"u_check_state": u_check_state}
 
-def from_core_user_update_response(core_response: Dict[str, Any]) -> Dict[str, Any]:
-    """Распарсить ответ Core после обновления пользователя."""
+
+def from_core_user_update_response(core_response: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(core_response, dict):
         raise CoreMappingError(f"Unexpected response type: {type(core_response)}")
     if core_response.get("status") != "success":
-        raise CoreValidationError(f"Core error: {core_response.get('message', 'Unknown')}")
-    data = core_response.get("data", {})
+        raise CoreValidationError(
+            str(core_response.get("message") or "Unknown")
+        )
+    data = core_response.get("data", {}) or {}
     return {
         "affected_fields": data.get("affected_fields", []),
         "forbidden_fields": data.get("forbidden_fields", []),

@@ -2689,3 +2689,347 @@ def list_driver_trips(
         item["order_ids"] = list_trip_order_ids(session, int(item["id"]))
         out.append(item)
     return out
+
+
+# --- Core user / order mapping (таблицы уже в domain DB) ---
+
+
+def create_user_record(
+    session: Session,
+    *,
+    phone: str,
+    name: str,
+    role_name: str,
+    city: Optional[str] = None,
+) -> int:
+    """INSERT users; returns local user id."""
+    result = session.execute(
+        text(
+            """
+            INSERT INTO users (phone, name, role_name, city)
+            VALUES (:phone, :name, :role_name, :city)
+            """
+        ),
+        {
+            "phone": phone,
+            "name": name,
+            "role_name": role_name,
+            "city": city,
+        },
+    )
+    return int(result.lastrowid)
+
+
+def create_user_core_mapping(
+    session: Session,
+    *,
+    user_id: int,
+    core_u_id: int,
+    core_role: int,
+) -> None:
+    session.execute(
+        text(
+            """
+            INSERT INTO core_user_mapping
+                (local_user_id, core_u_id, core_role, sync_status, registered_at, last_sync_at)
+            VALUES
+                (:local_id, :core_id, :core_role, 'success', NOW(), NOW())
+            ON DUPLICATE KEY UPDATE
+                core_u_id = VALUES(core_u_id),
+                core_role = VALUES(core_role),
+                last_sync_at = NOW(),
+                sync_status = 'success'
+            """
+        ),
+        {
+            "local_id": int(user_id),
+            "core_id": int(core_u_id),
+            "core_role": int(core_role),
+        },
+    )
+
+
+def get_local_user_id_by_core_u_id(
+    session: Session, core_u_id: int
+) -> Optional[int]:
+    row = session.execute(
+        text(
+            "SELECT local_user_id FROM core_user_mapping WHERE core_u_id = :core_u_id"
+        ),
+        {"core_u_id": int(core_u_id)},
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def get_core_u_id_by_local_user_id(
+    session: Session, local_user_id: int
+) -> Optional[int]:
+    row = session.execute(
+        text(
+            "SELECT core_u_id FROM core_user_mapping WHERE local_user_id = :local_id"
+        ),
+        {"local_id": int(local_user_id)},
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def get_user_core_tokens(
+    session: Session, core_u_id: int
+) -> Tuple[Optional[str], Optional[str]]:
+    row = session.execute(
+        text(
+            "SELECT token, u_hash FROM core_user_mapping WHERE core_u_id = :core_id"
+        ),
+        {"core_id": int(core_u_id)},
+    ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def get_user_tokens(
+    session: Session, local_user_id: int
+) -> Tuple[Optional[str], Optional[str]]:
+    row = session.execute(
+        text(
+            "SELECT token, u_hash FROM core_user_mapping WHERE local_user_id = :uid"
+        ),
+        {"uid": int(local_user_id)},
+    ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def update_user_core_tokens(
+    session: Session, core_u_id: int, token: str, u_hash: str
+) -> None:
+    session.execute(
+        text(
+            """
+            UPDATE core_user_mapping
+            SET token = :token, u_hash = :u_hash, last_sync_at = NOW()
+            WHERE core_u_id = :core_u_id
+            """
+        ),
+        {"token": token, "u_hash": u_hash, "core_u_id": int(core_u_id)},
+    )
+
+
+def clear_user_u_hash(session: Session, local_user_id: int) -> None:
+    session.execute(
+        text(
+            "UPDATE core_user_mapping SET u_hash = NULL WHERE local_user_id = :uid"
+        ),
+        {"uid": int(local_user_id)},
+    )
+
+
+def get_car_core_id(session: Session, local_user_id: int) -> Optional[int]:
+    row = session.execute(
+        text(
+            "SELECT car_core_id FROM core_user_mapping WHERE local_user_id = :uid"
+        ),
+        {"uid": int(local_user_id)},
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def update_car_core_id(
+    session: Session, local_user_id: int, car_core_id: int
+) -> None:
+    session.execute(
+        text(
+            """
+            UPDATE core_user_mapping
+            SET car_core_id = :car_id, last_sync_at = NOW()
+            WHERE local_user_id = :uid
+            """
+        ),
+        {"car_id": int(car_core_id), "uid": int(local_user_id)},
+    )
+
+
+def get_user_city(session: Session, user_id: int) -> str:
+    row = session.execute(
+        text("SELECT city FROM users WHERE id = :id"),
+        {"id": int(user_id)},
+    ).fetchone()
+    return str(row[0]) if row and row[0] else ""
+
+
+def get_locker_address_by_cell(session: Session, cell_id: int) -> str:
+    row = session.execute(
+        text(
+            """
+            SELECT l.location_address
+            FROM locker_cells lc
+            JOIN lockers l ON l.id = lc.locker_id
+            WHERE lc.id = :cell_id
+            """
+        ),
+        {"cell_id": int(cell_id)},
+    ).fetchone()
+    if not row or not row[0]:
+        raise ValueError(f"No address for cell {cell_id}")
+    return str(row[0])
+
+
+def save_core_order_mapping(
+    session: Session,
+    *,
+    local_order_id: int,
+    core_order_id: int,
+    role: str,
+    kind: Optional[int],
+    upper: Optional[int],
+    b_state: Optional[int],
+    client_local_user_id: Optional[int] = None,
+    performer_local_user_id: Optional[int] = None,
+) -> None:
+    session.execute(
+        text(
+            """
+            INSERT INTO core_order_mapping
+                (local_order_id, core_order_id, role, kind, upper, b_state,
+                 client_local_user_id, performer_local_user_id, created_at, updated_at)
+            VALUES (:local_id, :core_id, :role, :kind, :upper, :b_state,
+                    :client_id, :performer_id, NOW(), NOW())
+            ON DUPLICATE KEY UPDATE
+                core_order_id = VALUES(core_order_id),
+                role = VALUES(role),
+                kind = VALUES(kind),
+                upper = VALUES(upper),
+                b_state = VALUES(b_state),
+                client_local_user_id = VALUES(client_local_user_id),
+                performer_local_user_id = VALUES(performer_local_user_id),
+                updated_at = NOW()
+            """
+        ),
+        {
+            "local_id": int(local_order_id),
+            "core_id": int(core_order_id),
+            "role": role,
+            "kind": kind,
+            "upper": upper,
+            "b_state": b_state,
+            "client_id": client_local_user_id,
+            "performer_id": performer_local_user_id,
+        },
+    )
+
+
+def get_main_core_order_id(
+    session: Session, local_order_id: int
+) -> Optional[int]:
+    row = session.execute(
+        text(
+            """
+            SELECT core_order_id FROM core_order_mapping
+            WHERE local_order_id = :local_id AND role = 'main' AND kind = 1
+            LIMIT 1
+            """
+        ),
+        {"local_id": int(local_order_id)},
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def get_suborder_core_id(
+    session: Session, local_order_id: int, role: str, upper: int
+) -> Optional[int]:
+    row = session.execute(
+        text(
+            """
+            SELECT core_order_id FROM core_order_mapping
+            WHERE local_order_id = :local_id AND role = :role AND upper = :upper
+            LIMIT 1
+            """
+        ),
+        {
+            "local_id": int(local_order_id),
+            "role": role,
+            "upper": int(upper),
+        },
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def get_core_suborder_id_by_performer(
+    session: Session,
+    local_order_id: int,
+    performer_local_user_id: int,
+) -> Optional[int]:
+    row = session.execute(
+        text(
+            """
+            SELECT core_order_id FROM core_order_mapping
+            WHERE local_order_id = :local_id
+              AND performer_local_user_id = :performer_id
+            LIMIT 1
+            """
+        ),
+        {
+            "local_id": int(local_order_id),
+            "performer_id": int(performer_local_user_id),
+        },
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def get_core_order_b_state(
+    session: Session, core_order_id: int
+) -> Optional[int]:
+    row = session.execute(
+        text(
+            "SELECT b_state FROM core_order_mapping WHERE core_order_id = :core_id"
+        ),
+        {"core_id": int(core_order_id)},
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def update_core_order_b_state(
+    session: Session, core_order_id: int, b_state: int
+) -> None:
+    session.execute(
+        text(
+            """
+            UPDATE core_order_mapping
+            SET b_state = :b_state, updated_at = NOW()
+            WHERE core_order_id = :core_id
+            """
+        ),
+        {"b_state": int(b_state), "core_id": int(core_order_id)},
+    )
+
+
+def clear_core_order_performer(session: Session, core_order_id: int) -> None:
+    session.execute(
+        text(
+            """
+            UPDATE core_order_mapping
+            SET performer_local_user_id = NULL, updated_at = NOW()
+            WHERE core_order_id = :cid
+            """
+        ),
+        {"cid": int(core_order_id)},
+    )
+
+
+def get_core_order_by_role(
+    session: Session, local_order_id: int, role: str
+) -> Optional[dict[str, Any]]:
+    row = session.execute(
+        text(
+            """
+            SELECT local_order_id, core_order_id, role, kind, upper, b_state,
+                   client_local_user_id, performer_local_user_id
+            FROM core_order_mapping
+            WHERE local_order_id = :local_id AND role = :role
+            LIMIT 1
+            """
+        ),
+        {"local_id": int(local_order_id), "role": role},
+    ).mappings().first()
+    return dict(row) if row else None

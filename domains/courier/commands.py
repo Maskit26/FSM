@@ -267,6 +267,35 @@ def create_order(
             platform_session=platform_session,
         )
 
+        # Core: create main + courier suborders via outbox (after commit)
+        core_u = db_layer.get_core_u_id_by_local_user_id(
+            domain_session, client_user_id
+        )
+        if not core_u:
+            raise DomainError(
+                "CLIENT_NOT_MAPPED_TO_CORE",
+                "Сначала register_user / login_user для клиента",
+            )
+        token, u_hash = db_layer.get_user_core_tokens(domain_session, int(core_u))
+        if not token or not u_hash:
+            raise DomainError(
+                "MISSING_CORE_TOKENS",
+                "Нет token/u_hash — выполните login_user",
+            )
+        from domains.courier.core.enqueue import enqueue_core
+
+        enqueue_core(
+            {"platform": platform_session},
+            op="create_order",
+            payload={
+                "local_order_id": order_id,
+                "pickup_type": pickup_type,
+                "delivery_type": delivery_type,
+            },
+            idempotency_key=f"core:create_order:{order_id}",
+            platform_session=platform_session,
+        )
+
     return {
         "entity_type": "order",
         "entity_id": order_id,
@@ -1200,3 +1229,180 @@ def confirm_courier2_delivery(
             "status": "pending_fsm",
         },
     }
+
+
+# --- Core auth (sync call_api) ---
+
+
+def register_user(
+    domain_session,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    platform_session=None,
+) -> dict[str, Any]:
+    """Регистрация в Core + локальный user + core_user_mapping."""
+    _ = actor
+    _ = platform_session
+    from domains.courier.core.exceptions import CoreError
+    from domains.courier.core import users as core_users
+
+    phone = _require_str(params, "phone")
+    name = _require_str(params, "name")
+    role_name = str(params.get("role_name") or "client").strip() or "client"
+    user_data = {
+        "phone": phone,
+        "name": name,
+        "role_name": role_name,
+        "password": params.get("password"),
+        "email": params.get("email"),
+        "city": params.get("city"),
+    }
+    try:
+        result = core_users.register_user(domain_session, user_data)
+    except CoreError as exc:
+        raise DomainError(exc.code, str(exc)) from exc
+    return {"data": result}
+
+
+def login_user(
+    domain_session,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    platform_session=None,
+) -> dict[str, Any]:
+    """Авторизация в Core → token/u_hash в core_user_mapping."""
+    _ = actor
+    _ = platform_session
+    from domains.courier.core.exceptions import CoreError
+    from domains.courier.core import users as core_users
+
+    login = _require_str(params, "login")
+    password = _require_str(params, "password")
+    login_type = str(params.get("type") or "phone").strip() or "phone"
+    try:
+        result = core_users.login_user(
+            domain_session, login=login, password=password, type=login_type
+        )
+    except CoreError as exc:
+        raise DomainError(exc.code, str(exc)) from exc
+    return {"data": result}
+
+
+def logout_user(
+    domain_session,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    platform_session=None,
+) -> dict[str, Any]:
+    """Logout в Core + clear u_hash."""
+    _ = platform_session
+    from domains.courier.core.exceptions import CoreError
+    from domains.courier.core import users as core_users
+
+    try:
+        local_id = int(
+            params.get("user_id")
+            or params.get("local_user_id")
+            or (actor or {}).get("actor_id")
+            or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("user_id / actor.actor_id required") from exc
+    if not local_id:
+        raise ValueError("user_id / actor.actor_id required")
+    try:
+        result = core_users.logout_user(domain_session, local_id)
+    except CoreError as exc:
+        raise DomainError(exc.code, str(exc)) from exc
+    return {"data": result}
+
+
+def create_car(
+    domain_session,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    platform_session=None,
+) -> dict[str, Any]:
+    """Создать авто/байк в Core → car_core_id (нужен для assign)."""
+    _ = platform_session
+    from domains.courier.core.exceptions import CoreError
+    from domains.courier.core import users as core_users
+
+    try:
+        local_id = int(
+            params.get("user_id")
+            or params.get("local_user_id")
+            or (actor or {}).get("actor_id")
+            or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("user_id / actor.actor_id required") from exc
+    if not local_id:
+        raise ValueError("user_id / actor.actor_id required")
+    car_type = str(params.get("car_type") or "courier").strip() or "courier"
+    seats = int(params.get("seats") or 1)
+    try:
+        result = core_users.create_car_for_user(
+            domain_session,
+            local_user_id=local_id,
+            car_type=car_type,
+            seats=seats,
+        )
+    except CoreError as exc:
+        raise DomainError(exc.code, str(exc)) from exc
+    return {"data": result}
+
+
+def verify_user(
+    domain_session,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    platform_session=None,
+) -> dict[str, Any]:
+    """
+    Изменить u_check_state пользователя в Core (от имени админа).
+    params: local_user_id (target), u_check_state;
+    admin — params.admin_local_user_id или actor.actor_id.
+    """
+    _ = platform_session
+    from domains.courier.core.exceptions import CoreError
+    from domains.courier.core import users as core_users
+
+    try:
+        target_id = int(
+            params.get("local_user_id")
+            or params.get("target_local_user_id")
+            or params.get("user_id")
+            or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("local_user_id required") from exc
+    if not target_id:
+        raise ValueError("local_user_id required")
+
+    if params.get("u_check_state") is None or str(params.get("u_check_state")).strip() == "":
+        raise ValueError("u_check_state required")
+    new_state = int(params["u_check_state"])
+
+    try:
+        admin_id = int(
+            params.get("admin_local_user_id")
+            or params.get("admin_user_id")
+            or (actor or {}).get("actor_id")
+            or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("admin_local_user_id / actor.actor_id required") from exc
+    if not admin_id:
+        raise ValueError("admin_local_user_id / actor.actor_id required")
+
+    try:
+        result = core_users.verify_user(
+            domain_session,
+            target_local_user_id=target_id,
+            new_check_state=new_state,
+            admin_local_user_id=admin_id,
+        )
+    except CoreError as exc:
+        raise DomainError(exc.code, str(exc)) from exc
+    return {"data": result}

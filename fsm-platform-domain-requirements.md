@@ -19,7 +19,7 @@
 | §11–12 | запрещённые решения, примеры доменов |
 | §13–14 | критерии готовности |
 | §15 | глоссарий |
-| §16 | **статус реализации** блоков 0–3 и фаз каналов 0–3 (secrets / call_api / hooks / Telegram) |
+| §16 | **статус реализации** блоков 0–3 и фаз каналов 0–5 (secrets / call_api / hooks / Telegram / Leo4 skip / Core) |
 
 ---
 
@@ -649,7 +649,7 @@ token = get_domain_secret("TELEGRAM_BOT_TOKEN")  # только текущий �
 {"type":"api_key_header","base_url":"...","api_key":"...","header_name":"x-api-key"}
 {"type":"basic_auth","base_url":"...","username":"...","password":"..."}
 {"type":"custom","base_url":"...","fields":{...},"signer":"domains.foo.bar:sign"}
-{"type":"none","base_url":"https://ibronevik.ru/taxi/"}
+{"type":"none","base_url":"https://ibronevik.ru/taxi/c/postamat/"}
 ```
 
 | type | Поля |
@@ -658,7 +658,7 @@ token = get_domain_secret("TELEGRAM_BOT_TOKEN")  # только текущий �
 | `api_key_header` | `api_key`, `header_name` (default `x-api-key`) |
 | `basic_auth` | `username`, `password` |
 | `custom` | `fields` + `signer` = `module.path:func` |
-| `none` | только `base_url`; без auth-заголовка (публичный API: ibronevik Core) |
+| `none` | только `base_url`; без auth-заголовка (публичный API: ibronevik Core; пример §16.9 фаза 5) |
 
 Signer: `sign(fields, *, method, path, headers, json=None, params=None, data=None)` → mapping с опц. `headers`/`json`/`params`/`data` (merge).
 
@@ -2997,7 +2997,7 @@ fsm_worker                    API pod 1 … N (SSE)
 |------|--------|
 | `id` | PK |
 | `service_id` | |
-| `channel` | `webhook` \| `telegram` \| `whatsapp` \| `http_external` \| … |
+| `channel` | `webhook` \| `telegram` \| `whatsapp` \| `http_external` \| `core` \| … |
 | `destination` | URL / chat_id / system code |
 | `event_type` | тип события |
 | `payload_json` | тело доставки |
@@ -3051,7 +3051,7 @@ LOOP:
   3. по channel:
        webhook → HTTP POST destination + HMAC signature
        telegram → Bot API sendMessage (токен из secrets канала)
-       http_external → HTTP по контракту destination
+       http_external / core → domain deliver (courier: handle_core_outbox → call_api)
   4. успех → SENT + sent_at
      ошибка → attempts++, backoff next_attempt_at, status=PENDING
      attempts > max → DEAD + alert
@@ -3107,12 +3107,25 @@ Sender на **выходе** только доставляет сообщени�
 | Когда | Механизм |
 |-------|----------|
 | Нужен **reliable async** push после commit (уведомить внешнюю систему о событии) | `platform.notify` → `platform_outbox` (`channel=http_external` / `core`) → outbox_worker |
-| Нужен **sync** запрос-ответ внутри command/effect (register, billing, open cell) | `call_api(credential_key, …)` (§4.15); credential в `domain_secrets` |
+| Нужен **sync** запрос-ответ внутри command/effect (register, billing, verify) | `call_api(credential_key, …)` (§4.15); credential в `domain_secrets` |
 
 Цепочки вызовов — FSM transitions / timers, не зависимости между строками outbox.  
 Браузер external outbox не читает: ему poll / SSE / webhook.  
 Vendor-клиенты (Leo4, Core) **не** кладутся в `fsm_platform/` / `output/{vendor}/` — только domain code поверх `call_api`.
 
+#### Реализовано: канал `core` (courier / ibronevik)
+
+| Элемент | Реализация |
+|---------|------------|
+| Producer | `domains.courier.core.enqueue.enqueue_core` → `platform.notify(channel="core", destination="CORE", event_type="core.<op>", …)` |
+| Consumer | `outbox_worker.deliver_one`: `channel in ("core", "http_external")` → `domains.courier.core.deliver.handle_core_outbox` |
+| HTTP | `call_api("CORE", …)` form/GET; credential type `none` |
+| Retry | любая ошибка deliver → outbox RETRY + backoff; `OUTBOX_MAX_ATTEMPTS` → DEAD |
+| Mapping | после успеха deliver пишет/обновляет `core_order_mapping` (и связанные поля) |
+
+Ops в payload (`op`): `create_order`, `create_suborder`, `assign_executor`, `remove_performer`, `cancel_main`, `complete_main`, `complete_suborder`.
+
+Подробности домена — **§16.9 фаза 5**.
 ### 10.10. WebSocket (пример: биржи курьера и водителя)
 
 Двусторонний канал для UI. Имеет смысл, если нужны клиент→server команды поверх того же сокета. Для только server→client достаточно SSE.
@@ -3322,7 +3335,7 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 - [x] Generic inbound hooks `POST /v1/{service_id}/hooks/{channel}` (§4.16).
 - [x] Telegram multi-tenant: secrets + `/input/telegram/{service_id}/webhook` (фаза 3).
 - [ ] Leo4 на courier — **пропущено** до появления API-ключа; пример §4.17.
-- [ ] ibronevik Core на courier (фаза 5).
+- [x] ibronevik Core на courier (фаза 5): `domains/courier/core/`, outbox `channel=core`, sync auth + verify, lifecycle через outbox (§16.9).
 
 ## 14. Критерии готовности домена
 
@@ -3413,7 +3426,7 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 
 Журнал того, что **уже сделано в коде** относительно плана доработок после аудита гонок. Норматив выше (§4–10) приведён в соответствие с этим статусом.  
 Отложено явно: **3.5 компенсации в сагах**.  
-Multi-tenant secrets / call_api / hooks / Telegram — **§16.9** (фазы 0–3 плана каналов).
+Multi-tenant secrets / call_api / hooks / Telegram / Core — **§16.9** (фазы 0–5 плана каналов).
 
 ### 16.1. Блок 0 — гонки и согласованность
 
@@ -3480,6 +3493,7 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 | `output/telegram` из outbox (`domain_secrets` / env) | done |
 | `tools/domain_e2e` auto Bearer при `PLATFORM_AUTH_*` | done (`client.py` → `/v1/auth/token`) |
 | Generic inbound hooks `POST …/hooks/{channel}` | done (§4.16, §16.9 фаза 2) |
+| ibronevik Core на courier (outbox `channel=core` + sync auth) | done (§16.9 фаза 5) |
 | `scripts/apply_sql.py` (в т.ч. DELIMITER) | done |
 | Worker: FSM + timers + schedules + outbox + reconcile в одном цикле | done |
 | Пул соединений domain/platform с учётом `max_user_connections` | учтено в эксплуатации (pool_size) |
@@ -3503,7 +3517,7 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 | `sql/domain/022_state_timeouts.sql` | domain | timeout_* на `fsm_states` |
 | `sql/domain/023_graph_version.sql` | domain | `fsm_graph_meta`, `fsm_transitions.graph_version` |
 
-### 16.9. Multi-tenant secrets, call_api, hooks, Telegram (фазы 0–3)
+### 16.9. Multi-tenant secrets, call_api, hooks, Telegram, Core (фазы 0–5)
 
 План: platform остаётся generic; секреты и HTTP in/out — без vendor-папок в ядре.
 
@@ -3518,10 +3532,10 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 | 2 | Generic inbound `POST …/hooks/{channel}` | done | `host/hook_registry.py`, `app.py`; catalog.`hooks` |
 | 3 | Telegram multi-tenant | done + e2e ok | `settings.py` / `sender.py` / `webhook.py`; только `/input/telegram/{service_id}/…`; secrets → env fallback; legacy path удалён; e2e auto-Bearer (`client.py`) |
 | 4 | Leo4 на courier | **пропущено** (нет API-ключа) | норматив-пример **§4.17**; код домена не писать до появления credentials |
-| 5 | ibronevik Core на courier | **не сделано** | тот же паттерн `call_api` + credential; отдельно |
+| 5 | ibronevik Core на courier | **done** | `domains/courier/core/` + outbox `channel=core` + sync auth; § ниже |
 | — | Изоляция процессов арендаторов | **отложено** | деплой, не код |
 
-Норматив: **§4.15**, **§4.16**, **§4.17** (пример Leo4), **§9.10**, side-effect API **§4.13**, Public API **§9.14**.
+Норматив: **§4.15**, **§4.16**, **§4.17** (пример Leo4), **§9.10**, **§10.9**, side-effect API **§4.13**, Public API **§9.14**.
 
 #### Фаза 3 — детали (зафиксировано после проверки)
 
@@ -3537,6 +3551,99 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 Шаблон подключения (credential, `call_api` в effect, inbound `hooks/leo4`, чеклист) — **§4.17**.  
 Когда появится ключ — следовать §4.17 без правок ядра platform.
 
-#### Фаза 5 — ibronevik Core
+#### Фаза 5 — ibronevik Core (done)
 
-Отдельно: billing/register через `call_api` + credential в domain (можно без Leo4).
+Перенос старого `adapter/` + `old/` в картридж courier. Legacy-деревья **удалены**. Platform не знает семантику Core: только `call_api` + outbox channel.
+
+##### Онбординг credential
+
+```http
+PUT /v1/{service_id}/secrets
+X-Admin-Token: <PLATFORM_ADMIN_TOKEN>
+Content-Type: application/json
+
+{
+  "key": "CORE",
+  "value": {
+    "type": "none",
+    "base_url": "https://ibronevik.ru/taxi/c/postamat/"
+  }
+}
+```
+
+- `base_url` — URL форм/доступа арендатора; **без rewrite** в коде.
+- HTTP-пути в клиенте — абсолютные path из доки форм (`/taxi/api/v1/register/`, `/taxi/api/v1/drive`, …); `urljoin` с `base_url` как у `call_api`.
+- Auth пользователя Core — `token` + `u_hash` в form body (не Bearer из credential).
+
+##### Пакет `domains/courier/core/`
+
+| Модуль | Назначение |
+|--------|------------|
+| `client.py` | обёртка над `call_api("CORE", …)` form/GET |
+| `mappers/user.py`, `mappers/order.py` | payload ↔ Core |
+| `users.py` | sync: register / login(+token) / logout / create_car / verify |
+| `enqueue.py` | `platform.notify(channel=core, …)` |
+| `deliver.py` | outbox consumer: `op` → HTTP + обновление mapping |
+| `exceptions.py` | `CoreError` / auth / validation / mapping |
+
+##### Domain DB mapping (таблицы уже в domain; DDL-миграцию фазы 5 не добавляли)
+
+| Таблица | Смысл |
+|--------|--------|
+| `core_user_mapping` | `local_user_id` ↔ `core_u_id`, `token`, `u_hash`, `car_core_id`, `core_role` |
+| `core_order_mapping` | `local_order_id` ↔ `core_order_id` (`role` main/courier1/courier2/driver), `kind`, `upper`, `b_state`, performer |
+
+CRUD: `domains/courier/db_layer.py` (`create_user_core_mapping`, `save_core_order_mapping`, tokens, car, …).
+
+##### Sync commands (`POST …/invoke`)
+
+| operation | Поведение |
+|-----------|-----------|
+| `register_user` | Core register → local `users` → mapping (+ tokens при `st`) |
+| `login_user` | Core auth → get token → upsert mapping/tokens (+ `car_core_id` если есть авто) |
+| `logout_user` | Core logout + clear `u_hash` |
+| `create_car` | Core create car → `car_core_id` (нужен для `set_performer`) |
+| `verify_user` | admin tokens → Core update `u_check_state` целевого пользователя |
+
+Ошибка Core → `DomainError` → HTTP 409 с `error_code`. Транзакция invoke откатывается.
+
+##### Async lifecycle (outbox `channel=core`)
+
+Локальный commit **сначала**; HTTP в Core — после commit, `outbox_worker` (retry / DEAD, §10.9).
+
+| Место | Outbox `op` |
+|-------|-------------|
+| `create_order` (после локального INSERT) | `create_order` (main kind=1 + suborders courier1/2 при courier legs) |
+| `assign_executor_effect` | `assign_executor` (suborder + `set_performer`; нужен `car_core_id`) |
+| `remove_executor_effect` | `remove_performer` |
+| `close_cell_effect` → `order_parcel_confirmed` | `complete_suborder` (courier1) |
+| `confirm_courier2_delivery_effect` | `complete_suborder` (courier2) + `complete_main` |
+| `sync_trip_status` → `trip_in_progress` / `trip_completed` | `assign_executor` / `complete_suborder` (`role=driver`) |
+
+`create_order` **до commit** проверяет mapping + token клиента:
+
+- нет mapping → `CLIENT_NOT_MAPPED_TO_CORE` (409), **rollback** (локального заказа нет);
+- нет token/u_hash → `MISSING_CORE_TOKENS` (409), rollback;
+- ok → `enqueue_core` в той же tx → после commit worker создаёт drive в Core.
+
+Если Core недоступен **после** успешного create_order: локальный заказ есть; outbox RETRY до `OUTBOX_MAX_ATTEMPTS`, затем DEAD.
+
+##### Поток (сводка)
+
+```text
+Frontend
+  → POST /v1/{service_id}/invoke
+  → request_runtime (service_scope + domain/platform sessions)
+  → domains/courier/commands|effects
+       ├─ sync auth/verify  → call_api("CORE") → commit
+       └─ order/FSM lifecycle → notify(channel=core) → commit
+            → outbox_worker → deliver.handle_core_outbox → call_api → mapping
+```
+
+##### Регистрация
+
+`domains/courier/processes.py` → `register_all`: operations auth + verify; effects уже с Core enqueue.
+
+##### Cleanup
+
+Каталоги `adapter/` и `old/` удалены после переноса (больше не референс в дереве репо).
