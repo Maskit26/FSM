@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from fsm_platform.host.auth import AuthError, auth_enabled, make_token, resolve_actor
 from fsm_platform.host.boot import boot
@@ -581,8 +582,21 @@ async def inbound_hook(
 
 
 class SecretBody(BaseModel):
+    """Admin upsert: value — строка или JSON-объект (объект сериализуется в строку)."""
+
     key: str
     value: str
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _coerce_value_to_str(cls, v: Any) -> str:
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (dict, list)):
+            return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+        if v is None:
+            return ""
+        return str(v)
 
 
 def _admin_or_raise(x_admin_token: Optional[str]) -> None:

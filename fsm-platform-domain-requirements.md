@@ -9,7 +9,7 @@
 | Раздел | Содержание |
 |--------|------------|
 | §1–3 | видение, принципы, кто пишет в какую БД |
-| §4 | platform: компоненты, worker, HTTP, bootstrap, secrets, call_api, inbound hooks |
+| §4 | platform: компоненты, worker, HTTP, bootstrap, secrets, call_api, inbound hooks, пример Leo4 (§4.17) |
 | §5 | картридж домена: структура, guards/effects/queries/db_layer |
 | §6 | контракт подключения картриджа: operations, ProcessDef, register_all, реестры |
 | §7 | Accept и Domain Validator: критерии, коды ошибок, отчёт |
@@ -632,7 +632,7 @@ token = get_domain_secret("TELEGRAM_BOT_TOKEN")  # только текущий �
 
 | Метод | Path | Назначение |
 |-------|------|------------|
-| PUT | `/v1/{service_id}/secrets` | upsert `{key, value}` (value шифруется) |
+| PUT | `/v1/{service_id}/secrets` | upsert `{key, value}`; `value` — строка **или** JSON-объект (объект сериализуется в строку перед шифрованием) |
 | GET | `/v1/{service_id}/secrets` | список имён ключей (без values) |
 | DELETE | `/v1/{service_id}/secrets/{key}` | удалить |
 
@@ -649,6 +649,7 @@ token = get_domain_secret("TELEGRAM_BOT_TOKEN")  # только текущий �
 {"type":"api_key_header","base_url":"...","api_key":"...","header_name":"x-api-key"}
 {"type":"basic_auth","base_url":"...","username":"...","password":"..."}
 {"type":"custom","base_url":"...","fields":{...},"signer":"domains.foo.bar:sign"}
+{"type":"none","base_url":"https://ibronevik.ru/taxi/"}
 ```
 
 | type | Поля |
@@ -657,6 +658,7 @@ token = get_domain_secret("TELEGRAM_BOT_TOKEN")  # только текущий �
 | `api_key_header` | `api_key`, `header_name` (default `x-api-key`) |
 | `basic_auth` | `username`, `password` |
 | `custom` | `fields` + `signer` = `module.path:func` |
+| `none` | только `base_url`; без auth-заголовка (публичный API: ibronevik Core) |
 
 Signer: `sign(fields, *, method, path, headers, json=None, params=None, data=None)` → mapping с опц. `headers`/`json`/`params`/`data` (merge).
 
@@ -724,6 +726,87 @@ Vendor-папки `input/leo4/`, `output/tinkoff/` в дереве platform **з
 ```text
 https://<host>/v1/{service_id}/hooks/{channel}
 ```
+
+### 4.17. Пример интеграции стороннего API (Leo4) — только норматив
+
+**Статус:** фаза 4 плана каналов **пропущена в коде** courier: нет админ-доступа / API-ключа Leo4 (нужна покупка/аккаунт).  
+Ниже — как это **должно** выглядеть на домене, когда появятся credentials. В `domains/courier` **не** реализовывать, пока нет ключа. Platform уже готов: `call_api` (§4.15) + `hooks` (§4.16).
+
+#### Онбординг credential
+
+```http
+PUT /v1/{service_id}/secrets
+X-Admin-Token: …
+Content-Type: application/json
+
+{
+  "key": "leo4",
+  "value": "{\"type\":\"api_key_header\",\"base_url\":\"https://dev.leo4.ru\",\"api_key\":\"<KEY>\",\"header_name\":\"x-api-key\"}"
+}
+```
+
+Опционально отдельно: `LEO4_WEBHOOK_SECRET` для проверки подписи входящих webhooks.
+
+В кабинете Leo4 webhook URL арендатора:
+
+```text
+https://<host>/v1/{service_id}/hooks/leo4
+```
+
+#### Исходящий вызов из effect (открытие ячейки)
+
+Пишется **в домене** (например прямо в `open_cell_effect`), не в `fsm_platform/` / `output/leo4/`:
+
+```python
+from fsm_platform.host.side_effects import call_api, ExternalApiError
+from fsm_platform.core.types import EffectResult
+
+def open_cell_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
+    # … CAS order status как сейчас …
+    try:
+        resp = call_api(
+            "leo4",
+            "POST",
+            f"/postomats/{postomat_id}/cells/{cell_id}/open",
+            json_body={"client_ref": str(instance["id"])},  # для матчинга webhook
+        )
+    except ExternalApiError as exc:
+        # transient → FSM retry; permanent → FAILED
+        return EffectResult(ok=False, error=str(exc))
+    return EffectResult(ok=True, payload={"leo4": resp.data})
+```
+
+Пути/поля тела — **иллюстрация**; точный контракт брать из актуальной OpenAPI Leo4 при подключении.
+
+#### Входящий hook (подтверждение с железа)
+
+```python
+from fsm_platform.host.hook_registry import default_webhook_registry, HookError
+from fsm_platform.host.secrets import get_domain_secret
+
+def handle_leo4_webhook(body, *, headers, query, domain_session, platform_session):
+    secret = get_domain_secret("LEO4_WEBHOOK_SECRET")
+    # проверить подпись headers vs secret; иначе:
+    # raise HookError("BAD_SIGNATURE", status_code=401)
+    client_ref = (body or {}).get("client_ref")  # instance_id / order_id
+    event = (body or {}).get("event")  # например cell_opened
+    # → enqueue существующего process / обновить domain DB
+    return {"ok": True}
+
+def register_all(service_id: str) -> None:
+    ...
+    default_webhook_registry.register(service_id, "leo4", handle_leo4_webhook)
+```
+
+#### Чеклист, когда появится ключ Leo4
+
+1. `PUT …/secrets` credential `leo4` (+ webhook secret).
+2. Callback URL в Leo4 на `…/hooks/leo4`.
+3. В `open_cell_effect` (и close при необходимости) — `call_api("leo4", …)`.
+4. Handler + `register` в `register_all`.
+5. Smoke: invoke `open_cell` → FSM → ответ Leo4 → hook → состояние заказа.
+
+До тех пор courier оставляет только локальный CAS статусов ячейки (как сейчас) — без реального железа.
 
 ---
 
@@ -3238,6 +3321,8 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 - [x] Events hub — чтение platform DB (WS poll), не in-process pub/sub.
 - [x] Generic inbound hooks `POST /v1/{service_id}/hooks/{channel}` (§4.16).
 - [x] Telegram multi-tenant: secrets + `/input/telegram/{service_id}/webhook` (фаза 3).
+- [ ] Leo4 на courier — **пропущено** до появления API-ключа; пример §4.17.
+- [ ] ibronevik Core на courier (фаза 5).
 
 ## 14. Критерии готовности домена
 
@@ -3432,10 +3517,11 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 | 1 | `ExternalApiError` → FSM retry | done | `EXTERNAL_API_TRANSIENT` в `retry_policy.py` |
 | 2 | Generic inbound `POST …/hooks/{channel}` | done | `host/hook_registry.py`, `app.py`; catalog.`hooks` |
 | 3 | Telegram multi-tenant | done + e2e ok | `settings.py` / `sender.py` / `webhook.py`; только `/input/telegram/{service_id}/…`; secrets → env fallback; legacy path удалён; e2e auto-Bearer (`client.py`) |
-| 4–5 | Leo4 / Core вызовы в domain effects | **не сделано** | поверх `call_api` + hook handler |
+| 4 | Leo4 на courier | **пропущено** (нет API-ключа) | норматив-пример **§4.17**; код домена не писать до появления credentials |
+| 5 | ibronevik Core на courier | **не сделано** | тот же паттерн `call_api` + credential; отдельно |
 | — | Изоляция процессов арендаторов | **отложено** | деплой, не код |
 
-Норматив: **§4.15**, **§4.16**, **§9.10** (Telegram multi-tenant), side-effect API **§4.13**, Public API **§9.14**.
+Норматив: **§4.15**, **§4.16**, **§4.17** (пример Leo4), **§9.10**, side-effect API **§4.13**, Public API **§9.14**.
 
 #### Фаза 3 — детали (зафиксировано после проверки)
 
@@ -3444,3 +3530,13 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 - Исходящие: outbox `channel=telegram` → `send_telegram_message` читает токен через `telegram_setting` (`service_scope` уже в outbox_worker).
 - Legacy `/input/telegram/webhook` и `/link` **удалены**.
 - E2e при auth on не падает с `401 AUTH_REQUIRED`: runner запрашивает Bearer на каждого actor.
+
+#### Фаза 4 — Leo4 (пропущено)
+
+Нет админ-доступа / токена Leo4 → интеграцию на `domains/courier` **не внедряем**.  
+Шаблон подключения (credential, `call_api` в effect, inbound `hooks/leo4`, чеклист) — **§4.17**.  
+Когда появится ключ — следовать §4.17 без правок ядра platform.
+
+#### Фаза 5 — ibronevik Core
+
+Отдельно: billing/register через `call_api` + credential в domain (можно без Leo4).

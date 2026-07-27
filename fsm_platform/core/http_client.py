@@ -4,7 +4,7 @@ Generic исходящий HTTP для доменов (Tier 1).
 Credential хранится в domain_secrets под именем credential_key как JSON:
 
   {
-    "type": "bearer_token" | "api_key_header" | "basic_auth" | "custom",
+    "type": "bearer_token" | "api_key_header" | "basic_auth" | "custom" | "none",
     "base_url": "https://api.example.com",
     ...поля типа...
   }
@@ -14,6 +14,7 @@ Credential хранится в domain_secrets под именем credential_key
   api_key_header:   api_key, header_name (default x-api-key)
   basic_auth:       username, password
   custom:           fields (dict) + signer="module.path:func"
+  none:             только base_url (публичный API, напр. ibronevik Core)
 
 Signer (custom):
   sign(fields, *, method, path, headers, json=None, params=None, data=None)
@@ -44,7 +45,7 @@ _DEFAULT_TIMEOUT = float(os.environ.get("EXTERNAL_API_TIMEOUT", "15"))
 _MAX_ATTEMPTS = int(os.environ.get("EXTERNAL_API_MAX_ATTEMPTS", "3"))
 
 _AUTH_TYPES = frozenset(
-    {"bearer_token", "api_key_header", "basic_auth", "custom"}
+    {"bearer_token", "api_key_header", "basic_auth", "custom", "none"}
 )
 
 
@@ -186,6 +187,10 @@ def _apply_auth(
                 "CREDENTIAL_USERNAME_REQUIRED", "basic_auth needs username"
             )
         return headers, (user, password)
+
+    if auth_type == "none":
+        # Публичный API: без Authorization (ibronevik Core register/auth и т.п.)
+        return headers, None
 
     # custom — auth через signer
     return headers, None
