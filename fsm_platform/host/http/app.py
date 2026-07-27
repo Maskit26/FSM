@@ -664,31 +664,38 @@ def delete_secret(
     return {"service_id": service_id, "key": key, "deleted": True}
 
 
-@app.post("/input/telegram/webhook")
-def telegram_webhook(update: dict[str, Any]) -> dict[str, Any]:
+@app.post("/input/telegram/{service_id}/webhook")
+def telegram_webhook_tenant(
+    service_id: str, update: dict[str, Any]
+) -> dict[str, Any]:
     """
-    Входящий Telegram Update (Bot webhook).
-    /start u{user_id}_{sig} → users.telegram_chat_id.
+    Multi-tenant Telegram Update.
+    При онбординге: setWebhook → https://<host>/input/telegram/{service_id}/webhook
+    Секреты бота: domain_secrets (TELEGRAM_BOT_TOKEN, …) или env fallback.
     """
     from input.telegram.webhook import handle_telegram_update
 
-    return handle_telegram_update(update)
+    return handle_telegram_update(update, service_id=service_id)
 
 
-@app.get("/input/telegram/link")
-def telegram_link(user_id: int) -> dict[str, Any]:
+@app.get("/input/telegram/{service_id}/link")
+def telegram_link_tenant(service_id: str, user_id: int) -> dict[str, Any]:
     """
-    Deep-link для фронта: пользователь открывает URL → /start в боте → bind chat_id.
-    Нужны TELEGRAM_BOT_USERNAME и TELEGRAM_BOT_TOKEN (или TELEGRAM_LINK_SECRET).
+    Deep-link для фронта арендатора.
+    Нужны TELEGRAM_BOT_USERNAME + TOKEN/LINK_SECRET в domain_secrets или env.
     """
+    from fsm_platform.host.runtime_context import service_scope
     from input.telegram.webhook import build_bot_start_url, make_start_payload
 
     try:
-        url = build_bot_start_url(user_id)
+        with service_scope(service_id):
+            url = build_bot_start_url(user_id)
+            payload = make_start_payload(user_id)
         return {
+            "service_id": service_id,
             "user_id": user_id,
             "url": url,
-            "payload": make_start_payload(user_id),
+            "payload": payload,
         }
     except RuntimeError as exc:
         raise HTTPException(400, detail=str(exc)) from exc

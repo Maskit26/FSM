@@ -8,8 +8,9 @@
 #   1) API + fsm_worker запущены (outbox встроен в worker)
 #   2) TELEGRAM_DRY_RUN=0, TELEGRAM_BOT_TOKEN задан
 #   3) привязка TG: открой deep-link из
-#        GET /input/telegram/link?user_id=3
+#        GET /input/telegram/svc_courier_01/link?user_id=3
 #      или вручную /start u3_<sig> в боте
+#      setWebhook → /input/telegram/svc_courier_01/webhook
 #   4) желательно CALL clear_test_data(); + platform clear runtime
 #
 # Сиды: client 3 = Москва, courier 2 = Москва, recipient 4 = СПб.

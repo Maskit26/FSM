@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import ssl
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Optional
+
+from output.telegram.settings import telegram_bot_token, telegram_dry_run
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +29,17 @@ def send_telegram_message(
     *,
     chat_id: str,
     text: str,
-    bot_token: str | None = None,
+    bot_token: Optional[str] = None,
 ) -> None:
     """
     POST sendMessage. Raises on HTTP/API error.
-    TELEGRAM_DRY_RUN=1 — только лог, без сети.
+
+    Token: явный bot_token → domain_secrets TELEGRAM_BOT_TOKEN (если service bound)
+    → env TELEGRAM_BOT_TOKEN (fallback).
+    TELEGRAM_DRY_RUN=1 — только лог, без сети (process-wide).
     """
-    token = (bot_token or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-    dry = str(os.environ.get("TELEGRAM_DRY_RUN") or "").strip() in (
-        "1",
-        "true",
-        "yes",
-    )
+    token = (bot_token or telegram_bot_token() or "").strip()
+    dry = telegram_dry_run()
     if dry or not token:
         logger.info(
             "telegram %s chat_id=%s text=%s",
@@ -48,7 +48,10 @@ def send_telegram_message(
             text[:200],
         )
         if not token and not dry:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
+            raise RuntimeError(
+                "TELEGRAM_BOT_TOKEN not set "
+                "(domain_secrets or env; need service_scope for secrets)"
+            )
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"

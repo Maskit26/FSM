@@ -19,7 +19,7 @@
 | §11–12 | запрещённые решения, примеры доменов |
 | §13–14 | критерии готовности |
 | §15 | глоссарий |
-| §16 | **статус реализации** блоков 0–3 и фаз каналов 0–2 (secrets / call_api / hooks) |
+| §16 | **статус реализации** блоков 0–3 и фаз каналов 0–3 (secrets / call_api / hooks / Telegram) |
 
 ---
 
@@ -2644,23 +2644,34 @@ message "/orders"
   → reply text с списком
 ```
 
-#### Привязка Telegram chat_id (deep-link) — реализовано
+#### Привязка Telegram chat_id (deep-link) — реализовано (multi-tenant, фаза 3)
 
 Bot API шлёт сообщения только в `chat_id` после того, как пользователь хотя бы раз открыл бота. В домене courier поле `users.telegram_chat_id` заполняется **signed deep-link**, не «голым» `/start`.
 
 | Шаг | Что |
 |-----|-----|
-| 1 | Фронт/ЛК: `GET /input/telegram/link?user_id=<id>` → `{ url, payload }` |
+| 0a | Онбординг секретов: `PUT /v1/{service_id}/secrets` → `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, опц. `TELEGRAM_LINK_SECRET` |
+| 0b | `setWebhook` вызывается **у Telegram Bot API** (не в Swagger platform): `https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<публичный-хост>/input/telegram/{service_id}/webhook`. `127.0.0.1` Telegram не видит — нужен туннель/деплой. Проверка: `getWebhookInfo` |
+| 1 | Фронт/ЛК: `GET /input/telegram/{service_id}/link?user_id=<id>` → `{ url, payload }` |
 | 2 | Пользователь открывает `https://t.me/<bot>?start=u{user_id}_{sig12}` |
-| 3 | Telegram шлёт Update на `POST /input/telegram/webhook` |
-| 4 | Adapter проверяет HMAC (`TELEGRAM_LINK_SECRET` или fallback `TELEGRAM_BOT_TOKEN`) |
+| 3 | Telegram POST Update → `/input/telegram/{service_id}/webhook` (тело Update заполняет Telegram; руками в Swagger не нужно) |
+| 4 | Adapter в `service_scope(service_id)`: HMAC (`TELEGRAM_LINK_SECRET` или fallback token) |
 | 5 | `UPDATE users SET telegram_chat_id = …` (domain DB) |
-| 6 | Дальше progress-notify: effect/command → `platform.notify(channel=telegram, destination=chat_id)` → `platform_outbox` → outbox в `fsm_worker` → `output/telegram/sender.py` |
+| 6 | progress-notify: `platform.notify(channel=telegram, …)` → outbox → `output/telegram/sender.py` |
 
-Код: `input/telegram/webhook.py` (вход), `output/telegram/sender.py` (выход), `domains/courier/notifications.py` (шаблоны → notify).  
-Каталог: `input/` = входящий канал, `output/` = исходящий; `channels/` в тексте выше — логическая роль adapter/sender, физические пути — `input/` + `output/`.
+Код: `input/telegram/webhook.py`, `output/telegram/sender.py`, `output/telegram/settings.py`, `domains/courier/notifications.py`.
 
-Env: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `TELEGRAM_LINK_SECRET`, `TELEGRAM_DRY_RUN` (`0` = реальная отправка).
+| Настройка | Где |
+|-----------|-----|
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_BOT_USERNAME` / `TELEGRAM_LINK_SECRET` | `domain_secrets` (приоритет) → fallback `.env` |
+| `TELEGRAM_DRY_RUN` | только process `.env` (не секрет арендатора) |
+
+Пути **только** с `{service_id}` (legacy без префикса удалён):
+
+- `POST /input/telegram/{service_id}/webhook`
+- `GET /input/telegram/{service_id}/link`
+
+E2e (`tools/domain_e2e`, сценарий `tg_notify_create_and_take`): при включённом `PLATFORM_AUTH_SECRET` клиент сам берёт Bearer через `GET /v1/auth/token` (`PLATFORM_AUTH_DEV_TOKENS=1`). Проверено: create → take → TG-уведомления клиенту.
 
 ### 9.11. Как подключаются типы клиентов
 
@@ -2668,7 +2679,7 @@ Env: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `TELEGRAM_LINK_SECRET`, `TEL
 |--------|----------------|
 | Сайт заказчика | напрямую Public API: invoke + enqueue + status |
 | Postman / OpenAPI | то же; catalog для списка operation/process |
-| Автотестер | enqueue + Idempotency-Key + poll status или `mode=wait` |
+| Автотестер | Public API + Idempotency-Key; Bearer через `/v1/auth/token` если auth on (`tools/domain_e2e`) |
 | Telegram / WhatsApp | channel adapter → Public API |
 | Голос / другие | свой adapter → тот же Public API |
 
@@ -2733,8 +2744,8 @@ OperationRegistry — единственный реестр sync handler'ов (�
 | GET | `/v1/metrics` | очереди / failed_1h / lag |
 | GET | `/v1/health` | health |
 | GET | `/v1/auth/token` | dev Bearer (opt-in) |
-| POST | `/input/telegram/webhook` | Telegram Update |
-| GET | `/input/telegram/link` | deep-link bind chat_id |
+| POST | `/input/telegram/{service_id}/webhook` | Telegram Update (multi-tenant) |
+| GET | `/input/telegram/{service_id}/link` | deep-link bind chat_id |
 
 Полный внешний HTTP-контракт. §4.10 — не публичные URL. Admin secrets — §4.15 (`PLATFORM_ADMIN_TOKEN`, не actor Bearer).
 
@@ -3226,7 +3237,7 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 - [ ] `mode=wait` = poll-in-request (если ещё не доведён — см. код enqueue).
 - [x] Events hub — чтение platform DB (WS poll), не in-process pub/sub.
 - [x] Generic inbound hooks `POST /v1/{service_id}/hooks/{channel}` (§4.16).
-- [ ] Telegram secrets из `domain_secrets` вместо `.env` (фаза 3 плана).
+- [x] Telegram multi-tenant: secrets + `/input/telegram/{service_id}/webhook` (фаза 3).
 
 ## 14. Критерии готовности домена
 
@@ -3317,7 +3328,7 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 
 Журнал того, что **уже сделано в коде** относительно плана доработок после аудита гонок. Норматив выше (§4–10) приведён в соответствие с этим статусом.  
 Отложено явно: **3.5 компенсации в сагах**.  
-Multi-tenant secrets / generic HTTP / inbound hooks — **§16.9** (фазы 0–2 плана каналов).
+Multi-tenant secrets / call_api / hooks / Telegram — **§16.9** (фазы 0–3 плана каналов).
 
 ### 16.1. Блок 0 — гонки и согласованность
 
@@ -3380,8 +3391,9 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 
 | Что | Статус |
 |-----|--------|
-| `input/telegram` + deep-link `/start` → bind `telegram_chat_id` | done (пока токен из `.env`; фаза 3 → secrets) |
-| `output/telegram` из outbox | done |
+| `input/telegram` multi-tenant webhook + secrets | done (§16.9 фаза 3; проверено e2e `tg_notify_create_and_take`) |
+| `output/telegram` из outbox (`domain_secrets` / env) | done |
+| `tools/domain_e2e` auto Bearer при `PLATFORM_AUTH_*` | done (`client.py` → `/v1/auth/token`) |
 | Generic inbound hooks `POST …/hooks/{channel}` | done (§4.16, §16.9 фаза 2) |
 | `scripts/apply_sql.py` (в т.ч. DELIMITER) | done |
 | Worker: FSM + timers + schedules + outbox + reconcile в одном цикле | done |
@@ -3389,9 +3401,10 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 
 ### 16.7. Что сознательно не трогаем в ежедневной разработке
 
-- **Auth** — не включать, пока API не публичный; Telegram/e2e работают без секрета.
+- **Auth** — для публичного API включать `PLATFORM_AUTH_SECRET`; локально e2e работает и с auth (`DEV_TOKENS=1` + авто-Bearer в runner), и без секрета.
 - **Graph publish** — нужен при горячих правках графа под нагрузкой; в dev можно править v1 в простое.
 - **Schedules** — нужны доменные process/рёбра на `schedule/{id}`; платформа только крутит интервал.
+- **Telegram setWebhook** — настраивается на стороне Bot API на публичный URL; platform Swagger `…/webhook` — приём Update, не форма setWebhook.
 
 ### 16.8. Миграции SQL (сводка файлов)
 
@@ -3405,7 +3418,7 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 | `sql/domain/022_state_timeouts.sql` | domain | timeout_* на `fsm_states` |
 | `sql/domain/023_graph_version.sql` | domain | `fsm_graph_meta`, `fsm_transitions.graph_version` |
 
-### 16.9. Multi-tenant secrets, call_api и inbound hooks (фазы 0–2)
+### 16.9. Multi-tenant secrets, call_api, hooks, Telegram (фазы 0–3)
 
 План: platform остаётся generic; секреты и HTTP in/out — без vendor-папок в ядре.
 
@@ -3418,8 +3431,16 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 | 1 | `call_api` + credential JSON types | done | `core/http_client.py`; re-export `host/side_effects.py` |
 | 1 | `ExternalApiError` → FSM retry | done | `EXTERNAL_API_TRANSIENT` в `retry_policy.py` |
 | 2 | Generic inbound `POST …/hooks/{channel}` | done | `host/hook_registry.py`, `app.py`; catalog.`hooks` |
-| 3 | Telegram → `domain_secrets` + per-service webhook URL | **не сделано** | |
+| 3 | Telegram multi-tenant | done + e2e ok | `settings.py` / `sender.py` / `webhook.py`; только `/input/telegram/{service_id}/…`; secrets → env fallback; legacy path удалён; e2e auto-Bearer (`client.py`) |
 | 4–5 | Leo4 / Core вызовы в domain effects | **не сделано** | поверх `call_api` + hook handler |
 | — | Изоляция процессов арендаторов | **отложено** | деплой, не код |
 
-Норматив: **§4.15**, **§4.16**, side-effect API **§4.13**, Public API **§9.14**.
+Норматив: **§4.15**, **§4.16**, **§9.10** (Telegram multi-tenant), side-effect API **§4.13**, Public API **§9.14**.
+
+#### Фаза 3 — детали (зафиксировано после проверки)
+
+- Онбординг: `PUT …/secrets` для `TELEGRAM_BOT_*`; `setWebhook` на Telegram API → публичный `/input/telegram/{service_id}/webhook`.
+- Deep-link: `GET /input/telegram/{service_id}/link?user_id=…`.
+- Исходящие: outbox `channel=telegram` → `send_telegram_message` читает токен через `telegram_setting` (`service_scope` уже в outbox_worker).
+- Legacy `/input/telegram/webhook` и `/link` **удалены**.
+- E2e при auth on не падает с `401 AUTH_REQUIRED`: runner запрашивает Bearer на каждого actor.

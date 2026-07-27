@@ -46,12 +46,13 @@ python fsm_worker.py
 
 ### Telegram-уведомления
 
-1. Фронт (после логина): `GET /input/telegram/link?user_id=<id>` → URL вида  
+1. Фронт (после логина): `GET /input/telegram/{service_id}/link?user_id=<id>` → URL вида  
    `https://t.me/<bot>?start=u{id}_{sig}`
-2. Пользователь открывает ссылку → бот получает `/start` с payload → пишется `telegram_chat_id`.
-3. Прогресс заказа: effect → `platform_outbox` → `fsm_worker` → Bot API.
-4. Шаблоны: `domains/courier/notifications.py`.  
-   Env: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, опц. `TELEGRAM_LINK_SECRET`.  
+2. `setWebhook` бота → `POST /input/telegram/{service_id}/webhook`.
+3. Пользователь открывает ссылку → бот получает `/start` с payload → пишется `telegram_chat_id`.
+4. Прогресс заказа: effect → `platform_outbox` → `fsm_worker` → Bot API.
+5. Шаблоны: `domains/courier/notifications.py`.  
+   Секреты: `domain_secrets` (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, опц. `TELEGRAM_LINK_SECRET`) или env fallback.  
    Dev без сети: `TELEGRAM_DRY_RUN=1`.
 
 ## Тесты без БД
