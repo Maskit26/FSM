@@ -5,13 +5,18 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from fsm_platform.host.auth import AuthError, auth_enabled, make_token, resolve_actor
 from fsm_platform.host.boot import boot
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.http.events_ws import router as events_ws_router
+from fsm_platform.host.hook_registry import (
+    HookError,
+    default_webhook_registry,
+    dispatch_inbound_hook,
+)
 from fsm_platform.host.operations import default_operation_registry
 from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.core.db_layer import default_db_layer
@@ -122,10 +127,16 @@ def metrics() -> dict[str, Any]:
 
 @app.get("/v1/{service_id}/catalog")
 def catalog(service_id: str) -> dict[str, Any]:
-    """Каталог операций и процессов домена. Удобно смотреть, что доступно в Swagger."""
+    """Каталог операций, процессов и inbound hook channels домена."""
     ops = default_operation_registry.list(service_id)
     processes = default_process_registry.list_process_names(service_id)
-    return {"service_id": service_id, "operations": ops, "processes": processes}
+    hooks = default_webhook_registry.list_channels(service_id)
+    return {
+        "service_id": service_id,
+        "operations": ops,
+        "processes": processes,
+        "hooks": hooks,
+    }
 
 
 @app.post("/v1/{service_id}/invoke")
@@ -513,6 +524,60 @@ def graph_publish(service_id: str) -> dict[str, Any]:
         raise HTTPException(400, detail=str(exc)) from exc
     finally:
         sd.close()
+
+
+@app.post("/v1/{service_id}/hooks/{channel}")
+async def inbound_hook(
+    service_id: str,
+    channel: str,
+    request: Request,
+) -> dict[str, Any]:
+    """
+    Generic inbound webhook от стороннего API (снаружи → внутрь).
+    Платформа только диспетчерит (service_id, channel) → handler домена.
+    Разбор payload / проверка подписи — в domain handler
+    (register: default_webhook_registry.register(service_id, channel, fn)).
+    Не путать с outbound POST …/webhooks (подписки клиентов на platform_events).
+    """
+    import json
+
+    raw = await request.body()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    query = {k: v for k, v in request.query_params.multi_items()}
+    body: Any
+    if not raw:
+        body = None
+    else:
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            body = raw
+
+    try:
+        return dispatch_inbound_hook(
+            service_id,
+            channel,
+            body=body,
+            headers=headers,
+            query=query,
+            raw_body=raw,
+        )
+    except HookError as exc:
+        raise HTTPException(
+            exc.status_code,
+            detail={"error_code": exc.code, "message": str(exc)},
+        ) from exc
+    except DomainError as exc:
+        raise HTTPException(
+            409,
+            detail={"error_code": exc.code, "message": exc.message},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, detail=str(exc)) from exc
 
 
 class SecretBody(BaseModel):

@@ -9,17 +9,17 @@
 | Раздел | Содержание |
 |--------|------------|
 | §1–3 | видение, принципы, кто пишет в какую БД |
-| §4 | platform: компоненты, worker, HTTP, bootstrap |
+| §4 | platform: компоненты, worker, HTTP, bootstrap, secrets, call_api, inbound hooks |
 | §5 | картридж домена: структура, guards/effects/queries/db_layer |
 | §6 | контракт подключения картриджа: operations, ProcessDef, register_all, реестры |
 | §7 | Accept и Domain Validator: критерии, коды ошибок, отчёт |
 | §8 | модули `fsm_core`: файлы, алгоритмы, таблицы |
-| §9 | публичный API клиентов, channel adapters |
+| §9 | публичный API клиентов, channel adapters, inbound hooks |
 | §10 | исходящие ответы клиенту: poll, SSE/WS, outbox, webhooks |
 | §11–12 | запрещённые решения, примеры доменов |
 | §13–14 | критерии готовности |
 | §15 | глоссарий |
-| §16 | **статус реализации** блоков 0–3 и сопутствующих правок (что сделано в коде) |
+| §16 | **статус реализации** блоков 0–3 и фаз каналов 0–2 (secrets / call_api / hooks) |
 
 ---
 
@@ -55,7 +55,7 @@ Platform HTTP-слой (Gateway → Dispatcher → Request Runtime)
 4. **Guard routing** — `priority ASC, id ASC`; NULL-guard = unconditional; иначе первый `ok=true` (§4.4).
 5. **Разделение ответственности за UPDATE** — `TransitionExecutor` / `fsm_core` db_layer меняет только FSM-state и log в platform DB; бизнес-таблицы домена меняются в **effects** домена.
 6. **Картридж** — добавление домена = SQL seed + Python register + конфиг, без правки ядра platform.
-7. **Side effects наружу** — HTTP/push через `platform.notify` → `platform_outbox`; события — `platform.emit_event`; таймеры — `platform.schedule_timer` (после commit — outbox_worker).
+7. **Side effects наружу** — HTTP/push через `platform.notify` → `platform_outbox`; события — `platform.emit_event`; таймеры — `platform.schedule_timer`; **внешний HTTP API** — только `platform.call_api` / `get_domain_secret` (§4.13, §4.15). После commit — outbox_worker.
 8. **Session только platform** — session к любой БД открывает worker (FSM) или Request Runtime (REST); домен session не создаёт.
 9. **Два db_layer** — `fsm_platform/core/db_layer.py` только platform DB; `domains/<type>/db_layer.py` только domain DB.
 10. **Домен только после валидации** — status `active` после Domain Validator; иначе REST/FSM для `service_id` не обслуживаются.
@@ -65,6 +65,8 @@ Platform HTTP-слой (Gateway → Dispatcher → Request Runtime)
 14. **Outbox producer** — запись в `platform_outbox` только через `platform.notify` (и platform fan-out webhooks); не из сырого SQL домена и не из трёх независимых точек.
 15. **Accept без remote code exec в prod** — пакеты только из доверенного registry; произвольный zip→import в prod запрещён (§7.10).
 16. **Multi-entity companions** — один process-step может двигать несколько сущностей: после primary (`ProcessDef.entity_type`) TransitionRunner по очереди выполняет companions из `effect_params` выбранного primary-ребра. Каждый companion — полный pipeline `candidates → guards → apply → effect` по своему `entity_type` / `event_name`; `entity_id` берётся из context по `entity_id_key`. Fail любого companion → FAILED всего шага (rollback dual-tx у worker). Оркестрацию делает runner, не Python-effect. Подробности §4.3, §8.5.
+17. **Per-tenant secrets** — API-ключи / bot tokens / credential JSON только в `domain_secrets` (шифровано); доменный код читает `get_domain_secret(key)` **без** параметра `service_id` (биндинг через `contextvars`, §4.15). `.env` — только инфраструктура самой platform (`PLATFORM_*`), не секреты арендаторов.
+18. **Inbound hooks vs Public commands** — события от внешних систем → `POST …/hooks/{channel}` (§4.16); команды/запросы клиентов → `invoke` / `enqueue` (§9). Vendor-парсеры живут в домене, не в ядре platform.
 
 ---
 
@@ -130,6 +132,10 @@ Platform **не** обязана:
 | Transition repository | `fsm_platform/core/transition_repository.py` | SELECT candidates + params из domain DB (§8.10) |
 | Transition executor | `fsm_platform/core/transition_executor.py` | apply state+log через db_layer (§8.11) |
 | Timers helper | `fsm_platform/core/timers.py` | schedule/cancel → `fsm_timers` (§8.6) |
+| HTTP client | `fsm_platform/core/http_client.py` | generic `call_api` + credentials из `domain_secrets` (§4.15) |
+| Runtime context | `fsm_platform/host/runtime_context.py` | `service_scope` / `current_service_id` (contextvars) |
+| Secrets | `fsm_platform/host/secrets.py` | Fernet + CRUD `domain_secrets`; admin token |
+| Inbound hooks | `fsm_platform/host/hook_registry.py` | `default_webhook_registry` + `dispatch_inbound_hook` (§4.16) |
 | Worker | `fsm_worker.py` | poll, claim, session, commit/rollback, mark FAILED |
 | Bootstrap | `domains/bootstrap.py` | загрузка доменов из Domain Registry / `FSM_DOMAINS` |
 | HTTP Gateway | `fsm_platform/host/http/app.py` (или `main.py`) | HTTP in/out, auth, status code, JSON |
@@ -209,6 +215,7 @@ Worker открывает `session_platform` + `session_domain`, владеет 
 | `fsm_sagas` / `fsm_saga_children` | async saga: parent + children + fan-in |
 | `entity_fsm_state` | `(service_id, entity_type, entity_id) → current_state` |
 | `domain_services` | Domain Registry + `db_secret_ref` (§6.4); boot → `engine_by_service_id` в RAM |
+| `domain_secrets` | per-tenant секреты/credentials (Fernet); §4.15 |
 | `idempotency_keys` | Idempotency-Key → результат enqueue/invoke (§4.14) |
 | `platform_outbox` | webhooks, channel push, external HTTP (§10) |
 | `platform_events` | события для WS/poll/подписок (§10) |
@@ -481,11 +488,19 @@ platform.notify(session_platform, service_id=..., channel=..., destination=...,
 platform.emit_event(session_platform, service_id=..., event_type=...,
                     instance_id=..., entity_type=..., entity_id=..., payload=...)
 # emit_event → INSERT platform_events (единственный writer событий)
+
+# внешний HTTP (Tier 1) — service_id из runtime_context, не аргумент:
+from fsm_platform.host.side_effects import call_api, ExternalApiError
+resp = call_api("leo4", "POST", "/cells/open", json_body={...})
+# credential JSON читается из domain_secrets текущего арендатора (§4.15)
 ```
+
+Реализация side-effect API: `fsm_platform/host/side_effects.py` (re-export `call_api` из `core/http_client.py`).
 
 Fan-out webhooks — platform hook (§10.6): `emit_event` + `notify` для подписчиков.  
 Сырой INSERT в `platform_events` / `platform_outbox` вне этих API — **запрещён**.  
-HTTP наружу — `outbox_worker` после commit (§10).
+Сырой `requests` / `os.environ` за чужими ключами из effect — **запрещён**; только `call_api` / `get_domain_secret`.  
+HTTP наружу (каналы/webhooks) — `outbox_worker` после commit (§10). Sync-вызов внешнего API в effect/command — через `call_api` (§4.15).
 
 ### 4.14. Нормативные схемы platform-таблиц (минимум v1)
 
@@ -566,10 +581,149 @@ UNIQUE(`service_id`, `scope`, `key`).
 | `active` | bool |
 | `created_at` | |
 
+#### `domain_secrets`
+
+| Поле | Смысл |
+|------|--------|
+| `service_id` | арендатор |
+| `key` | имя секрета / credential (например `leo4`, `TELEGRAM_BOT_TOKEN`) |
+| `value_enc` | Fernet-ciphertext (`PLATFORM_SECRETS_KEY`) |
+| `created_at`, `updated_at` | |
+
+PRIMARY KEY (`service_id`, `key`). Значения наружу (Admin GET) **не** отдаём — только список имён ключей.  
+Схема также в `sql/platform/001_platform_schema.sql`; миграция существующих БД — `008_domain_secrets.sql`.
+
 #### Engines map (RAM, не отдельная «магия»)
 
 Отдельной таблицы `engines` в v1 нет. Источник: `domain_services.db_secret_ref` (+ опц. `pool_options_json`).  
 При boot: `engine_by_service_id[service_id] = create_engine(secret)`. Connection к domain DB — только через этот map.
+
+### 4.15. Multi-tenant secrets и generic HTTP (`call_api`)
+
+Цель: platform **не** хранит ключи арендаторов в `.env` процесса и **не** знает конкретные API (Leo4, банк, Core). В `.env` только инфраструктура platform:
+
+| Env | Назначение |
+|-----|------------|
+| `PLATFORM_SECRETS_KEY` | мастер-ключ Fernet для `domain_secrets.value_enc` |
+| `PLATFORM_ADMIN_TOKEN` | заголовок `X-Admin-Token` для Admin API секретов |
+| `EXTERNAL_API_TIMEOUT` | таймаут `call_api` (default 15s) |
+| `EXTERNAL_API_MAX_ATTEMPTS` | локальные ретраи внутри одного вызова (default 3) |
+
+#### Изоляция `service_id` (contextvars)
+
+Перед вызовом доменного кода platform биндит арендатора:
+
+```text
+service_scope(service_id)  →  command / effect / guard / on_failed / outbox deliver
+```
+
+Точки bind: `request_runtime.run_operation`, `engine.run_instance`, `worker._call_on_failed`, `list_available_actions`, `outbox_worker.deliver_one`.
+
+Доменный API **без** параметра `service_id`:
+
+```python
+from fsm_platform.host.secrets import get_domain_secret, set_domain_secret
+token = get_domain_secret("TELEGRAM_BOT_TOKEN")  # только текущий арендатор
+```
+
+Подставить чужой `service_id` через сигнатуру нельзя (параметра нет). Полная изоляция процессов между арендаторами — отдельно (деплой); здесь закрыта утечка секретов через API platform.
+
+#### Admin API секретов
+
+| Метод | Path | Назначение |
+|-------|------|------------|
+| PUT | `/v1/{service_id}/secrets` | upsert `{key, value}` (value шифруется) |
+| GET | `/v1/{service_id}/secrets` | список имён ключей (без values) |
+| DELETE | `/v1/{service_id}/secrets/{key}` | удалить |
+
+Заголовок: `X-Admin-Token: <PLATFORM_ADMIN_TOKEN>`. Не путать с actor Bearer (§9.7).
+
+Модули: `fsm_platform/host/secrets.py`, `runtime_context.py`; маршруты в `host/http/app.py`.
+
+#### Credential JSON + `call_api`
+
+Секрет с именем credential (например `leo4`) хранит JSON:
+
+```json
+{"type":"bearer_token","base_url":"https://api.example.com","token":"..."}
+{"type":"api_key_header","base_url":"...","api_key":"...","header_name":"x-api-key"}
+{"type":"basic_auth","base_url":"...","username":"...","password":"..."}
+{"type":"custom","base_url":"...","fields":{...},"signer":"domains.foo.bar:sign"}
+```
+
+| type | Поля |
+|------|------|
+| `bearer_token` | `token` → `Authorization: Bearer …` |
+| `api_key_header` | `api_key`, `header_name` (default `x-api-key`) |
+| `basic_auth` | `username`, `password` |
+| `custom` | `fields` + `signer` = `module.path:func` |
+
+Signer: `sign(fields, *, method, path, headers, json=None, params=None, data=None)` → mapping с опц. `headers`/`json`/`params`/`data` (merge).
+
+```python
+from fsm_platform.host.side_effects import call_api, ExternalApiError
+resp = call_api("leo4", "POST", "/v1/open", json_body={"cell_id": 1})
+# resp.status_code, resp.data, resp.ok
+```
+
+Ошибки: `ExternalApiError` (`transient=True` → в тексте `EXTERNAL_API_TRANSIENT` → FSM retry policy §1.1 / `host/retry_policy.py`).  
+Локальные ретраи: timeout / connection / 5xx / 429; 4xx (кроме 408/429) — permanent.
+
+Специфичные клиенты Leo4/Core/банка **не** живут в `fsm_platform/` / `output/{vendor}/` — вызовы пишутся в domain `effects.py`/`commands.py` поверх `call_api`. Входящие webhooks сторонних API — §4.16.
+
+### 4.16. Generic inbound hooks (снаружи → внутрь)
+
+Один платформенный вход для webhooks от внешних систем (Leo4, банк, платёжный шлюз, …).  
+Платформа **не** знает формат Leo4/Тинькофф: только диспетчерит `(service_id, channel)` → handler домена.
+
+**Три разных HTTP-входа — не путать:**
+
+| Вход | Направление | Кто вызывает | Зачем |
+|------|-------------|--------------|--------|
+| `POST …/invoke`, `…/fsm/enqueue` | клиент → platform | UI, Telegram-adapter, автотестер | **команды/запросы** домена (catalog.`operations` / `processes`) |
+| `POST …/hooks/{channel}` | внешняя система → platform | Leo4, банк, ERP | **событие снаружи** («ячейка открылась», «платёж ok») |
+| `POST …/webhooks` + outbox | platform → клиент | подписчик заказчика | **уведомление наружу** о `platform_events` (§9.9, §10.7) |
+
+`GET …/catalog`.`hooks` — список зарегистрированных **channel-имён** inbound handlers, а не полный список Public API команд. Список команд — `operations` / `processes` того же catalog.
+
+| | |
+|--|--|
+| URL | `POST /v1/{service_id}/hooks/{channel}` |
+| Реестр | `default_webhook_registry` (`fsm_platform/host/hook_registry.py`) |
+| Регистрация | в `register_all(service_id)`: `default_webhook_registry.register(service_id, "leo4", handle_fn)` |
+| Что делает platform | parse body (JSON если возможно), `service_scope`, sessions domain+platform, dispatch, commit/rollback |
+| Что делает домен | проверка подписи (`get_domain_secret`), разбор payload, дальше `enqueue` / domain SQL / side-effects |
+| Ошибки | неизвестный channel → `404 UNKNOWN_HOOK_CHANNEL`; домен → `HookError(code, status_code=401\|…)` |
+
+```python
+from fsm_platform.host.hook_registry import default_webhook_registry, HookError
+from fsm_platform.host.secrets import get_domain_secret
+
+def handle_leo4(body, *, headers, query, domain_session, platform_session):
+    secret = get_domain_secret("LEO4_WEBHOOK_SECRET")
+    # verify signature from headers / body…
+    # → enqueue process или обновить domain DB
+    return {"ok": True}
+
+def register_all(service_id: str) -> None:
+    ...
+    default_webhook_registry.register(service_id, "leo4", handle_leo4)
+```
+
+Типичная сигнатура handler (любой subset kwargs по `inspect`):
+
+```text
+body, headers, query, raw_body, domain_session, platform_session, service_id, channel
+```
+
+Handler может жить в `effects.py`, `commands.py` или отдельном модуле домена — platform путь файла не диктует.  
+Vendor-папки `input/leo4/`, `output/tinkoff/` в дереве platform **запрещены** (§11).
+
+Внешняя система настраивает свой webhook URL на:
+
+```text
+https://<host>/v1/{service_id}/hooks/{channel}
+```
 
 ---
 
@@ -585,7 +739,8 @@ domains/<domain_name>/
   sql/
     fsm/                 # fsm_states, fsm_events, fsm_transitions → domain DB
     domain/              # orders, taxi_orders, … → domain DB
-  processes.py           # register_all: ProcessDef, OperationRegistry, guards/effects
+  processes.py           # register_all: ProcessDef, OperationRegistry, guards/effects,
+                         #               опц. default_webhook_registry (inbound hooks §4.16)
   context.py
   guards.py
   effects.py
@@ -608,7 +763,7 @@ Platform DB не содержит states/events/transitions домена — т�
 
 | Файл | Требование |
 |------|------------|
-| `processes.py` | `register_all()`: ProcessDef, OperationRegistry, guards, effects (без HTTP routes) |
+| `processes.py` | `register_all()`: ProcessDef, OperationRegistry, guards, effects; опц. inbound hooks (§4.16) |
 | `context.py` | сбор данных для guards/effects по instance |
 | `guards.py` | `(session, db, context, instance, params) → GuardResult` |
 | `effects.py` | `→ EffectResult`; запись через domain db_layer; notify/timers — `platform.*` (§4.13) |
@@ -691,9 +846,10 @@ Platform не навязывает единый lifecycle всем домена�
 - Менять код `fsm_core` / Gateway.
 - Писать business через TransitionExecutor / fsm_core db_layer.
 - Открывать session сам.
-- Произвольный SQL в platform DB — только `platform.notify` / `platform.emit_event` / `platform.schedule_timer` (§4.13).
+- Произвольный SQL в platform DB — только side-effect API §4.13 (`notify` / `emit_event` / `schedule_timer`).
 - Бизнес-SQL вне domain `db_layer.py`.
-- Синхронный внешний HTTP из effect.
+- Сырой внешний HTTP (`requests`/`httpx`) и чтение чужих ключей из `os.environ` — только `call_api` / `get_domain_secret` (§4.15).
+- Регистрировать FastAPI routes / `(method, path)` — только RAM-реестры (operations, FSM, опц. webhook_registry).
 - Статусы instance в `fsm_states` как entity states.
 
 ### 5.9. Подключение домена (чеклист разработчика картриджа)
@@ -701,9 +857,9 @@ Platform не навязывает единый lifecycle всем домена�
 1. Создать `domains/<name>/` по структуре §5.1, включая `manifest.yaml`.
 2. Написать SQL seed: `sql/fsm/` + `sql/domain/` (+ ХП домена при необходимости).
 3. Подготовить domain DB: накатить схему/граф/ХП **до** Accept в platform (v1: накат на стороне заказчика/devops).
-4. Зарегистрировать в `register_all()`: ProcessDef, guards, effects, OperationRegistry (§6.7).
+4. Зарегистрировать в `register_all()`: ProcessDef, guards, effects, OperationRegistry; при интеграции с внешним API — inbound hook (§6.7, §4.16).
 5. Пройти Domain Validator (§7) → статус active; разбор ошибок — §7.13.
-6. Smoke Command и Query после активации.
+6. Smoke Command и Query после активации; для hooks — `POST …/hooks/{channel}` с тестовым payload.
 
 Полный контракт подключения (operations, kind, ProcessDef, имена графа) — §6; критерии Validator — §7.
 
@@ -1039,7 +1195,11 @@ def register_all(service_id: str) -> None:
 5. Не регистрировать HTTP routes / FastAPI router.
 6. Не открывать DB connection и не выполнять SQL (только заполнение RAM).
 
-Минимум содержимого: **хотя бы одна** Operation **или** один ProcessDef. Пустой `register_all` → fail Validator (`EMPTY_REGISTRATION`).
+`register_all` **может** (если домен принимает webhooks внешних систем):
+
+7. Зарегистрировать inbound handlers: `default_webhook_registry.register(service_id, channel, fn)` (§4.16). Channel попадает в `GET …/catalog`.`hooks`.
+
+Минимум содержимого: **хотя бы одна** Operation **или** один ProcessDef. Пустой `register_all` → fail Validator (`EMPTY_REGISTRATION`). Inbound hooks без operations/processes сами по себе минимумом не считаются.
 
 #### 6.7.2. Пример полного `register_all` (courier, сокращённо)
 
@@ -1380,6 +1540,7 @@ Validator **не** обязан импортировать и «прогонят
 | `transition_repository.py` | чтение candidates из **domain DB** (`fsm_transitions`…) |
 | `transition_executor.py` | apply перехода: state + log через `db_layer` (только platform) |
 | `timers.py` | schedule/cancel → `fsm_timers` через `db_layer` |
+| `http_client.py` | generic `call_api` / credentials / `ExternalApiError` (§4.15) |
 | `errors.py` | коды ошибок FSM |
 
 Две БД — два канала доступа:
@@ -1409,7 +1570,7 @@ fsm_worker
             → transition_repository         (domain DB: fsm_*)
             → registry guards               (могут читать domain DB)
             → transition_executor → db_layer (platform DB: state + log)
-            → effects → domain db_layer; platform.notify / emit_event / schedule_timer
+            → effects → domain db_layer; platform.notify / emit_event / schedule_timer / call_api
 ```
 
 ---
@@ -2387,18 +2548,24 @@ Content-Type: application/json
 ```json
 {
   "service_id": "svc_courier_acme_01",
-  "cartridge_type": "courier",
-  "processes": [
-    { "process_name": "order_creation", "entity_type": "order_request", "event_name": "order_create" }
-  ],
+  "processes": ["order_creation", "locker_reserve", "open_cell"],
   "operations": [
     { "operation": "list_client_orders", "kind": "query" },
     { "operation": "create_order_request", "kind": "command" }
-  ]
+  ],
+  "hooks": ["leo4"]
 }
 ```
 
-Источник: ProcessRegistry + OperationRegistry в RAM (§6.5–6.7). После Accept UI/клиент опирается на catalog, а не на хардкод имён.
+| Поле | Источник | Смысл |
+|------|----------|--------|
+| `operations` | OperationRegistry | что вызывать через `invoke` |
+| `processes` | ProcessRegistry | что ставить в очередь через `enqueue` |
+| `hooks` | `default_webhook_registry` | какие inbound channel принимают `POST …/hooks/{channel}` (§4.16) |
+
+`hooks` — **не** список команд для клиента. Клиент/автотестер управляет доменом через `operations`/`processes`; внешняя система (Leo4) шлёт события на hooks.
+
+Источник: ProcessRegistry + OperationRegistry + WebhookRegistry в RAM (§6.5–6.7, §4.16). После Accept UI/клиент опирается на catalog, а не на хардкод имён.
 
 ### 9.7. Auth и актор
 
@@ -2428,12 +2595,21 @@ Content-Type: application/json
 
 HTTP: `400` контракт/валидация, `401`/`403` auth, `404` неизвестный instance/operation, `409` конфликт idempotency/state, `504` wait timeout. Коды FSM instance (`NO_GUARD_MATCHED` и т.д.) — в status/`last_error` после async, не обязательно как HTTP 500 на enqueue (enqueue уже принял задачу).
 
-### 9.9. Webhooks (outbound) — кратко
+### 9.9. Webhooks outbound vs inbound hooks
 
-Клиент регистрирует URL (`POST /v1/{service_id}/webhooks` + `secret`).  
+| | Outbound (§10.7) | Inbound (§4.16) |
+|--|------------------|-----------------|
+| URL | `POST/GET …/webhooks` (регистрация подписки) | `POST …/hooks/{channel}` (приём события) |
+| Направление | platform → URL клиента | внешняя система → platform |
+| Кто пишет payload | platform (`platform_events`) | внешняя система (свой формат) |
+| Хранение | `webhook_subscriptions` | RAM `default_webhook_registry` + логика в домене |
+| Доставка | `platform_outbox` → `output/webhook` | сразу handler домена в HTTP-запросе |
+
+**Outbound (кратко):** клиент регистрирует URL (`POST /v1/{service_id}/webhooks` + `secret`).  
 Platform fan-out на `fsm.instance.completed` / `failed`: `emit_event` + `notify(channel=webhook)` → `platform_outbox` → `outbox_worker` → `output/webhook/sender.py` (HMAC `X-FSM-Signature`).
 
-Полная модель исходящих каналов (poll, WS, outbox, channel push, external) — **§10**.
+Полная модель исходящих каналов (poll, WS, outbox, channel push, external) — **§10**.  
+Inbound от Leo4/банка — **§4.16**, не этот подраздел.
 
 ### 9.10. Channel adapters
 
@@ -2521,6 +2697,10 @@ OperationRegistry — единственный реестр sync handler'ов (�
 | `fsm_platform/host/http/app.py` | `GET .../catalog` из RAM-реестров |
 | `fsm_platform/host/http/app.py` | `POST .../invoke` → dispatcher → Request Runtime |
 | `fsm_platform/host/auth.py` | opt-in HMAC Bearer (`PLATFORM_AUTH_SECRET`); §9.7 |
+| `fsm_platform/host/runtime_context.py` | `service_scope` / `current_service_id` (§4.15) |
+| `fsm_platform/host/secrets.py` | Fernet secrets + `require_admin`; Admin routes в `app.py` |
+| `fsm_platform/host/hook_registry.py` | inbound `default_webhook_registry` + `dispatch_inbound_hook` (§4.16) |
+| `fsm_platform/core/http_client.py` | `call_api` (re-export через `side_effects`) |
 | `idempotency_keys` + enqueue | заголовок Idempotency-Key (§4.14, §9.3) — реализовано |
 | OperationRegistry | RAM §6.5; наполняет `register_all` (домен) |
 | Public API routes | фиксированные path §9; код platform |
@@ -2536,7 +2716,7 @@ OperationRegistry — единственный реестр sync handler'ов (�
 | POST | `/v1/{service_id}/fsm/enqueue` | async Command (+ Idempotency-Key) |
 | GET | `/v1/{service_id}/fsm/instances/{id}` | status instance |
 | POST | `/v1/{service_id}/invoke` | sync Query/Command |
-| GET | `/v1/{service_id}/catalog` | processes + operations |
+| GET | `/v1/{service_id}/catalog` | processes + operations + hooks |
 | POST | `/v1/{service_id}/entities/{type}/{id}/actions` | available actions |
 | GET | `/v1/{service_id}/entities/{type}/{id}/history` | history / audit |
 | GET | `/v1/{service_id}/events` | poll platform_events |
@@ -2546,13 +2726,17 @@ OperationRegistry — единственный реестр sync handler'ов (�
 | POST/GET | `/v1/{service_id}/schedules` | периодические процессы |
 | POST | `/v1/{service_id}/schedules/{id}/pause\|resume` | пауза schedule |
 | POST | `/v1/{service_id}/graph/publish` | новая версия графа (domain) |
+| POST | `/v1/{service_id}/hooks/{channel}` | inbound webhook стороннего API → domain handler (§4.16) |
+| PUT | `/v1/{service_id}/secrets` | admin: upsert секрет / credential JSON (`X-Admin-Token`) |
+| GET | `/v1/{service_id}/secrets` | admin: список имён ключей |
+| DELETE | `/v1/{service_id}/secrets/{key}` | admin: удалить секрет |
 | GET | `/v1/metrics` | очереди / failed_1h / lag |
 | GET | `/v1/health` | health |
 | GET | `/v1/auth/token` | dev Bearer (opt-in) |
 | POST | `/input/telegram/webhook` | Telegram Update |
 | GET | `/input/telegram/link` | deep-link bind chat_id |
 
-Полный внешний HTTP-контракт. §4.10 — не публичные URL. Admin/Accept — отдельно.
+Полный внешний HTTP-контракт. §4.10 — не публичные URL. Admin secrets — §4.15 (`PLATFORM_ADMIN_TOKEN`, не actor Bearer).
 
 ### 9.15. Чеклист реализации Public API
 
@@ -2824,9 +3008,16 @@ Sender на **выходе** только доставляет сообщени�
 
 ### 10.9. External outbox (Core / ERP)
 
-External-интеграции (Core/ERP) — тот же `platform_outbox` с `channel=http_external` (или `core`) через **`platform.notify`**. Цепочки вызовов — отдельные FSM transitions / timers, не зависимости между строками outbox.
+Два разных пути наружу к Core/ERP:
 
-Браузер external outbox не читает: ему poll / SSE / webhook.
+| Когда | Механизм |
+|-------|----------|
+| Нужен **reliable async** push после commit (уведомить внешнюю систему о событии) | `platform.notify` → `platform_outbox` (`channel=http_external` / `core`) → outbox_worker |
+| Нужен **sync** запрос-ответ внутри command/effect (register, billing, open cell) | `call_api(credential_key, …)` (§4.15); credential в `domain_secrets` |
+
+Цепочки вызовов — FSM transitions / timers, не зависимости между строками outbox.  
+Браузер external outbox не читает: ему poll / SSE / webhook.  
+Vendor-клиенты (Leo4, Core) **не** кладутся в `fsm_platform/` / `output/{vendor}/` — только domain code поверх `call_api`.
 
 ### 10.10. WebSocket (пример: биржи курьера и водителя)
 
@@ -2958,6 +3149,10 @@ Worker FSM после `run_instance`: при COMPLETED — fan-out в рабоч
 | Параллельная «SQL Core» procedure рядом с TransitionExecutor | один путь: TransitionExecutor (§4.6) |
 | `core_outbox` + `platform_outbox` | только `platform_outbox` |
 | Произвольный SQL домена в platform DB | только notify / emit_event / schedule_timer (§4.13) |
+| Сырой `requests` / ключи арендатора в `.env` / `os.environ` из domain | `domain_secrets` + `call_api` / `get_domain_secret` (§4.15) |
+| `output/leo4`, `input/tinkoff` и т.п. в дереве platform | вызовы в domain effects; platform только generic `call_api` / hooks |
+| Inbound webhook стороннего API как новый Public `invoke` без handler | `default_webhook_registry` + `POST …/hooks/{channel}` (§4.16) |
+| `get_domain_secret(service_id, key)` с чужим id | только `get_domain_secret(key)` + `service_scope` (§4.15) |
 | IF `entity_type` → выбор таблицы домена внутри `fsm_core` | opaque `entity_type`/`entity_id`; схему знает только домен |
 | Смешение SQL platform и domain в одном db_layer | `fsm_platform/core/db_layer.py` + `domains/*/db_layer.py` |
 | Хардкод внешних URL клиентов в обход Public API | только `/v1/{service_id}/…` (§9) |
@@ -3010,7 +3205,7 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 - [x] Guard routing по priority работает и логирует reason при отказе.
 - [x] TransitionExecutor → только `entity_fsm_state` + `fsm_transition_logs` (CAS + FOR UPDATE).
 - [x] Dual-DB commit §4.7; recovery §4.7.1 (`platform_reconcile_queue` + reconcile worker).
-- [x] Bootstrap state §4.12; side-effect API §4.13.
+- [x] Bootstrap state §4.12; side-effect API §4.13 (+ `call_api` §4.15).
 - [x] Guard default §4.4; `list_candidates` через `session_domain` (+ pin `graph_version`).
 - [x] Bootstrap: active домены из Domain Registry / `FSM_DOMAINS` → `register_all`.
 - [ ] Domain Validator §7: полный Accept-контур (частично есть код validator).
@@ -3020,15 +3215,18 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 - [x] Public API routes + OperationRegistry + Request Runtime (§4.10.1).
 - [x] Request Runtime владеет session на HTTP-запрос; домен session не открывает.
 - [x] Query / Command через invoke; lifecycle в worker.
-- [x] Public API: enqueue, invoke, instances, catalog, actions, history, events, WS, webhooks, schedules, metrics (§9.14).
+- [x] Public API: enqueue, invoke, instances, catalog, actions, history, events, WS, webhooks, schedules, secrets (admin), metrics (§9.14).
 - [x] Idempotency-Key на enqueue; Auth opt-in (`PLATFORM_AUTH_SECRET`) — для prod включать отдельно.
+- [x] Multi-tenant `domain_secrets` + `call_api` (§4.15); bind `service_id` на входах в домен.
 - [x] Smoke / e2e домен courier через Public API (`tools/domain_e2e`).
 - [x] Channel adapter Telegram (`input/` + `output/`) через / рядом с Public API.
 - [x] Исходящий контур: poll + outbox_worker (telegram + webhook); WS events (вместо обязательного SSE).
-- [x] Нет HTTP наружу из fsm_core / effect до commit.
-- [x] Outbox/events через notify/emit_event; FAILED fan-out в short tx; retry instances.
+- [x] Нет HTTP наружу из fsm_core / effect до commit (каналы); sync внешний API — только `call_api`.
+- [x] Outbox/events через notify/emit_event; FAILED fan-out в short tx; retry instances (+ `EXTERNAL_API_TRANSIENT`).
 - [ ] `mode=wait` = poll-in-request (если ещё не доведён — см. код enqueue).
 - [x] Events hub — чтение platform DB (WS poll), не in-process pub/sub.
+- [x] Generic inbound hooks `POST /v1/{service_id}/hooks/{channel}` (§4.16).
+- [ ] Telegram secrets из `domain_secrets` вместо `.env` (фаза 3 плана).
 
 ## 14. Критерии готовности домена
 
@@ -3036,11 +3234,13 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 - [ ] `register_all()` по контракту §6.7 (ProcessDef + OperationRegistry + guards/effects).
 - [ ] Domain DB: FSM-граф + бизнес-схема (+ ХП по manifest) до Accept.
 - [ ] Все guard_name/effect_name из SQL зарегистрированы в Python (§6.6.3 / §7.7).
-- [ ] Effects → domain db_layer; наружу только notify / emit_event / schedule_timer (§4.13).
+- [ ] Effects → domain db_layer; наружу notify / emit_event / schedule_timer / `call_api` (§4.13, §4.15).
+- [ ] При webhooks внешних систем — `default_webhook_registry.register` в `register_all` (§4.16).
 - [ ] `db_layer.py` — единственное место бизнес-SQL домена; session только аргумент.
 - [ ] Query → `queries.py`; sync Command → `commands.py`; у каждой operation корректный `kind` (§6.5.2).
 - [ ] Проходит Domain Validator → `active` (§7).
 - [ ] Smoke Command / Query после активации.
+- [ ] Внешние API: credential JSON в `domain_secrets`, вызовы через `call_api` (не хардкод ключей / не `os.environ`).
 
 ---
 
@@ -3086,6 +3286,14 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 | mode=wait | enqueue + poll status в том же HTTP; claim только worker |
 | platform_outbox | единственный outbox; §10.6 |
 | platform.notify / emit_event / schedule_timer | side-effect API домена; §4.13 |
+| call_api / ExternalApiError | generic исходящий HTTP + credential JSON; §4.15 |
+| domain_secrets | per-tenant encrypted secrets / credentials; §4.15 |
+| service_scope / current_service_id | contextvars-биндинг арендатора перед domain code; §4.15 |
+| inbound hook / hooks/{channel} | webhook внешней системы → domain handler; §4.16 |
+| default_webhook_registry | RAM: `(service_id, channel) → handler`; не outbound subscriptions |
+| HookError | отказ inbound handler → HTTP status (подпись и т.п.) |
+| PLATFORM_SECRETS_KEY | Fernet master key для `domain_secrets` |
+| PLATFORM_ADMIN_TOKEN | `X-Admin-Token` для Admin API `/secrets` |
 | fsm_transition_logs | единственный audit log переходов |
 | outbox_worker | процесс отправки webhook/channel/external из outbox; §10.6 |
 | SSE | Server-Sent Events: поток событий к клиенту; §10.5 |
@@ -3108,7 +3316,8 @@ Realtime UI (биржа): клиент на `WS …/ws/events` делает `sub
 ## 16. Статус реализации (блоки 0–3 и сопутствующее)
 
 Журнал того, что **уже сделано в коде** относительно плана доработок после аудита гонок. Норматив выше (§4–10) приведён в соответствие с этим статусом.  
-Отложено явно: **3.5 компенсации в сагах**.
+Отложено явно: **3.5 компенсации в сагах**.  
+Multi-tenant secrets / generic HTTP / inbound hooks — **§16.9** (фазы 0–2 плана каналов).
 
 ### 16.1. Блок 0 — гонки и согласованность
 
@@ -3171,8 +3380,9 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 
 | Что | Статус |
 |-----|--------|
-| `input/telegram` + deep-link `/start` → bind `telegram_chat_id` | done |
+| `input/telegram` + deep-link `/start` → bind `telegram_chat_id` | done (пока токен из `.env`; фаза 3 → secrets) |
 | `output/telegram` из outbox | done |
+| Generic inbound hooks `POST …/hooks/{channel}` | done (§4.16, §16.9 фаза 2) |
 | `scripts/apply_sql.py` (в т.ч. DELIMITER) | done |
 | Worker: FSM + timers + schedules + outbox + reconcile в одном цикле | done |
 | Пул соединений domain/platform с учётом `max_user_connections` | учтено в эксплуатации (pool_size) |
@@ -3190,6 +3400,26 @@ SQL: `sql/platform/007_graph_version_and_schedules.sql`, `sql/domain/023_graph_v
 | `sql/platform/005_instance_retry.sql` | platform | `next_attempt_at` |
 | `sql/platform/006_timer_owner.sql` | platform | `fsm_timers.owner` |
 | `sql/platform/007_graph_version_and_schedules.sql` | platform | `graph_version` на instances, `fsm_schedules` |
+| `sql/platform/008_domain_secrets.sql` | platform | `domain_secrets` (также в `001_platform_schema.sql`) |
 | `sql/domain/021_order_requests_for_hold.sql` | domain | order_requests / `current_request_id` |
 | `sql/domain/022_state_timeouts.sql` | domain | timeout_* на `fsm_states` |
 | `sql/domain/023_graph_version.sql` | domain | `fsm_graph_meta`, `fsm_transitions.graph_version` |
+
+### 16.9. Multi-tenant secrets, call_api и inbound hooks (фазы 0–2)
+
+План: platform остаётся generic; секреты и HTTP in/out — без vendor-папок в ядре.
+
+| Фаза | Что | Статус | Где |
+|------|-----|--------|-----|
+| 0 | Таблица `domain_secrets` + Fernet | done | `sql/platform/008_*`, `001_platform_schema.sql` |
+| 0 | `runtime_context` (contextvars) | done | `host/runtime_context.py`; bind в invoke / FSM / on_failed / actions / outbox / hooks |
+| 0 | `get/set/delete_domain_secret(key)` без `service_id` | done | `host/secrets.py` |
+| 0 | Admin API secrets + `PLATFORM_ADMIN_TOKEN` | done | `PUT/GET/DELETE /v1/{service_id}/secrets` |
+| 1 | `call_api` + credential JSON types | done | `core/http_client.py`; re-export `host/side_effects.py` |
+| 1 | `ExternalApiError` → FSM retry | done | `EXTERNAL_API_TRANSIENT` в `retry_policy.py` |
+| 2 | Generic inbound `POST …/hooks/{channel}` | done | `host/hook_registry.py`, `app.py`; catalog.`hooks` |
+| 3 | Telegram → `domain_secrets` + per-service webhook URL | **не сделано** | |
+| 4–5 | Leo4 / Core вызовы в domain effects | **не сделано** | поверх `call_api` + hook handler |
+| — | Изоляция процессов арендаторов | **отложено** | деплой, не код |
+
+Норматив: **§4.15**, **§4.16**, side-effect API **§4.13**, Public API **§9.14**.
