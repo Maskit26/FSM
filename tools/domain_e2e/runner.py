@@ -190,7 +190,7 @@ def run_scenario(
     client: ApiClient,
     path: Path,
     *,
-    default_service_id: str,
+    service_id_override: Optional[str] = None,
     poll_timeout: float,
     poll_interval: float,
     stop_on_fail: bool = True,
@@ -208,7 +208,10 @@ def run_scenario(
         )
 
     name = str(scenario.get("name") or path.stem)
-    service_id = str(scenario.get("service_id") or default_service_id)
+    # YAML service_id обязателен (load_scenario); CLI --service-id только override.
+    service_id = str(service_id_override or "").strip() or str(
+        scenario["service_id"]
+    )
     defaults = scenario.get("defaults") or {}
     poll_timeout = float(defaults.get("poll_timeout", poll_timeout))
     poll_interval = float(defaults.get("poll_interval", poll_interval))
@@ -279,8 +282,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--service-id",
-        default="svc_courier_01",
-        help="Default service_id if not set in YAML",
+        default="",
+        help="Override YAML service_id (optional; scenarios must declare service_id)",
     )
     parser.add_argument(
         "--report",
@@ -335,7 +338,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             run_scenario(
                 client,
                 f,
-                default_service_id=args.service_id,
+                service_id_override=args.service_id or None,
                 poll_timeout=args.poll_timeout,
                 poll_interval=args.poll_interval,
                 stop_on_fail=not args.continue_on_fail,

@@ -1,4 +1,4 @@
-"""HTTP client for FSM Platform Public API."""
+"""HTTP client for FSM Platform Public API (multi-tenant)."""
 
 from __future__ import annotations
 
@@ -15,16 +15,20 @@ class ApiClient:
         self._session.headers.update(
             {"Accept": "application/json", "Content-Type": "application/json"}
         )
-        self._token_by_actor: dict[str, str] = {}
+        # cache: "service_id|actor_type:actor_id" → "Bearer …"
+        self._token_by_key: dict[str, str] = {}
         self._auth_mode: Optional[str] = None  # None | "on" | "off"
 
     def health(self) -> tuple[int, dict[str, Any]]:
         r = self._session.get(f"{self.base_url}/v1/health", timeout=self.timeout)
         return r.status_code, _json_or_text(r)
 
-    def _authorization_for_actor(self, actor: dict[str, Any]) -> dict[str, str]:
+    def _authorization_for_actor(
+        self, actor: dict[str, Any], *, service_id: str = ""
+    ) -> dict[str, str]:
         """
-        Если PLATFORM_AUTH включён и DEV_TOKENS=1 — Bearer из GET /v1/auth/token.
+        Если PLATFORM_AUTH включён и DEV_TOKENS=1 — Bearer из GET /v1/auth/token
+        (per-actor; ключ кэша включает service_id для multi-tenant прогонов).
         Если auth выключен — пустой dict (actor остаётся в body).
         """
         actor_type = str((actor or {}).get("actor_type") or "user").strip() or "user"
@@ -32,9 +36,9 @@ class ApiClient:
         if not actor_id:
             return {}
 
-        cache_key = f"{actor_type}:{actor_id}"
-        if cache_key in self._token_by_actor:
-            return {"Authorization": self._token_by_actor[cache_key]}
+        cache_key = f"{service_id}|{actor_type}:{actor_id}"
+        if cache_key in self._token_by_key:
+            return {"Authorization": self._token_by_key[cache_key]}
 
         if self._auth_mode == "off":
             return {}
@@ -50,7 +54,7 @@ class ApiClient:
             if not auth:
                 return {}
             self._auth_mode = "on"
-            self._token_by_actor[cache_key] = auth
+            self._token_by_key[cache_key] = auth
             return {"Authorization": auth}
 
         # 400 PLATFORM_AUTH_SECRET not set; 403 DEV_TOKENS disabled
@@ -65,7 +69,7 @@ class ApiClient:
         actor: dict[str, Any],
     ) -> tuple[int, dict[str, Any]]:
         url = f"{self.base_url}/v1/{service_id}/invoke"
-        headers = self._authorization_for_actor(actor)
+        headers = self._authorization_for_actor(actor, service_id=service_id)
         r = self._session.post(
             url,
             json={"operation": operation, "params": params, "actor": actor},

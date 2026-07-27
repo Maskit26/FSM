@@ -18,6 +18,12 @@ def load_scenario(path: Path) -> dict[str, Any]:
         raise ValueError(f"scenario root must be a mapping: {path}")
     if not data.get("name"):
         data["name"] = path.stem
+    sid = str(data.get("service_id") or "").strip()
+    if not sid:
+        raise ValueError(
+            f"scenario requires service_id (multi-tenant): {path}"
+        )
+    data["service_id"] = sid
     if not isinstance(data.get("steps"), list) or not data["steps"]:
         raise ValueError(f"scenario requires non-empty steps: {path}")
     return data

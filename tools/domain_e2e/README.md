@@ -42,7 +42,7 @@ python -m tools.domain_e2e.runner scenarios/courier/
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--base-url` | `http://127.0.0.1:8000` | API |
-| `--service-id` | `svc_courier_01` | если не задан в YAML |
+| `--service-id` | _(пусто)_ | override YAML `service_id` (сценарий обязан объявить свой) |
 | `--report` | `tools/domain_e2e/reports/e2e_<timestamp>.md` | Markdown |
 | `--poll-timeout` | `30` | сек ожидания instance |
 | `--poll-interval` | `0.5` | интервал poll |
@@ -54,8 +54,12 @@ Exit code: `0` all green, `1` fail, `2` path/API unavailable.
 
 См. примеры в [`scenarios/courier/`](scenarios/courier/).
 
+**Обязательно:** корневой `service_id` (multi-tenant). Без него сценарий не загрузится.  
+`--service-id` в CLI — только **override** YAML, не fallback.
+
 - `{{var}}` — подстановка в params / actor / expect
 - `capture` — JSON-path (`data.pin`, `data.directions.0.id`)
 - `wait_instance: true` — poll `instance_id` или все `instance_ids` до COMPLETED/FAILED
 - `create_order` ставит `enqueues[]` `locker_reserve` на source/dest; дожидайтесь их перед open_cell
 
+**Auth:** при `PLATFORM_AUTH_SECRET` + `PLATFORM_AUTH_DEV_TOKENS=1` клиент сам берёт Bearer на каждого `actor` через `GET /v1/auth/token` (кэш per `service_id|actor`). Формат Markdown-отчёта без изменений.
