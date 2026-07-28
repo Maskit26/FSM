@@ -1803,7 +1803,8 @@ class FsmDbLayer:
         rows = session.execute(
             text(
                 """
-                SELECT service_id, db_secret_ref, status
+                SELECT service_id, db_secret_ref,
+                       db_graph_secret_ref, db_graph_write_secret_ref, status
                 FROM domain_services
                 WHERE status = 'active'
                 """

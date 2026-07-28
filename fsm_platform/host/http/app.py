@@ -22,7 +22,7 @@ from fsm_platform.host.operations import default_operation_registry
 from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.registry import default_process_registry
-from fsm_platform.host.engines import domain_session, platform_session
+from fsm_platform.host.engines import domain_session, graph_write_session, platform_session
 from fsm_platform.host.graph_version import publish_graph_version
 
 app = FastAPI(title="FSM Platform", version="0.1.0")
@@ -515,7 +515,7 @@ def graph_publish(service_id: str) -> dict[str, Any]:
     Копирует transitions current→current+1 и поднимает fsm_graph_meta.
     Летящие инстансы остаются на старой версии; новые берут новую.
     """
-    sd = domain_session(service_id)
+    sd = graph_write_session(service_id)
     try:
         nxt = publish_graph_version(sd)
         sd.commit()

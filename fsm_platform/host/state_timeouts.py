@@ -50,7 +50,7 @@ def state_timeout_idem_key(
 
 def reschedule_after_transition(
     session_platform: SessionLike,
-    session_domain: SessionLike,
+    session_graph: SessionLike,
     *,
     service_id: str,
     entity_type: str,
@@ -68,7 +68,7 @@ def reschedule_after_transition(
         session_platform, service_id, key
     )
 
-    meta = _repo.get_state_timeout(session_domain, entity_type, to_state)
+    meta = _repo.get_state_timeout(session_graph, entity_type, to_state)
     if meta is None:
         return None
 

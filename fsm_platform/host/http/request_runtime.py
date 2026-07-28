@@ -9,7 +9,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
-from fsm_platform.host.engines import domain_session, platform_session
+from fsm_platform.host.engines import domain_session, graph_session, platform_session
 from fsm_platform.host.graph_version import (
     current_graph_version,
     resolve_graph_version,
@@ -455,6 +455,7 @@ def list_available_actions(
     repo = TransitionRepository()
     sp = platform_session()
     sd = domain_session(service_id)
+    sg = graph_session(service_id)
     try:
         with service_scope(service_id):
             current = default_db_layer.get_entity_state(
@@ -469,9 +470,9 @@ def list_available_actions(
                     "error": "ENTITY_STATE_NOT_FOUND",
                 }
 
-            gv = current_graph_version(sd)
+            gv = current_graph_version(sg)
             outgoing = repo.list_outgoing(
-                sd, entity_type, str(current), graph_version=gv
+                sg, entity_type, str(current), graph_version=gv
             )
             by_event: dict[str, list] = {}
             for p in default_process_registry.list_for_service(service_id):
@@ -561,3 +562,4 @@ def list_available_actions(
     finally:
         sp.close()
         sd.close()
+        sg.close()

@@ -39,6 +39,7 @@ def run_instance(
     state_store: Optional[EntityStateStore] = None,
     transition_repository: Optional[TransitionRepository] = None,
     transition_executor: Optional[TransitionExecutor] = None,
+    session_graph: Optional[SessionLike] = None,
 ) -> FsmResult:
     """Запускает один шаг FSM для server_fsm_instances и возвращает FsmResult. Главная функция движка, вызываемая воркером после claim_pending_instance."""
     process_registry = process_registry or default_process_registry
@@ -85,6 +86,7 @@ def run_instance(
             runtime_ctx,
             instance,
             process_def,
+            session_graph=session_graph,
         )
 
     if result.new_state not in _ALLOWED_INSTANCE_STATES:

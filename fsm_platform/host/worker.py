@@ -15,7 +15,7 @@ from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.registry import default_process_registry
 from fsm_platform.core.sagas import on_child_terminal
 from fsm_platform.core.types import FsmResult
-from fsm_platform.host.engines import domain_session, platform_session
+from fsm_platform.host.engines import domain_session, graph_session, platform_session
 from fsm_platform.host.graph_version import resolve_graph_version
 from fsm_platform.host.retry_policy import backoff_seconds, should_retry
 from fsm_platform.host.webhooks import emit_event_with_webhooks
@@ -47,14 +47,15 @@ def _fire_due_timers(*, limit: int = 20, service_id: Optional[str] = None) -> bo
             svc = str(timer["service_id"])
             gv = None
             sd = None
+            sg = None
             try:
-                sd = domain_session(svc)
-                gv = resolve_graph_version(sd)
+                sg = graph_session(svc)
+                gv = resolve_graph_version(sg)
             except Exception:
                 logger.exception("timer graph_version resolve failed svc=%s", svc)
             finally:
-                if sd is not None:
-                    sd.close()
+                if sg is not None:
+                    sg.close()
             default_db_layer.insert_fsm_instance(
                 sp,
                 service_id=svc,
@@ -113,15 +114,15 @@ def _fire_due_schedules(*, limit: int = 20, service_id: Optional[str] = None) ->
                     sp, svc, etype, eid, "idle"
                 )
             gv = None
-            sd = None
+            sg = None
             try:
-                sd = domain_session(svc)
-                gv = resolve_graph_version(sd)
+                sg = graph_session(svc)
+                gv = resolve_graph_version(sg)
             except Exception:
                 logger.exception("schedule graph_version resolve failed svc=%s", svc)
             finally:
-                if sd is not None:
-                    sd.close()
+                if sg is not None:
+                    sg.close()
             payload = dict(sched.get("payload") or {})
             payload.setdefault("schedule_id", int(sched["id"]))
             default_db_layer.insert_fsm_instance(
@@ -326,12 +327,17 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
     assert instance is not None
     service_id = str(instance["service_id"])
     sp = platform_session()
+    sd = None
+    sg = None
     try:
         sd = domain_session(service_id)
+        sg = graph_session(service_id)
         runtime_ctx: dict[str, Any] = {}
         db = {"platform": sp, "domain": sd}
 
-        result = run_instance(sp, sd, db, runtime_ctx, instance)
+        result = run_instance(
+            sp, sd, db, runtime_ctx, instance, session_graph=sg
+        )
 
         if result.new_state == "COMPLETED":
             emit_event_with_webhooks(
@@ -386,6 +392,8 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
     finally:
         if sd is not None:
             sd.close()
+        if sg is not None:
+            sg.close()
         sp.close()
 
 

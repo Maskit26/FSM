@@ -69,8 +69,11 @@ class TransitionRunner:
         runtime_ctx: RuntimeContext,
         instance: InstanceDict,
         process_def: ProcessDef,
+        *,
+        session_graph: Optional[SessionLike] = None,
     ) -> FsmResult:
         """Primary pipeline, затем companions из effect_params выбранного primary-ребра."""
+        session_graph = session_graph or session_domain
         service_id = str(instance["service_id"])
         instance_id = instance.get("id")
 
@@ -110,6 +113,7 @@ class TransitionRunner:
         primary = self._run_entity_step(
             session_platform=session_platform,
             session_domain=session_domain,
+            session_graph=session_graph,
             db=db,
             domain_context=domain_context,
             instance=instance,
@@ -142,6 +146,7 @@ class TransitionRunner:
             step = self._run_companion(
                 session_platform=session_platform,
                 session_domain=session_domain,
+                session_graph=session_graph,
                 db=db,
                 domain_context=domain_context,
                 instance=instance,
@@ -176,6 +181,7 @@ class TransitionRunner:
         *,
         session_platform: SessionLike,
         session_domain: SessionLike,
+        session_graph: SessionLike,
         db: Any,
         domain_context: dict[str, Any],
         instance: InstanceDict,
@@ -225,6 +231,7 @@ class TransitionRunner:
         result = self._run_entity_step(
             session_platform=session_platform,
             session_domain=session_domain,
+            session_graph=session_graph,
             db=db,
             domain_context=domain_context,
             instance=instance,
@@ -265,6 +272,7 @@ class TransitionRunner:
         *,
         session_platform: SessionLike,
         session_domain: SessionLike,
+        session_graph: SessionLike,
         db: Any,
         domain_context: dict[str, Any],
         instance: InstanceDict,
@@ -303,9 +311,9 @@ class TransitionRunner:
         except (TypeError, ValueError):
             graph_version = None
         if graph_version is None:
-            graph_version = self._repo.current_graph_version(session_domain)
+            graph_version = self._repo.current_graph_version(session_graph)
         candidates = self._repo.list_candidates(
-            session_domain,
+            session_graph,
             entity_type,
             current_state,
             event_name,
@@ -395,7 +403,7 @@ class TransitionRunner:
 
             reschedule_after_transition(
                 session_platform,
-                session_domain,
+                session_graph,
                 service_id=service_id,
                 entity_type=entity_type,
                 entity_id=entity_id,
