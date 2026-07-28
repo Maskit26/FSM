@@ -328,26 +328,36 @@ class FsmDbLayer:
         return int(result.rowcount or 0)
 
     def claim_due_timers(
-        self, session: SessionLike, *, limit: int = 20
+        self,
+        session: SessionLike,
+        *,
+        limit: int = 20,
+        service_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """
         Забирает due SCHEDULED таймеры (fire_at <= UTC now) и помечает FIRED.
         Возвращает строки для enqueue процессов.
+        service_id — опциональный фильтр тенанта (воркер на одного арендатора).
         """
+        svc_sql = "AND service_id = :service_id" if service_id else ""
+        params: dict[str, Any] = {"limit": int(limit)}
+        if service_id:
+            params["service_id"] = service_id
         rows = session.execute(
             text(
-                """
+                f"""
                 SELECT id, service_id, entity_type, entity_id, process_name,
                        payload_json
                 FROM fsm_timers
                 WHERE status = 'SCHEDULED'
                   AND fire_at <= UTC_TIMESTAMP()
+                  {svc_sql}
                 ORDER BY fire_at ASC
                 LIMIT :limit
                 FOR UPDATE SKIP LOCKED
                 """
             ),
-            {"limit": int(limit)},
+            params,
         ).mappings().all()
         out: list[dict[str, Any]] = []
         for row in rows:
@@ -489,14 +499,23 @@ class FsmDbLayer:
         return dict(row) if row else None
 
     def claim_pending_instance(
-        self, session: SessionLike
+        self,
+        session: SessionLike,
+        *,
+        service_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
-        """Атомарно захватывает старейший due PENDING (FOR UPDATE SKIP LOCKED) → PROCESSING."""
+        """Атомарно захватывает старейший due PENDING (FOR UPDATE SKIP LOCKED) → PROCESSING.
+        service_id — опциональный фильтр тенанта (воркер на одного арендатора).
+        """
         gv = (
             ", graph_version"
             if self._has_column(session, "server_fsm_instances", "graph_version")
             else ""
         )
+        svc_sql = "AND service_id = :service_id" if service_id else ""
+        params: dict[str, Any] = {}
+        if service_id:
+            params["service_id"] = service_id
         row = session.execute(
             text(
                 f"""
@@ -506,11 +525,13 @@ class FsmDbLayer:
                 WHERE status = 'PENDING'
                   AND (next_attempt_at IS NULL
                        OR next_attempt_at <= UTC_TIMESTAMP())
+                  {svc_sql}
                 ORDER BY id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
                 """
-            )
+            ),
+            params,
         ).mappings().first()
         if row is None:
             return None
@@ -728,23 +749,34 @@ class FsmDbLayer:
         )
 
     def claim_pending_reconcile(
-        self, session: SessionLike, *, limit: int = 10
+        self,
+        session: SessionLike,
+        *,
+        limit: int = 10,
+        service_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """PENDING reconcile → PROCESSING (FOR UPDATE SKIP LOCKED)."""
+        """PENDING reconcile → PROCESSING (FOR UPDATE SKIP LOCKED).
+        service_id — опциональный фильтр тенанта.
+        """
+        svc_sql = "AND service_id = :service_id" if service_id else ""
+        params: dict[str, Any] = {"lim": int(limit)}
+        if service_id:
+            params["service_id"] = service_id
         rows = session.execute(
             text(
-                """
+                f"""
                 SELECT id, service_id, instance_id, entity_type, entity_id,
                        from_state, to_state, event_name, transition_id,
                        payload_json, attempts
                 FROM platform_reconcile_queue
                 WHERE status = 'PENDING'
+                  {svc_sql}
                 ORDER BY id ASC
                 LIMIT :lim
                 FOR UPDATE SKIP LOCKED
                 """
             ),
-            {"lim": int(limit)},
+            params,
         ).mappings().all()
         out: list[dict[str, Any]] = []
         for row in rows:
@@ -940,26 +972,36 @@ class FsmDbLayer:
         return int(result.lastrowid)
 
     def claim_pending_outbox(
-        self, session: SessionLike, *, limit: int = 10
+        self,
+        session: SessionLike,
+        *,
+        limit: int = 10,
+        service_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """
         Берёт PENDING outbox строки (FOR UPDATE SKIP LOCKED) → PROCESSING.
         Возвращает список dict с полями строки.
+        service_id — опциональный фильтр тенанта.
         """
+        svc_sql = "AND service_id = :service_id" if service_id else ""
+        params: dict[str, Any] = {"lim": int(limit)}
+        if service_id:
+            params["service_id"] = service_id
         rows = session.execute(
             text(
-                """
+                f"""
                 SELECT id, service_id, channel, destination, event_type,
                        payload_json, attempts, idempotency_key
                 FROM platform_outbox
                 WHERE status = 'PENDING'
                   AND next_attempt_at <= UTC_TIMESTAMP()
+                  {svc_sql}
                 ORDER BY id ASC
                 LIMIT :lim
                 FOR UPDATE SKIP LOCKED
                 """
             ),
-            {"lim": int(limit)},
+            params,
         ).mappings().all()
         out: list[dict[str, Any]] = []
         for row in rows:
@@ -1556,26 +1598,36 @@ class FsmDbLayer:
         return int(result.lastrowid)
 
     def claim_due_schedules(
-        self, session: SessionLike, *, limit: int = 20
+        self,
+        session: SessionLike,
+        *,
+        limit: int = 20,
+        service_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """
         ACTIVE schedules с next_run_at<=now → сдвигает next_run_at += interval.
         Возвращает snapshot строк до сдвига (для enqueue).
+        service_id — опциональный фильтр тенанта.
         """
+        svc_sql = "AND service_id = :service_id" if service_id else ""
+        params: dict[str, Any] = {"lim": int(limit)}
+        if service_id:
+            params["service_id"] = service_id
         rows = session.execute(
             text(
-                """
+                f"""
                 SELECT id, service_id, process_name, entity_type, entity_id,
                        interval_seconds, payload_json, next_run_at, status
                 FROM fsm_schedules
                 WHERE status = 'ACTIVE'
                   AND next_run_at <= UTC_TIMESTAMP()
+                  {svc_sql}
                 ORDER BY next_run_at ASC, id ASC
                 LIMIT :lim
                 FOR UPDATE SKIP LOCKED
                 """
             ),
-            {"lim": int(limit)},
+            params,
         ).mappings().all()
         out: list[dict[str, Any]] = []
         for row in rows:

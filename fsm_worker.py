@@ -21,7 +21,10 @@ def main() -> None:
 
     boot()
     poll = float(os.environ.get("FSM_WORKER_POLL_SECONDS", "1"))
-    run_loop(poll_seconds=poll)
+    # Один процесс воркера на тенанта: задать WORKER_SERVICE_ID=svc_courier_01
+    # Без переменной — прежнее поведение (все тенанты).
+    service_id = (os.environ.get("WORKER_SERVICE_ID") or "").strip() or None
+    run_loop(poll_seconds=poll, service_id=service_id)
 
 
 if __name__ == "__main__":

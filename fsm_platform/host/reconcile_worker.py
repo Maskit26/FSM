@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.sagas import on_child_terminal
@@ -118,12 +118,16 @@ def dock_platform(row: dict[str, Any]) -> None:
         sp.close()
 
 
-def process_one(*, batch_size: int = 10) -> bool:
-    """Claim + dock batch. True если была хотя бы одна строка."""
+def process_one(*, batch_size: int = 10, service_id: Optional[str] = None) -> bool:
+    """Claim + dock batch. True если была хотя бы одна строка.
+    service_id — опциональный фильтр тенанта.
+    """
     sp = platform_session()
     claimed: list[dict[str, Any]] = []
     try:
-        claimed = default_db_layer.claim_pending_reconcile(sp, limit=batch_size)
+        claimed = default_db_layer.claim_pending_reconcile(
+            sp, limit=batch_size, service_id=service_id
+        )
         sp.commit()
     except Exception:
         sp.rollback()

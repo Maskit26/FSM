@@ -23,14 +23,16 @@ from fsm_platform.host.webhooks import emit_event_with_webhooks
 logger = logging.getLogger(__name__)
 
 
-def _fire_due_timers(*, limit: int = 20) -> bool:
+def _fire_due_timers(*, limit: int = 20, service_id: Optional[str] = None) -> bool:
     """
     SCHEDULED timers с fire_at<=now → enqueue process + FIRED.
     True если хотя бы один таймер обработан.
     """
     sp = platform_session()
     try:
-        due = default_db_layer.claim_due_timers(sp, limit=limit)
+        due = default_db_layer.claim_due_timers(
+            sp, limit=limit, service_id=service_id
+        )
         if not due:
             sp.rollback()
             return False
@@ -80,7 +82,7 @@ def _fire_due_timers(*, limit: int = 20) -> bool:
         sp.close()
 
 
-def _fire_due_schedules(*, limit: int = 20) -> bool:
+def _fire_due_schedules(*, limit: int = 20, service_id: Optional[str] = None) -> bool:
     """
     ACTIVE fsm_schedules с next_run_at<=now → enqueue process + сдвиг next_run_at.
     True если хотя бы один schedule обработан.
@@ -91,7 +93,9 @@ def _fire_due_schedules(*, limit: int = 20) -> bool:
     try:
         # таблица может ещё не быть применена
         try:
-            due = default_db_layer.claim_due_schedules(sp, limit=limit)
+            due = default_db_layer.claim_due_schedules(
+                sp, limit=limit, service_id=service_id
+            )
         except Exception as exc:
             sp.rollback()
             if "fsm_schedules" in str(exc) or "1146" in str(exc):
@@ -291,21 +295,22 @@ def _enqueue_reconcile(
         sp.close()
 
 
-def process_one() -> bool:
+def process_one(*, service_id: Optional[str] = None) -> bool:
     """
     Берёт один PENDING-инстанс и прогоняет FSM до COMPLETED или FAILED.
     Возвращает True, если была работа; False, если очередь пуста.
+    service_id — опциональный фильтр тенанта (воркер на одного арендатора).
     """
-    if _fire_due_timers():
+    if _fire_due_timers(service_id=service_id):
         return True
-    if _fire_due_schedules():
+    if _fire_due_schedules(service_id=service_id):
         return True
 
     sp = platform_session()
     instance: Optional[dict[str, Any]] = None
     sd = None
     try:
-        instance = default_db_layer.claim_pending_instance(sp)
+        instance = default_db_layer.claim_pending_instance(sp, service_id=service_id)
         if instance is None:
             sp.rollback()
             return False
@@ -384,17 +389,27 @@ def process_one() -> bool:
         sp.close()
 
 
-def run_loop(poll_seconds: float = 1.0) -> None:
-    """Бесконечный цикл: FSM instances + outbox + reconcile."""
-    logger.info("fsm worker loop started (fsm + outbox + reconcile)")
+def run_loop(
+    poll_seconds: float = 1.0, *, service_id: Optional[str] = None
+) -> None:
+    """Бесконечный цикл: FSM instances + outbox + reconcile.
+    service_id — если задан, воркер обслуживает только этот тенант.
+    """
+    if service_id:
+        logger.info(
+            "fsm worker loop started (fsm + outbox + reconcile) service_id=%s",
+            service_id,
+        )
+    else:
+        logger.info("fsm worker loop started (fsm + outbox + reconcile)")
     while True:
-        fsm_worked = process_one()
+        fsm_worked = process_one(service_id=service_id)
         outbox_worked = False
         reconcile_worked = False
         try:
             from fsm_platform.host.outbox_worker import process_one as process_outbox
 
-            outbox_worked = process_outbox()
+            outbox_worked = process_outbox(service_id=service_id)
         except Exception:
             logger.exception("outbox process_one failed")
         try:
@@ -402,7 +417,7 @@ def run_loop(poll_seconds: float = 1.0) -> None:
                 process_one as process_reconcile,
             )
 
-            reconcile_worked = process_reconcile()
+            reconcile_worked = process_reconcile(service_id=service_id)
         except Exception:
             logger.exception("reconcile process_one failed")
         if not fsm_worked and not outbox_worked and not reconcile_worked:

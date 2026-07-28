@@ -116,15 +116,18 @@ def deliver_one(row: dict[str, Any]) -> None:
         _deliver()
 
 
-def process_one(*, batch_size: int = 10) -> bool:
+def process_one(*, batch_size: int = 10, service_id: Optional[str] = None) -> bool:
     """
     Claim + deliver batch. True если была хотя бы одна строка.
     Каждая доставка — отдельный commit после успеха/ошибки строки.
+    service_id — опциональный фильтр тенанта.
     """
     sp = platform_session()
     claimed: list[dict[str, Any]] = []
     try:
-        claimed = default_db_layer.claim_pending_outbox(sp, limit=batch_size)
+        claimed = default_db_layer.claim_pending_outbox(
+            sp, limit=batch_size, service_id=service_id
+        )
         sp.commit()
     except Exception:
         sp.rollback()
@@ -180,10 +183,15 @@ def process_one(*, batch_size: int = 10) -> bool:
     return True
 
 
-def run_loop(poll_seconds: float = 1.0) -> None:
+def run_loop(
+    poll_seconds: float = 1.0, *, service_id: Optional[str] = None
+) -> None:
     """Опциональный standalone-цикл outbox (обычно вызывается из fsm_worker)."""
-    logger.info("outbox-only loop started")
+    logger.info(
+        "outbox-only loop started%s",
+        f" service_id={service_id}" if service_id else "",
+    )
     while True:
-        worked = process_one()
+        worked = process_one(service_id=service_id)
         if not worked:
             time.sleep(poll_seconds)
