@@ -28,7 +28,7 @@ _ALLOWED_INSTANCE_STATES = frozenset({"COMPLETED", "FAILED"})
 
 def run_instance(
     session_platform: SessionLike,
-    session_domain: SessionLike,
+    session_domain: Optional[SessionLike],
     db: Any,
     runtime_ctx: RuntimeContext,
     instance: InstanceDict,

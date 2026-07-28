@@ -79,12 +79,13 @@ class TransitionRunner:
 
         # 1. CONTEXT (один раз на process-step; companions делят тот же context)
         try:
-            if process_def.context_builder is not None:
-                domain_context = process_def.context_builder(
-                    session_domain, db, runtime_ctx, instance
-                )
-            else:
-                domain_context = {}
+            from fsm_platform.host.contract_invoke import call_context_builder
+
+            domain_context = call_context_builder(
+                process_def.context_builder,
+                runtime_ctx=runtime_ctx,
+                instance=instance,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("context_builder failed")
             return FsmResult(
@@ -351,13 +352,14 @@ class TransitionRunner:
                 return {
                     "error": f"{FsmErrorCodes.UNKNOWN_GUARD}: {guard_name}"
                 }
+            from fsm_platform.host.contract_invoke import call_guard
+
             result = normalize_guard_result(
-                guard_fn(
-                    session_domain,
-                    db,
-                    domain_context,
-                    instance,
-                    candidate.guard_params or {},
+                call_guard(
+                    guard_fn,
+                    context=domain_context,
+                    guard_params=candidate.guard_params or {},
+                    instance=instance,
                 )
             )
             if result.ok:
@@ -438,13 +440,14 @@ class TransitionRunner:
                     )
                 }
             try:
+                from fsm_platform.host.contract_invoke import call_effect
+
                 effect_result = normalize_effect_result(
-                    effect_fn(
-                        session_domain,
-                        db,
-                        domain_context,
-                        instance,
-                        _effect_params_for_call(selected.effect_params),
+                    call_effect(
+                        effect_fn,
+                        context=domain_context,
+                        effect_params=_effect_params_for_call(selected.effect_params),
+                        instance=instance,
                     )
                 )
             except Exception as exc:  # noqa: BLE001

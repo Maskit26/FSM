@@ -21,6 +21,7 @@ from fsm_platform.core.registry import (
 )
 from fsm_platform.core.transition_repository import TransitionRepository
 from fsm_platform.core.types import ProcessDef
+from fsm_platform.core.remote import RemoteRef
 from fsm_platform.host.operations import OperationRegistry, default_operation_registry
 
 logger = logging.getLogger(__name__)
@@ -194,62 +195,18 @@ class DomainValidator:
         self,
         service_id: str,
         *,
-        entry: Optional[str] = None,
-        package_dir: Optional[Path] = None,
-        session_domain: Any = None,
-        manifest: Optional[dict[str, Any]] = None,
+        catalog: dict[str, Any],
+        session_graph: Any = None,
     ) -> ValidationReport:
-        """
-        Полная проверка: manifest/пакет → RAM → (если есть session) domain DB.
-        """
+        """Catalog → RAM → (опционально) graph DB."""
         report = ValidationReport(service_id=service_id)
+        report.cartridge_type = str(catalog.get("cartridge_type") or "") or None
 
-        pkg = package_dir
-        man = manifest
-        if man is None and entry:
-            try:
-                pkg = pkg or package_dir_from_entry(entry)
-            except ValueError as exc:
-                report.add_error("MANIFEST_INVALID", str(exc), where=entry)
-                return report
-        if man is None and pkg is not None:
-            try:
-                man = load_manifest(pkg)
-            except FileNotFoundError:
-                report.add_error(
-                    "MANIFEST_MISSING",
-                    f"manifest.yaml not found in {pkg}",
-                    where=str(pkg),
-                )
-                return report
-            except Exception as exc:  # noqa: BLE001
-                report.add_error(
-                    "MANIFEST_INVALID",
-                    f"cannot parse manifest: {exc}",
-                    where=str(pkg),
-                )
-                return report
-
-        if man is not None:
-            report.cartridge_type = str(man.get("cartridge_type") or "") or None
-            self._validate_manifest(report, man)
-            if pkg is not None:
-                self._validate_required_modules(report, pkg, man)
-
+        self._validate_catalog(report, catalog)
         self._validate_ram(report, service_id)
 
-        if session_domain is not None and report.ok:
-            scope = str((man or {}).get("graph_scope") or "registered_processes")
-            required_tables = list((man or {}).get("required_tables") or [])
-            required_routines = list((man or {}).get("required_routines") or [])
-            self._validate_domain_db(
-                report,
-                service_id,
-                session_domain,
-                graph_scope=scope,
-                required_tables=required_tables,
-                required_routines=required_routines,
-            )
+        if session_graph is not None and report.ok:
+            self._validate_graph_db(report, service_id, session_graph)
 
         ops = self._ops.items(service_id)
         procs = self._processes.list_for_service(service_id)
@@ -269,30 +226,14 @@ class DomainValidator:
             raise DomainValidationError(report)
         return report
 
-    def _validate_manifest(
-        self, report: ValidationReport, man: dict[str, Any]
+    def _validate_catalog(
+        self, report: ValidationReport, catalog: dict[str, Any]
     ) -> None:
-        for key in ("cartridge_type", "version", "entry"):
-            if not str(man.get(key) or "").strip():
+        for key in ("cartridge_type", "version"):
+            if not str(catalog.get(key) or "").strip():
                 report.add_error(
-                    "MANIFEST_INVALID",
-                    f"manifest missing required field {key!r}",
-                )
-
-    def _validate_required_modules(
-        self,
-        report: ValidationReport,
-        package_dir: Path,
-        man: dict[str, Any],
-    ) -> None:
-        modules = man.get("required_modules") or list(_DEFAULT_REQUIRED_MODULES)
-        for name in modules:
-            path = package_dir / f"{name}.py"
-            if not path.is_file():
-                report.add_error(
-                    "REQUIRED_MODULE_MISSING",
-                    f"required module file missing: {name}.py",
-                    where=str(path),
+                    "CATALOG_INVALID",
+                    f"catalog missing required field {key!r}",
                 )
 
     def _validate_ram(self, report: ValidationReport, service_id: str) -> None:
@@ -320,10 +261,10 @@ class DomainValidator:
                     "INVALID_OPERATION_KIND",
                     f"operation {name!r} has kind={kind!r}",
                 )
-            if not callable(handler):
+            if not isinstance(handler, RemoteRef):
                 report.add_error(
-                    "OPERATION_HANDLER_NOT_CALLABLE",
-                    f"operation {name!r} handler is not callable",
+                    "OPERATION_HANDLER_NOT_REMOTE",
+                    f"operation {name!r} handler must be RemoteRef",
                 )
 
         for p in procs:
@@ -331,17 +272,17 @@ class DomainValidator:
 
         for gname in self._guards.list_names(service_id):
             fn = self._guards.get(service_id, gname)
-            if not callable(fn):
+            if not isinstance(fn, RemoteRef):
                 report.add_error(
-                    "GUARD_NOT_CALLABLE",
-                    f"guard {gname!r} is not callable",
+                    "GUARD_NOT_REMOTE",
+                    f"guard {gname!r} must be RemoteRef",
                 )
         for ename in self._effects.list_names(service_id):
             fn = self._effects.get(service_id, ename)
-            if not callable(fn):
+            if not isinstance(fn, RemoteRef):
                 report.add_error(
-                    "EFFECT_NOT_CALLABLE",
-                    f"effect {ename!r} is not callable",
+                    "EFFECT_NOT_REMOTE",
+                    f"effect {ename!r} must be RemoteRef",
                 )
 
     def _validate_process_def(
@@ -367,11 +308,33 @@ class DomainValidator:
                 "PROCESS_FIELDS_MISSING",
                 f"ProcessDef {p.process_name!r} missing: {', '.join(missing)}",
             )
-        if p.context_builder is not None and not callable(p.context_builder):
+        if p.context_builder is not None and not isinstance(
+            p.context_builder, RemoteRef
+        ):
             report.add_error(
-                "CONTEXT_BUILDER_NOT_CALLABLE",
-                f"ProcessDef {p.process_name!r} context_builder not callable",
+                "CONTEXT_BUILDER_NOT_REMOTE",
+                f"ProcessDef {p.process_name!r} context_builder must be RemoteRef",
             )
+        if p.on_failed is not None and not isinstance(p.on_failed, RemoteRef):
+            report.add_error(
+                "ON_FAILED_NOT_REMOTE",
+                f"ProcessDef {p.process_name!r} on_failed must be RemoteRef",
+            )
+
+    def _validate_graph_db(
+        self,
+        report: ValidationReport,
+        service_id: str,
+        session_graph: Any,
+    ) -> None:
+        self._validate_domain_db(
+            report,
+            service_id,
+            session_graph,
+            graph_scope="registered_processes",
+            required_tables=[],
+            required_routines=[],
+        )
 
     def _validate_domain_db(
         self,

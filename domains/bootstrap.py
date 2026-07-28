@@ -1,128 +1,281 @@
 """
-Загрузка активных доменов: импорт пакета → register_all(service_id) → Domain Validator.
+Bootstrap доменов платформы: GET /contract/v1/catalog → RAM-реестры → Domain Validator.
 
-v1: домены из FSM_DOMAINS; после register_all — валидация RAM (+ domain DB, если engine есть).
+Платформа не импортирует доменный Python-код.
+Bootstrap best-effort: сбой одного tenant не блокирует старт platform API.
 """
 
 from __future__ import annotations
 
-import importlib
 import logging
-import os
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
 
+from fsm_platform import ProcessDef
+from fsm_platform.core.registry import (
+    default_effect_registry,
+    default_guard_registry,
+    default_process_registry,
+)
+from fsm_platform.core.remote import (
+    remote_command,
+    remote_context,
+    remote_effect,
+    remote_guard,
+    remote_on_failed,
+    remote_query,
+)
 from fsm_platform.host.domain_validator import (
     DomainValidationError,
     default_domain_validator,
-    package_dir_from_entry,
 )
-from fsm_platform.host.engines import domain_session
+from fsm_platform.host.engines import graph_session, platform_session
+from fsm_platform.host.hook_registry import default_webhook_registry
+from fsm_platform.host.operations import default_operation_registry
 
 logger = logging.getLogger(__name__)
 
 
-def _load_register_all(entry: str) -> Callable[[str], None]:
-    """
-    Загружает callable register_all из строки entry.
-    Форматы: domains.courier.processes:register_all или domains.courier (атрибут register_all).
-    """
-    if ":" in entry:
-        module_name, attr = entry.split(":", 1)
-    else:
-        module_name, attr = entry, "register_all"
-    module = importlib.import_module(module_name)
-    fn = getattr(module, attr)
-    if not callable(fn):
-        raise TypeError(f"{entry} is not callable")
-    return fn  # type: ignore[return-value]
+@dataclass
+class DomainBootstrapStatus:
+    """Состояние подключения tenant domain service (in-memory, per process)."""
+
+    service_id: str
+    ok: bool = False
+    error: Optional[str] = None
+    checked_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    stats: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "service_id": self.service_id,
+            "ok": self.ok,
+            "error": self.error,
+            "checked_at": self.checked_at,
+            "stats": self.stats,
+        }
 
 
-def bootstrap_domain(service_id: str, entry: str) -> None:
+_bootstrap_status: dict[str, DomainBootstrapStatus] = {}
+
+
+def get_bootstrap_status(service_id: Optional[str] = None) -> dict[str, Any]:
+    """Статус bootstrap tenant(ов). None → все известные."""
+    if service_id is not None:
+        sid = str(service_id).strip()
+        st = _bootstrap_status.get(sid)
+        return st.to_dict() if st else {"service_id": sid, "ok": False, "error": "NOT_BOOTSTRAPPED"}
+    return {sid: st.to_dict() for sid, st in sorted(_bootstrap_status.items())}
+
+
+def is_domain_ready(service_id: str) -> bool:
+    st = _bootstrap_status.get(str(service_id).strip())
+    return bool(st and st.ok)
+
+
+def _unregister_service(service_id: str) -> None:
+    default_guard_registry.unregister(service_id)
+    default_effect_registry.unregister(service_id)
+    default_process_registry.unregister(service_id)
+    default_operation_registry.unregister(service_id)
+    default_webhook_registry.unregister(service_id)
+
+
+def register_catalog(service_id: str, catalog: dict[str, Any]) -> None:
+    """Наполняет RAM-реестры из ответа Contract API catalog."""
+    sid = str(service_id or "").strip()
+    if not sid:
+        raise ValueError("service_id is required")
+
+    _unregister_service(sid)
+
+    for op in catalog.get("operations") or []:
+        if not isinstance(op, dict):
+            continue
+        name = str(op.get("operation") or "").strip()
+        kind = str(op.get("kind") or "").strip()
+        if not name or kind not in ("command", "query"):
+            continue
+        ref = remote_command(sid, name) if kind == "command" else remote_query(sid, name)
+        default_operation_registry.register(sid, name, kind, ref)
+
+    for gname in catalog.get("guards") or []:
+        name = str(gname or "").strip()
+        if name:
+            default_guard_registry.register(sid, name, remote_guard(sid, name))
+
+    for ename in catalog.get("effects") or []:
+        name = str(ename or "").strip()
+        if name:
+            default_effect_registry.register(sid, name, remote_effect(sid, name))
+
+    for proc in catalog.get("processes") or []:
+        if not isinstance(proc, dict):
+            continue
+        process_name = str(proc.get("process_name") or "").strip()
+        if not process_name:
+            continue
+        cb_name = str(proc.get("context_builder") or "").strip()
+        on_failed_flag = bool(proc.get("on_failed"))
+        default_process_registry.register(
+            ProcessDef(
+                service_id=sid,
+                process_name=process_name,
+                entity_type=str(proc.get("entity_type") or "") or None,
+                event_name=str(proc.get("event_name") or "") or None,
+                initial_state=str(proc.get("initial_state") or "") or None,
+                context_builder=remote_context(sid, cb_name) if cb_name else None,
+                on_failed=remote_on_failed(sid, process_name)
+                if on_failed_flag
+                else None,
+            )
+        )
+
+    for channel in catalog.get("hooks") or []:
+        ch = str(channel or "").strip().lower()
+        if ch:
+            default_webhook_registry.register_channel(sid, ch)
+
+
+def _record_status(
+    service_id: str,
+    *,
+    ok: bool,
+    error: Optional[str] = None,
+    stats: Optional[dict[str, Any]] = None,
+) -> DomainBootstrapStatus:
+    st = DomainBootstrapStatus(
+        service_id=service_id,
+        ok=ok,
+        error=error,
+        stats=dict(stats or {}),
+    )
+    _bootstrap_status[service_id] = st
+    return st
+
+
+def bootstrap_domain(service_id: str, *, raise_on_error: bool = False) -> bool:
     """
-    register_all + Domain Validator для одного service_id.
-    При ошибках валидации — DomainValidationError (домен не считается активным).
+    Catalog remote-домена + Domain Validator.
+    Returns True если tenant готов к invoke/FSM.
+    По умолчанию не бросает — platform продолжает работать.
     """
+    from fsm_platform.host.contract_client import get_contract_client
     from fsm_platform.host.domain_validator import ValidationReport
 
-    try:
-        register_all = _load_register_all(entry)
-    except Exception as exc:
-        report = ValidationReport(service_id=service_id)
-        report.add_error("ENTRY_IMPORT_FAILED", str(exc), where=entry)
-        raise DomainValidationError(report) from exc
+    sid = str(service_id or "").strip()
+    if not sid:
+        raise ValueError("service_id is required")
 
-    logger.info("register_all service_id=%s entry=%s", service_id, entry)
+    logger.info("bootstrap domain service_id=%s (contract catalog)", sid)
     try:
-        register_all(service_id)
+        catalog = get_contract_client(sid).catalog()
     except Exception as exc:
-        logger.exception("REGISTER_ALL_FAILED service_id=%s", service_id)
-        report = ValidationReport(service_id=service_id)
-        report.add_error("REGISTER_ALL_FAILED", str(exc), where=entry)
-        raise DomainValidationError(report) from exc
+        msg = f"CATALOG_FETCH_FAILED: {exc}"
+        _record_status(sid, ok=False, error=msg)
+        logger.warning("domain bootstrap skipped service_id=%s: %s", sid, msg)
+        if raise_on_error:
+            report = ValidationReport(service_id=sid)
+            report.add_error("CATALOG_FETCH_FAILED", str(exc))
+            raise DomainValidationError(report) from exc
+        return False
 
-    session = _try_domain_session(service_id)
+    if not isinstance(catalog, dict):
+        msg = "CATALOG_INVALID: expected JSON object"
+        _record_status(sid, ok=False, error=msg)
+        logger.warning("domain bootstrap skipped service_id=%s: %s", sid, msg)
+        if raise_on_error:
+            report = ValidationReport(service_id=sid)
+            report.add_error("CATALOG_INVALID", "expected JSON object")
+            raise DomainValidationError(report)
+        return False
+
+    register_catalog(sid, catalog)
+
+    session_graph = _try_graph_session(sid)
     try:
         report = default_domain_validator.validate(
-            service_id,
-            entry=entry,
-            package_dir=package_dir_from_entry(entry),
-            session_domain=session,
+            sid,
+            catalog=catalog,
+            session_graph=session_graph,
         )
     finally:
-        if session is not None:
-            session.close()
+        if session_graph is not None:
+            session_graph.close()
 
     if not report.ok:
-        logger.error(
+        err = "; ".join(e.code for e in report.errors) or "VALIDATION_FAILED"
+        _record_status(sid, ok=False, error=err)
+        logger.warning(
             "domain validation failed service_id=%s errors=%s",
-            service_id,
+            sid,
             report.to_dict()["errors"],
         )
-        raise DomainValidationError(report)
+        if raise_on_error:
+            raise DomainValidationError(report)
+        return False
 
     if report.warnings:
         logger.warning(
             "domain validation warnings service_id=%s warnings=%s",
-            service_id,
+            sid,
             report.to_dict()["warnings"],
         )
+    _record_status(sid, ok=True, stats=report.stats)
     logger.info(
-        "domain validation ok service_id=%s stats=%s",
-        service_id,
+        "domain bootstrap ok service_id=%s stats=%s",
+        sid,
         report.stats,
     )
+    return True
 
 
-def _try_domain_session(service_id: str) -> Optional[object]:
-    """Открывает domain session если engine уже зарегистрирован; иначе None (только RAM-проверки)."""
+def _list_service_ids() -> list[str]:
+    ids: list[str] = []
     try:
-        return domain_session(service_id)
+        from fsm_platform.core.db_layer import default_db_layer
+
+        sp = platform_session()
+        try:
+            for row in default_db_layer.list_active_domain_services(sp):
+                ids.append(str(row["service_id"]))
+        finally:
+            sp.close()
+    except Exception:
+        logger.warning("platform DB unavailable — no tenants from domain_services")
+
+    return ids
+
+
+def _try_graph_session(service_id: str) -> Optional[object]:
+    try:
+        return graph_session(service_id)
     except KeyError:
         logger.warning(
-            "no domain engine for %s — Validator skips DB checks",
+            "no graph engine for %s — Validator skips graph DB checks",
             service_id,
         )
         return None
 
 
-def bootstrap_from_env() -> None:
+def bootstrap_active_domains() -> None:
     """
-    Читает FSM_DOMAINS и регистрирует домены в RAM-реестрах с валидацией.
-    Пример: svc_courier_01=domains.courier.processes:register_all
-    Несколько записей через точку с запятой.
+    Best-effort bootstrap всех active domain_services.
+    Ошибки логируются; platform API/worker стартуют в любом случае.
     """
-    raw = os.environ.get("FSM_DOMAINS", "").strip()
-    if not raw:
-        logger.warning("FSM_DOMAINS empty — no domains registered")
+    service_ids = _list_service_ids()
+    if not service_ids:
+        logger.info("no active domain_services — platform starts without remote domains")
         return
-
-    for item in raw.split(";"):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" not in item:
-            raise ValueError(
-                f"FSM_DOMAINS item must be service_id=module:register_all, got {item!r}"
-            )
-        service_id, entry = item.split("=", 1)
-        bootstrap_domain(service_id.strip(), entry.strip())
+    ok_count = 0
+    for sid in service_ids:
+        if bootstrap_domain(sid):
+            ok_count += 1
+    logger.info(
+        "domain bootstrap finished: %s/%s tenants ready",
+        ok_count,
+        len(service_ids),
+    )

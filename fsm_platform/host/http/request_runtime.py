@@ -9,7 +9,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
-from fsm_platform.host.engines import domain_session, graph_session, platform_session
+from fsm_platform.host.engines import graph_session, platform_session
 from fsm_platform.host.graph_version import (
     current_graph_version,
     resolve_graph_version,
@@ -30,40 +30,42 @@ def _actor_id_from_actor(actor: Optional[dict[str, Any]]) -> Optional[int]:
 
 def run_operation(
     service_id: str,
-    handler: Callable,
+    handler: Any,
     kind: str,
     params: dict[str, Any],
     actor: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Выполняет invoke: открывает domain/platform сессии, вызывает handler, коммитит.
-    Для create-command дополнительно пишет entity_fsm_state и опционально enqueue.
+    Invoke command/query через Contract API; platform commit + bootstrap/enqueue.
+    Domain DB commit — на стороне domain service до ответа HTTP.
     """
+    from fsm_platform.core.remote import RemoteRef
+    from fsm_platform.host.contract_invoke import call_operation
     from fsm_platform.host.runtime_context import service_scope
 
-    sp = platform_session()
-    sd = domain_session(service_id)
-    try:
-        import inspect
+    if not isinstance(handler, RemoteRef):
+        raise TypeError("operation handler must be RemoteRef")
 
+    sp = platform_session()
+    sg = None
+    try:
         with service_scope(service_id):
-            if "platform_session" in inspect.signature(handler).parameters:
-                result = handler(sd, params, actor, platform_session=sp)
-            else:
-                result = handler(sd, params, actor)
+            result = call_operation(
+                handler, kind=kind, params=params, actor=actor
+            )
             if kind == "command" and isinstance(result, dict) and result.get("entity_type"):
+                sg = graph_session(service_id)
                 _bootstrap_and_maybe_enqueue(
-                    sp, sd, service_id, result, actor=actor
+                    sp, sg, service_id, result, actor=actor
                 )
-        sd.commit()
         sp.commit()
         return result if isinstance(result, dict) else {"data": result}
     except Exception:
-        sd.rollback()
         sp.rollback()
         raise
     finally:
-        sd.close()
+        if sg is not None:
+            sg.close()
         sp.close()
 
 
@@ -304,13 +306,13 @@ def enqueue_instance(
         if state is None:
             raise LookupError("ENTITY_STATE_NOT_FOUND")
         gv = None
-        sd = None
+        sg = None
         try:
-            sd = domain_session(service_id)
-            gv = resolve_graph_version(sd)
+            sg = graph_session(service_id)
+            gv = resolve_graph_version(sg)
         finally:
-            if sd is not None:
-                sd.close()
+            if sg is not None:
+                sg.close()
         instance_id = default_db_layer.insert_fsm_instance(
             sp,
             service_id=service_id,
@@ -454,7 +456,6 @@ def list_available_actions(
 
     repo = TransitionRepository()
     sp = platform_session()
-    sd = domain_session(service_id)
     sg = graph_session(service_id)
     try:
         with service_scope(service_id):
@@ -499,8 +500,12 @@ def list_available_actions(
                 context_error: Optional[str] = None
                 if context_builder is not None:
                     try:
-                        domain_context = (
-                            context_builder(sd, None, {}, instance) or {}
+                        from fsm_platform.host.contract_invoke import (
+                            call_context_builder,
+                        )
+
+                        domain_context = call_context_builder(
+                            context_builder, runtime_ctx={}, instance=instance
                         )
                     except Exception as exc:  # noqa: BLE001
                         context_error = f"CONTEXT_FAILED:{exc}"
@@ -524,13 +529,14 @@ def list_available_actions(
                         reason = f"UNKNOWN_GUARD:{edge.guard_name}"
                     else:
                         try:
+                            from fsm_platform.host.contract_invoke import call_guard
+
                             gr = normalize_guard_result(
-                                guard_fn(
-                                    sd,
-                                    None,
-                                    domain_context,
-                                    instance,
-                                    edge.guard_params or {},
+                                call_guard(
+                                    guard_fn,
+                                    context=domain_context,
+                                    guard_params=edge.guard_params or {},
+                                    instance=instance,
                                 )
                             )
                             allowed = bool(gr.ok)
@@ -561,5 +567,4 @@ def list_available_actions(
             }
     finally:
         sp.close()
-        sd.close()
         sg.close()

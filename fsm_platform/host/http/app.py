@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from fsm_platform.host.auth import AuthError, auth_enabled, make_token, resolve_actor
-from fsm_platform.host.boot import boot
+from domains.bootstrap import get_bootstrap_status, is_domain_ready
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.http.events_ws import router as events_ws_router
 from fsm_platform.host.hook_registry import (
@@ -74,14 +74,16 @@ def _http_actor(
 
 @app.on_event("startup")
 def _startup() -> None:
-    """При старте API поднимает engines и регистрирует домены."""
+    """Engines + best-effort domain bootstrap (не блокирует API при offline domain)."""
+    from fsm_platform.host.boot import boot
+
     boot()
 
 
 @app.get("/v1/health")
-def health() -> dict[str, str]:
-    """Проверка живости сервиса. Нужна для мониторинга и smoke."""
-    return {"status": "ok"}
+def health() -> dict[str, Any]:
+    """Живость platform API. Domain service может быть offline — это не ошибка health."""
+    return {"status": "ok", "domains": get_bootstrap_status()}
 
 
 @app.get("/v1/auth/token")
@@ -129,11 +131,14 @@ def metrics() -> dict[str, Any]:
 @app.get("/v1/{service_id}/catalog")
 def catalog(service_id: str) -> dict[str, Any]:
     """Каталог операций, процессов и inbound hook channels домена."""
+    domain_status = get_bootstrap_status(service_id)
     ops = default_operation_registry.list(service_id)
     processes = default_process_registry.list_process_names(service_id)
     hooks = default_webhook_registry.list_channels(service_id)
     return {
         "service_id": service_id,
+        "domain_ready": is_domain_ready(service_id),
+        "domain_bootstrap": domain_status,
         "operations": ops,
         "processes": processes,
         "hooks": hooks,
@@ -153,7 +158,23 @@ def invoke(
     actor = _http_actor(authorization, body.actor)
     meta = default_operation_registry.get(service_id, body.operation)
     if meta is None:
-        raise HTTPException(404, detail=f"UNKNOWN_OPERATION: {body.operation}")
+        raise HTTPException(
+            404,
+            detail={
+                "error_code": "UNKNOWN_OPERATION",
+                "message": f"operation {body.operation!r} not registered",
+                "domain_ready": is_domain_ready(service_id),
+            },
+        )
+    if not is_domain_ready(service_id):
+        raise HTTPException(
+            503,
+            detail={
+                "error_code": "DOMAIN_NOT_READY",
+                "message": "domain service catalog not loaded; tenant offline or misconfigured",
+                "domain_bootstrap": get_bootstrap_status(service_id),
+            },
+        )
     try:
         result = request_runtime.run_operation(
             service_id,

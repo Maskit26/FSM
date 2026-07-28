@@ -4,17 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
+from fsm_platform.core.remote import RemoteRef
 
 RuntimeContext = dict[str, Any]
 InstanceDict = dict[str, Any]
-
-# session_domain, db facade, runtime_ctx, instance → context
-ContextBuilder = Callable[[Any, Any, RuntimeContext, InstanceDict], dict[str, Any]]
-# session_domain, db, context, instance, params → result
-GuardFunction = Callable[[Any, Any, dict[str, Any], InstanceDict, dict[str, Any]], Any]
-EffectFunction = Callable[[Any, Any, dict[str, Any], InstanceDict, dict[str, Any]], Any]
 
 
 @dataclass
@@ -46,8 +41,7 @@ class EffectResult:
     payload: Optional[dict[str, Any]] = None
 
 
-# (session_platform, session_domain, db, instance, last_error) -> None
-OnFailedHandler = Callable[..., None]
+# on_failed handler — только в domain service (ProcessDef.on_failed → RemoteRef на platform)
 
 
 @dataclass
@@ -58,9 +52,9 @@ class ProcessDef:
     process_name: str
     entity_type: Optional[str] = None
     event_name: Optional[str] = None
-    context_builder: Optional[ContextBuilder] = None
+    context_builder: Optional[RemoteRef] = None
     initial_state: Optional[str] = None
-    on_failed: Optional[OnFailedHandler] = None
+    on_failed: Optional[RemoteRef] = None
 
     @property
     def runtime_event_name(self) -> str:

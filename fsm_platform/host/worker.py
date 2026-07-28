@@ -15,7 +15,7 @@ from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.registry import default_process_registry
 from fsm_platform.core.sagas import on_child_terminal
 from fsm_platform.core.types import FsmResult
-from fsm_platform.host.engines import domain_session, graph_session, platform_session
+from fsm_platform.host.engines import graph_session, platform_session
 from fsm_platform.host.graph_version import resolve_graph_version
 from fsm_platform.host.retry_policy import backoff_seconds, should_retry
 from fsm_platform.host.webhooks import emit_event_with_webhooks
@@ -163,20 +163,18 @@ def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
         return
 
     sp = platform_session()
-    sd = None
     try:
-        sd = domain_session(service_id)
-        db = {"platform": sp, "domain": sd}
+        from fsm_platform.host.contract_invoke import call_on_failed
+
         with service_scope(service_id):
-            process_def.on_failed(sp, sd, db, instance, last_error or "")
-        sd.commit()
+            call_on_failed(
+                process_def.on_failed,
+                instance=instance,
+                last_error=last_error or "",
+                process_name=process_name,
+            )
         sp.commit()
     except Exception:
-        if sd is not None:
-            try:
-                sd.rollback()
-            except Exception:
-                pass
         try:
             sp.rollback()
         except Exception:
@@ -187,8 +185,6 @@ def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
             instance.get("id"),
         )
     finally:
-        if sd is not None:
-            sd.close()
         sp.close()
 
 
@@ -327,16 +323,14 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
     assert instance is not None
     service_id = str(instance["service_id"])
     sp = platform_session()
-    sd = None
     sg = None
     try:
-        sd = domain_session(service_id)
         sg = graph_session(service_id)
         runtime_ctx: dict[str, Any] = {}
-        db = {"platform": sp, "domain": sd}
+        db: dict[str, Any] = {"platform": sp}
 
         result = run_instance(
-            sp, sd, db, runtime_ctx, instance, session_graph=sg
+            sp, None, db, runtime_ctx, instance, session_graph=sg
         )
 
         if result.new_state == "COMPLETED":
@@ -356,14 +350,6 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
                 status="COMPLETED",
             )
             try:
-                sd.commit()
-            except Exception:
-                sd.rollback()
-                sp.rollback()
-                logger.exception("domain commit failed instance_id=%s", instance["id"])
-                _finish_failure(instance, "DOMAIN_COMMIT_FAILED")
-                return True
-            try:
                 sp.commit()
             except Exception:
                 sp.rollback()
@@ -375,23 +361,18 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
                 return True
             return True
 
-        sd.rollback()
         sp.rollback()
         _finish_failure(instance, result.last_error or "FAILED")
         return True
     except Exception as exc:
         logger.exception("process_one crashed instance_id=%s", instance.get("id"))
         try:
-            if sd is not None:
-                sd.rollback()
             sp.rollback()
         except Exception:
             pass
         _finish_failure(instance, f"WORKER_CRASH: {exc}")
         return True
     finally:
-        if sd is not None:
-            sd.close()
         if sg is not None:
             sg.close()
         sp.close()

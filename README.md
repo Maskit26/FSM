@@ -35,7 +35,13 @@ mysql … < sql/platform/001_platform_schema.sql
 
 # env
 set PLATFORM_DATABASE_URL=mysql+mysqlconnector://...
-set FSM_DOMAINS=svc_courier_01=domains.courier.processes:register_all
+set DOMAIN_GRAPH_DATABASE_URL=mysql+mysqlconnector://...
+set DOMAIN_GRAPH_WRITE_DATABASE_URL=mysql+mysqlconnector://...
+set SERVICE_ID=svc_courier_01
+set CONTRACT_BASE_URL=http://127.0.0.1:8100
+set CONTRACT_SHARED_SECRET=...
+
+# Platform стартует без domain service; invoke/FSM для tenant — когда catalog загружен
 
 # API
 uvicorn main:app --reload --host 127.0.0.1 --port 8000

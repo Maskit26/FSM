@@ -3,8 +3,7 @@ Inbound hook registry: сторонние API → домен (снаружи в�
 
 Не путать с host/webhooks.py (outbound webhook_subscriptions → клиент).
 
-Домен в register_all:
-  default_webhook_registry.register(service_id, "leo4", handle_leo4)
+Домен объявляет channels в catalog; dispatch — через domain service (часть 6).
 
 HTTP: POST /v1/{service_id}/hooks/{channel}
 """
@@ -21,7 +20,7 @@ class WebhookRegistry:
     """(service_id, channel) → handler. Channel — короткое имя источника (leo4, tinkoff, …)."""
 
     def __init__(self) -> None:
-        self._hooks: dict[tuple[str, str], WebhookHandler] = {}
+        self._hooks: dict[tuple[str, str], Optional[WebhookHandler]] = {}
 
     def register(
         self, service_id: str, channel: str, handler: WebhookHandler
@@ -34,6 +33,14 @@ class WebhookRegistry:
         if not callable(handler):
             raise TypeError("handler must be callable")
         self._hooks[(sid, ch)] = handler
+
+    def register_channel(self, service_id: str, channel: str) -> None:
+        """Channel из catalog (без handler — dispatch в domain service, часть 6)."""
+        sid = str(service_id or "").strip()
+        ch = str(channel or "").strip().lower()
+        if not sid or not ch:
+            raise ValueError("service_id and channel required")
+        self._hooks[(sid, ch)] = None
 
     def get(self, service_id: str, channel: str) -> Optional[WebhookHandler]:
         """Handler или None."""
@@ -162,6 +169,13 @@ def dispatch_inbound_hook(
     ch = str(channel or "").strip().lower()
     handler = default_webhook_registry.get(service_id, ch)
     if handler is None:
+        if default_webhook_registry.has(service_id, ch):
+            raise HookError(
+                "HOOK_REMOTE_NOT_IMPLEMENTED",
+                f"inbound hook channel={ch!r} declared in catalog; "
+                f"domain service dispatch pending",
+                status_code=501,
+            )
         raise HookError(
             "UNKNOWN_HOOK_CHANNEL",
             f"no inbound hook for channel={ch!r}",
