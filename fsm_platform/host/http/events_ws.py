@@ -33,11 +33,13 @@ from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.host.auth import AuthError, auth_enabled, resolve_actor
 from fsm_platform.host.engines import platform_session
 from fsm_platform.host.http import request_runtime
+from fsm_platform.host.http.dependencies import authenticate_domain_request
 from fsm_platform.host.operations import default_operation_registry
+from fsm_platform.host.tenant_auth import TenantAuthError
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(tags=["Domain API"])
 
 _DEFAULT_INTERVAL = float(os.environ.get("EVENTS_WS_POLL_SECONDS", "1"))
 
@@ -118,6 +120,20 @@ async def events_ws(
       {"type":"snapshot","operation":"...","data":{...},"fp":"..."}
       {"type":"pong"} | {"type":"error","detail":"..."}
     """
+    try:
+        await run_in_threadpool(
+            authenticate_domain_request,
+            raw_token=websocket.headers.get("x-admin-token"),
+            service_id=service_id,
+            source_ip=websocket.client.host if websocket.client else None,
+            user_agent=websocket.headers.get("user-agent"),
+        )
+    except TenantAuthError as exc:
+        await websocket.close(
+            code=4404 if exc.status_code == 404 else 4401,
+            reason=exc.code,
+        )
+        return
     await websocket.accept()
     poll = float(interval) if interval is not None else _DEFAULT_INTERVAL
     if poll < 0.2:

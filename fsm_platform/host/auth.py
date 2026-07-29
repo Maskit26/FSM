@@ -4,10 +4,9 @@
 Режим off (dev): PLATFORM_AUTH_SECRET не задан — actor из тела как раньше.
 Режим on: Authorization: Bearer <actor_type>:<actor_id>:<sig>
   sig = HMAC-SHA256(secret, "{actor_type}:{actor_id}").hexdigest()[:24]
-Тело actor игнорируется для identity — подставляется из токена.
-
-Dev-хелпер (только если PLATFORM_AUTH_DEV_TOKENS=1):
-  GET /v1/auth/token?actor_id=3 → выдаёт Bearer для локалки.
+Тело actor игнорируется для identity — подставляется из заранее выданного
+actor token. Tenant account access token и DOMAIN_ADMIN_TOKEN — отдельные
+контуры и здесь не проверяются.
 """
 
 from __future__ import annotations

@@ -16,10 +16,13 @@ Business-таблицы домена платформа **не** открыва�
 | Platform API `.env` | process: `PLATFORM_DATABASE_URL`, `PLATFORM_SECRETS_KEY`, `PLATFORM_ADMIN_TOKEN`, … |
 | Worker env | platform DB/secrets config + один `WORKER_SERVICE_ID` |
 
-Онбординг tenant: `domain_services` + `PUT /v1/{service_id}/secrets`
-(ключи `graph_database_url`, `graph_write_database_url`, `contract_base_url`, `contract_shared_secret`, Telegram).
+Онбординг tenant: register/login → `DOMAIN_ADMIN_TOKEN` →
+`POST /v1/tenant/domains` → `PUT /v1/{service_id}/secrets`
+(ключи `graph_database_url`, `graph_write_database_url`, `contract_base_url`,
+`contract_shared_secret`, Telegram) → `POST /v1/{service_id}/connect`.
 
-Сейчас secrets API авторизован глобальным `PLATFORM_ADMIN_TOKEN`. Per-tenant `DOMAIN_ADMIN_TOKEN` и автоматический worker provisioning имеют статус «В разработке» в основной спецификации.
+Secrets и весь Domain API авторизованы tenant-scoped `DOMAIN_ADMIN_TOKEN`.
+`PLATFORM_ADMIN_TOKEN` действует только на Platform Admin routes.
 
 ## Self-hosted MySQL
 

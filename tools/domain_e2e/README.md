@@ -18,6 +18,8 @@ API и worker должны быть подняты.
 ```bash
 cd C:\FSM_Platform
 $env:PYTHONPATH = "C:\FSM_Platform"
+$env:DOMAIN_ADMIN_TOKEN = "<tenant token>"
+$env:PLATFORM_ADMIN_TOKEN = "<platform token for health>"
 
 python -m tools.domain_e2e.runner scenarios/courier/client_self_pickup.yaml
 python -m tools.domain_e2e.runner scenarios/courier/client_deposit_x3_to_direction.yaml
@@ -43,6 +45,9 @@ python -m tools.domain_e2e.runner scenarios/courier/
 |------|---------|---------|
 | `--base-url` | `http://127.0.0.1:8000` | API |
 | `--service-id` | _(пусто)_ | override YAML `service_id` (сценарий обязан объявить свой) |
+| `--domain-admin-token` | `$env:DOMAIN_ADMIN_TOKEN` | обязательный tenant token для `/v1/{service_id}/…` |
+| `--platform-admin-token` | `$env:PLATFORM_ADMIN_TOKEN` | token только для platform health |
+| `--actor-bearer-token` | `$env:E2E_ACTOR_BEARER_TOKEN` | actor Bearer, если включён `PLATFORM_AUTH_SECRET` |
 | `--report` | `tools/domain_e2e/reports/e2e_<timestamp>.md` | Markdown |
 | `--poll-timeout` | `30` | сек ожидания instance |
 | `--poll-interval` | `0.5` | интервал poll |
@@ -62,4 +67,8 @@ Exit code: `0` all green, `1` fail, `2` path/API unavailable.
 - `wait_instance: true` — poll `instance_id` или все `instance_ids` до COMPLETED/FAILED
 - `create_order` ставит `enqueues[]` `locker_reserve` на source/dest; дожидайтесь их перед open_cell
 
-**Auth:** при `PLATFORM_AUTH_SECRET` + `PLATFORM_AUTH_DEV_TOKENS=1` клиент сам берёт Bearer на каждого `actor` через `GET /v1/auth/token` (кэш per `service_id|actor`). Формат Markdown-отчёта без изменений.
+**Auth:** каждый domain request передаёт `X-Admin-Token:
+<DOMAIN_ADMIN_TOKEN>`. Dev endpoint выдачи actor token отсутствует. Если включён
+`PLATFORM_AUTH_SECRET`, готовый actor Bearer передаётся через
+`--actor-bearer-token`; иначе actor остаётся в body сценария. Platform token
+используется только для health check.

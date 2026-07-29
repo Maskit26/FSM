@@ -27,16 +27,18 @@ FSM Platform — **универсальный движок оркестраци�
 Клиенты (фронт / мобилка) / Telegram / исходящие webhooks клиентов
         ↓
 Platform API (:8000)          FSM Worker × N (1 процесс = 1 tenant)
-  Public API + admin secrets    claim / timers / outbox / reconcile
-  input/telegram webhook
-        │  platform DB: instances, entity_fsm_state, outbox, secrets, …
+  Auth + Domain API + Input     claim / timers / outbox / reconcile
+  DOMAIN_ADMIN_TOKEN gateway
+        │  platform DB: instances, entity_fsm_state, outbox, secrets, tenants, …
         │  graph SQL (read / publish) — отдельные credentials
         ↓  HMAC Contract API
 Domain service (:8100…) — DOMAIN_DATABASE_URL (business + fsm_* tables)
   guards / effects / commands / queries / context / on_failed
 ```
 
-Целевая топология: **один** Platform API, **N** worker-процессов и **N** domain services (по числу активных арендаторов). Автоматический запуск worker при подключении домена — **в разработке** (§7.1).
+Топология: **один** Platform API, **N** worker-процессов и **N** domain services
+(по числу активных арендаторов). `POST …/connect` поднимает dedicated worker
+(`1 process = 1 service_id`) через локальный `WorkerProvisioner` (§7.1).
 
 ---
 
@@ -51,9 +53,9 @@ Domain service (:8100…) — DOMAIN_DATABASE_URL (business + fsm_* tables)
 7. **Per-tenant secrets** — graph URL, contract URL/secret, Telegram и т.п. в `domain_secrets` (Fernet). Platform `.env` — только процесс платформы.
 8. **`service_id`** — уникальный runtime-ключ арендатора; `cartridge_type` может повторяться.
 9. **Домен обслуживается после bootstrap** — `domain_services.status=active` + успешный catalog + Domain Validator.
-10. **1 worker process = 1 tenant** — целевая модель. Сейчас `WORKER_SERVICE_ID` ограничивает claim; tenant-scoped boot и автоматический lifecycle worker — **в разработке** (§7.1).
+10. **1 worker process = 1 tenant** — `WORKER_SERVICE_ID` обязателен; `boot(service_id)` и claim scoped на одного tenant; connect/start/stop/restart через `WorkerProvisioner` (§7.1).
 11. **I/O каналов на платформе** — Telegram webhook/deep-link/send в `input/` + `output/`; привязка аккаунта — доменная команда по конвенции канала (§8.4).
-12. **Один публичный контракт клиентов** — `/v1/{service_id}/…`.
+12. **Один публичный контракт клиентов** — `/v1/{service_id}/…` закрыт tenant-scoped `DOMAIN_ADMIN_TOKEN`.
 
 ---
 
@@ -63,7 +65,7 @@ Domain service (:8100…) — DOMAIN_DATABASE_URL (business + fsm_* tables)
 
 | Процесс | Entrypoint | Роль |
 |---------|------------|------|
-| Platform API | `uvicorn main:app` (порт 8000) | Public API, admin secrets, TG webhook, WS/events |
+| Platform API | `uvicorn main:app` (порт 8000) | Auth, Domain API, Platform Admin, TG webhook, WS/events |
 | FSM Worker | `python fsm_worker.py` | Claim instances / timers / outbox / reconcile **одного** tenant |
 | Domain service | `uvicorn domains.<name>.main:app` | Contract API + бизнес SQL |
 
@@ -109,7 +111,7 @@ domains/<name>/     # картриджи (отдельные процессы)
 
 Правила core: platform session/commit — у host; callables домена — через Contract / `domain_runtime`.
 
-Текущий `core/http_client.py` — исключение: generic external HTTP импортирует `host.secrets` и `runtime_context`. Перенос credential resolution за границу domain/platform входит в работы §9.7.
+Текущий `core/http_client.py` — исключение: generic external HTTP импортирует `host.secrets` и `runtime_context`. Перенос credential resolution за границу domain/platform входит в работы §9.6.
 
 | Модуль | Назначение |
 |--------|------------|
@@ -384,7 +386,7 @@ UPSERT строки `entity_fsm_state` для арендатора.
 
 Telegram для send/webhook кладётся в platform `domain_secrets` при онбординге.
 
-Текущая интеграция `call_api` читает credentials через `host.secrets`, поэтому courier domain process временно также получает `PLATFORM_DATABASE_URL` и `PLATFORM_SECRETS_KEY`. Это нарушает целевую изоляцию и входит в работы §9.7: после миграции domain process должен работать без доступа к platform DB.
+Текущая интеграция `call_api` читает credentials через `host.secrets`, поэтому courier domain process временно также получает `PLATFORM_DATABASE_URL` и `PLATFORM_SECRETS_KEY`. Это нарушает целевую изоляцию и входит в работы §9.6: после миграции domain process должен работать без доступа к platform DB.
 
 ### 5.6. Domain DB
 
@@ -398,39 +400,40 @@ Telegram для send/webhook кладётся в platform `domain_secrets` пр�
 
 ### 6.1. Как появляется `service_id`
 
-`service_id` — уникальный runtime-id арендатора. В текущей реализации его назначает оператор платформы при ручном создании строки `domain_services`. API регистрации арендатора — **в разработке** (§9.3).
+`service_id` — уникальный runtime-id домена. Платформа назначает его при
+`POST /v1/tenant/domains` и записывает владельца в `domain_services.tenant_account_id` (§9.2).
 
 | Где живёт | Назначение |
 |-----------|------------|
-| `domain_services.service_id` | Каталог арендаторов на platform DB |
+| `domain_services.service_id` | Каталог доменов на platform DB |
+| `domain_services.tenant_account_id` | Владелец (`domain_admin`) |
 | `domains/<name>/.env` → `SERVICE_ID` | Domain service регистрирует handlers под этим id |
-| URL Public API | `/v1/{service_id}/…` — клиенты и E2E передают его явно |
+| URL Domain API | `/v1/{service_id}/…` — клиенты и E2E передают его явно |
 | `WORKER_SERVICE_ID` | Env worker-процесса = тот же id |
 | HMAC Contract | Заголовок `X-Service-Id` |
 
-Типичное имя: `svc_<cartridge>_<nn>` (например `svc_courier_01`). `cartridge_type` может повторяться у разных `service_id`.
+Типичное имя: `svc_<cartridge>_<hex>` (например `svc_courier_a1b2c3d4e5f6`). `cartridge_type` может повторяться у разных `service_id`.
 
-Клиент получает `service_id` из конфига приложения/результата онбординга и ходит в `/v1/{service_id}/…`.
+Клиент получает `service_id` из ответа регистрации домена и ходит в `/v1/{service_id}/…`
+с `X-Admin-Token: DOMAIN_ADMIN_TOKEN`.
 
-### 6.2. Текущее ручное подключение
+### 6.2. Self-service подключение
 
-1. Развернуть Domain DB (schema + graph + graph users).
-2. Поднять domain service на известном URL (например `:8100`) с `SERVICE_ID=<новый id>`.
-3. Оператор вручную создаёт строку `domain_services`: `service_id`, `cartridge_type`, `status`, `db_secret_ref`, graph secret refs.
-4. Оператор записывает tenant secrets через `PUT /v1/{service_id}/secrets` с текущим глобальным `PLATFORM_ADMIN_TOKEN`.
-5. Перезапустить Platform API или вызвать `POST /v1/admin/domains/{service_id}/reload` с тем же токеном.
-6. Вручную запустить worker-процесс с `WORKER_SERVICE_ID={service_id}`.
-7. Проверить `GET /v1/{service_id}/catalog`, затем E2E (§16).
-
-Целевой self-service onboarding, выдача `DOMAIN_ADMIN_TOKEN` и автоматический worker provisioning описаны как **в разработке** в §9.3 и §7.1.
+1. Арендатор: `POST /v1/auth/register` → verify email → `POST /v1/auth/login`.
+2. Выпустить tenant-scoped `DOMAIN_ADMIN_TOKEN` (`POST /v1/tenant/admin-tokens`).
+3. Развернуть Domain DB (schema + graph + graph users) и domain service.
+4. `POST /v1/tenant/domains` с `DOMAIN_ADMIN_TOKEN` → получить `service_id`.
+5. Записать secrets через `PUT /v1/{service_id}/secrets` с тем же token.
+6. `POST /v1/{service_id}/connect` — Domain Validator + bootstrap + dedicated worker.
+7. Проверить `GET /v1/{service_id}/catalog`, затем E2E (§16 / `tools/tenant_e2e.py`).
 
 ### 6.3. Что платформа делает при boot
 
 ```text
 main.py / fsm_worker.py
-  → host/boot.py
-       list domain_services (active)
-       для каждого tenant:
+  → host/boot.py(service_id=…)
+       list domain_services (active; worker — только свой service_id)
+       для каждого выбранного tenant:
          tenant_config.resolve_tenant_ref → secrets graph_* URLs
          engines.register graph session makers
          domain_bootstrap: contract_client GET /catalog
@@ -440,7 +443,7 @@ main.py / fsm_worker.py
 
 Ошибки Validator → tenant не ready; Public API отвечает HTTP 503 `DOMAIN_NOT_READY`.
 
-Текущий `boot()` worker загружает graph engines и catalog **всех** active tenants. `WORKER_SERVICE_ID` применяется при claim timers/schedules/instances/outbox/reconcile, но не ограничивает bootstrap. Tenant-scoped boot — часть работ §7.1.
+Worker всегда стартует с `boot(service_id=WORKER_SERVICE_ID)` и загружает только свой tenant.
 
 ---
 
@@ -451,37 +454,25 @@ main.py / fsm_worker.py
 **Реализовано:**
 
 - `fsm_worker.py` требует `WORKER_SERVICE_ID` (fail-closed).
-- `host/worker.run_loop` передаёт `service_id` в обработку timers, schedules, instances, outbox и reconcile.
+- `boot(service_id)` / `bootstrap_active_domains(service_id=…)` загружают только этот tenant.
+- `host/worker.run_loop` передаёт `service_id` в timers, schedules, instances, outbox и reconcile.
 - Claim выполняется только по этому `service_id`.
-- `WORKER_ALLOW_ALL_TENANTS=1` включает явный dev-режим без tenant-фильтра.
-- Worker запускается оператором вручную.
-- `boot()` worker пока регистрирует в RAM все active tenants.
-
-**В разработке — tenant-scoped worker provisioning:**
+- `host/worker_provisioner.py` — локальный lifecycle: start/stop/restart/status.
+- `POST /v1/{service_id}/connect` после Validator/bootstrap вызывает `provision_worker`.
+- Tenant API: `GET …/worker/status`, `POST …/worker/restart|stop`.
+- При ошибке provisioning статус домена → `worker_failed`.
 
 | Правило | Смысл |
 |---------|--------|
-| 1 процесс = 1 tenant | Env **этого** процесса содержит ровно один `WORKER_SERVICE_ID` |
+| 1 процесс = 1 tenant | Env процесса содержит ровно один `WORKER_SERVICE_ID` |
 | Один бинарь | Все воркеры запускают `python fsm_worker.py` |
-| Изоляция конфига | Секретный env/Secret воркера содержит только конфиг конкретного tenant |
-| Claim filter | `claim_pending_instance(..., service_id=WORKER_SERVICE_ID)` и то же для timers/outbox/reconcile |
-| Tenant-scoped boot | `boot(service_id)` загружает graph engines и catalog только своего tenant |
-| Исполнение | После claim `service_id` берётся из строки instance (должен совпасть) |
+| Claim filter | `claim_*(..., service_id=WORKER_SERVICE_ID)` |
+| Tenant-scoped boot | `boot(service_id)` только своего tenant |
 | Fail-closed | Без `WORKER_SERVICE_ID` процесс не стартует |
-| Lifecycle | Подключение домена создаёт/запускает worker; disable/delete tenant останавливает его |
+| Lifecycle | connect поднимает worker; tenant stop/restart управляет им |
 
-План реализации:
-
-1. Добавить `WorkerProvisioner` с backend-адаптерами systemd / Docker Compose / Kubernetes.
-2. После успешного tenant onboarding + Domain Validator формировать конфиг worker: `WORKER_SERVICE_ID`, `PLATFORM_DATABASE_URL`, `PLATFORM_SECRETS_KEY`, runtime limits.
-3. Хранить env как OS/Kubernetes secret; файл, если используется, создавать с ограниченными правами и не класть в репозиторий.
-4. Изменить `boot()`/`bootstrap_active_domains()` так, чтобы worker принимал `service_id` и загружал только один tenant.
-5. Хранить статус lifecycle (`PENDING`, `STARTING`, `RUNNING`, `FAILED`, `STOPPED`) и диагностическое сообщение.
-6. Реализовать start/stop/restart/status и идемпотентность повторного provisioning.
-7. Добавить rollback: если worker не поднялся, tenant не переводится в ready.
-8. Покрыть provisioning интеграционными тестами и проверкой, что worker одного tenant не claim/boot другого.
-
-Целевая топология: N арендаторов → N domain services + N worker processes + один Platform API и одна platform DB.
+Дальнейшие backend-адаптеры (systemd / Docker / Kubernetes) могут заменить локальный
+subprocess launcher без смены модели `1 worker = 1 service_id`.
 
 ### 7.2. Entrypoint и цикл
 
@@ -711,78 +702,78 @@ Telegram → POST /input/telegram/{service_id}/webhook
 - Шифрование at-rest: Fernet(`PLATFORM_SECRETS_KEY`) — ключ **процесса платформы** (не отдаётся арендатору).
 - Чтение/запись значений — в `service_scope(service_id)` (`host/secrets.py`).
 
-### 9.2. Текущая реализация
+### 9.2. Реализованная модель tenant onboarding
 
-- Регистрация tenant выполняется вручную через `domain_services`.
-- `PUT/GET/DELETE /v1/{service_id}/secrets` и `POST /v1/admin/domains/{service_id}/reload` проверяют один глобальный `PLATFORM_ADMIN_TOKEN` из env Platform API.
-- Per-tenant `DOMAIN_ADMIN_TOKEN`, tenant account, login и API выдачи/ротации токена пока отсутствуют.
-- Значения secrets зашифрованы, но авторизация admin API пока не изолирована по tenant.
+Зарегистрированный арендатор (`domain_admin`) выпускает tenant-scoped
+`DOMAIN_ADMIN_TOKEN`, регистрирует им один или несколько `service_id` и использует
+тот же тип токена для всего service-scoped API своих доменов.
 
-Текущая схема пригодна только для управления оператором платформы и должна быть заменена целевой моделью ниже.
-
-### 9.3. В разработке — целевая модель tenant onboarding
-
-Цель: зарегистрированный арендатор получает доступ только к своим `service_id`, выпускает `DOMAIN_ADMIN_TOKEN` и использует его для управления secrets и credentials.
-
-#### 9.3.1. Модель данных
+#### 9.2.1. Модель данных
 
 | Сущность | Назначение |
 |----------|------------|
-| `tenant_accounts` | Учётная запись: id, login/email или external subject, password hash/IdP, status |
-| `tenant_services` | Связь tenant account ↔ разрешённые `service_id`, роль (`owner`, `admin`, `viewer`) |
-| `domain_admin_tokens` | `service_id`, token hash, prefix/id, created/expires/revoked, created_by, last_used |
-| `domain_services` | Runtime-регистрация домена и lifecycle |
+| `tenant_accounts` | Учётная запись `domain_admin`: id, email, password hash, verification/status |
+| `tenant_refresh_tokens` | Hash refresh token, rotation/revoke/expiry и данные сессии |
+| `domain_admin_tokens` | `tenant_account_id`, token hash, prefix/id, created/expires/revoked, last_used |
+| `domain_services` | Runtime-регистрация домена, lifecycle и обязательный владелец `tenant_account_id` |
 | `domain_secrets` | Зашифрованные значения graph/contract/Telegram/credentials |
+| `platform_audit_events` | Security audit tenant/token/domain операций |
 
 Raw `DOMAIN_ADMIN_TOKEN` возвращается только при выпуске. В БД хранится криптографический hash токена, а не raw token и не запись в `domain_secrets`.
 
-#### 9.3.2. Tenant authentication
+Ролей `owner/admin/viewer` и таблицы membership нет. Один tenant account всегда
+имеет одну роль `domain_admin`, может владеть несколькими `service_id`, а каждый
+`service_id` принадлежит ровно одному account через `domain_services.tenant_account_id`.
 
-1. Регистрация tenant account (self-service с подтверждением или создание оператором).
-2. Login через password/OIDC → короткоживущий access token.
-3. Access token содержит tenant account id; доступ к `service_id` проверяется через `tenant_services`.
-4. Операции регистрации домена и выпуска/ротации `DOMAIN_ADMIN_TOKEN` доступны только `owner/admin`.
-5. Platform-wide операции остаются под отдельной ops-аутентификацией и не используют tenant token.
+#### 9.2.2. Tenant authentication
 
-#### 9.3.3. Выпуск `DOMAIN_ADMIN_TOKEN`
+1. Свободная self-service регистрация tenant account и подтверждение email.
+2. Login по email/password → короткоживущий access token и ротируемый refresh token.
+3. Access token используется только для управления account и выпуска/отзыва `DOMAIN_ADMIN_TOKEN`.
+4. Арендатор выпускает tenant-scoped `DOMAIN_ADMIN_TOKEN`.
+5. Этим token арендатор регистрирует домен; платформа записывает владельца в `domain_services.tenant_account_id`.
+6. Доступ к `/v1/{service_id}/…` разрешён, только если account токена владеет `service_id`.
+7. Platform-wide операции используют отдельный `PLATFORM_ADMIN_TOKEN` и не принимают tenant token.
 
-1. Аутентифицированный tenant owner создаёт/подключает domain service.
-2. Платформа назначает `service_id` и создаёт `domain_services` в статусе `PENDING_CONFIGURATION`.
-3. Платформа генерирует криптографически случайный `DOMAIN_ADMIN_TOKEN`.
-4. Hash сохраняется в `domain_admin_tokens`; raw token возвращается один раз.
-5. Арендатор использует token в `X-Admin-Token` для secrets/credentials только этого `service_id`.
-6. Поддерживаются rotate, revoke, expiry и несколько активных токенов для безопасной ротации.
+#### 9.2.3. Выпуск `DOMAIN_ADMIN_TOKEN`
 
-#### 9.3.4. Целевые API
+1. Аутентифицированный tenant account запрашивает выпуск токена.
+2. Платформа генерирует криптографически случайный `DOMAIN_ADMIN_TOKEN`.
+3. Hash сохраняется в `domain_admin_tokens` с `tenant_account_id`; raw token возвращается один раз.
+4. Арендатор передаёт token в `X-Admin-Token` при регистрации домена и во всех `/v1/{service_id}/…`.
+5. Один token действует для всех текущих и будущих `service_id` этого account, но не даёт доступа к чужим доменам.
+6. Поддерживаются list, rotate, revoke, expiry и несколько активных токенов.
+
+#### 9.2.4. API
 
 | Метод | Авторизация | Назначение |
 |-------|-------------|------------|
-| `POST /v1/tenants/register` | public/ops policy | Создать tenant account |
-| `POST /v1/tenants/login` | credentials/OIDC | Получить access token |
-| `POST /v1/tenant/domains` | tenant access token | Зарегистрировать domain, получить `service_id` |
-| `POST /v1/tenant/domains/{service_id}/admin-tokens` | tenant owner/admin | Выпустить token (raw показывается один раз) |
-| `POST …/admin-tokens/{token_id}/revoke` | tenant owner/admin | Отозвать token |
-| `PUT/GET/DELETE /v1/{service_id}/secrets…` | `DOMAIN_ADMIN_TOKEN` | Secrets/credentials своего domain |
-| `POST /v1/{service_id}/connect` | tenant owner/admin | Validate domain и запустить provisioning worker |
+| `POST /v1/auth/register` | public | Создать tenant account |
+| `POST /v1/auth/verify-email` | public verification token | Подтвердить email |
+| `POST /v1/auth/login`, `/refresh`, `/logout` | credentials/refresh | Управление login session |
+| `POST/GET /v1/tenant/admin-tokens` | tenant access token | Выпустить/list token |
+| `POST …/admin-tokens/{token_id}/rotate|revoke` | tenant access token | Ротация/отзыв token |
+| `POST /v1/tenant/domains` | `DOMAIN_ADMIN_TOKEN` | Зарегистрировать domain, получить `service_id` |
+| Все `/v1/{service_id}/…` | `DOMAIN_ADMIN_TOKEN` | API принадлежащего account домена |
+| Platform Admin API | `PLATFORM_ADMIN_TOKEN` | Platform-wide управление |
 
-#### 9.3.5. Проверка `DOMAIN_ADMIN_TOKEN`
+#### 9.2.5. Проверка `DOMAIN_ADMIN_TOKEN`
 
-1. Взять `service_id` из URL.
-2. Найти активные token records только этого `service_id`.
-3. Constant-time проверить hash, expiry и revoked status.
-4. Записать audit event (`service_id`, token id, operation, result, source).
-5. Применить rate limit к неуспешным проверкам.
-6. Запретить через tenant token доступ к secrets другого `service_id`.
+1. Найти token record по безопасному hash и проверить expiry/revoked status.
+2. Получить `tenant_account_id` токена.
+3. Для service-scoped route взять `service_id` из URL и проверить владельца в `domain_services`.
+4. При несовпадении вернуть deny без раскрытия существования чужого `service_id`.
+5. Записать audit event (`tenant_account_id`, `service_id`, token id, operation, result, source).
+6. Применить rate limit к неуспешным проверкам.
 
-### 9.4. API secrets и credentials
+### 9.3. API secrets и credentials
 
-**Текущее состояние:** примеры ниже работают с `PLATFORM_ADMIN_TOKEN`.
-
-**После реализации §9.3:** те же endpoints принимают per-tenant `DOMAIN_ADMIN_TOKEN`.
+Tenant routes принимают только `DOMAIN_ADMIN_TOKEN`.
+`PLATFORM_ADMIN_TOKEN` на них не является fallback.
 
 ```http
 PUT /v1/{service_id}/secrets
-X-Admin-Token: <PLATFORM_ADMIN_TOKEN | DOMAIN_ADMIN_TOKEN после §9.3>
+X-Admin-Token: <DOMAIN_ADMIN_TOKEN>
 Content-Type: application/json
 
 { "key": "contract_base_url", "value": "http://127.0.0.1:8100" }
@@ -790,18 +781,18 @@ Content-Type: application/json
 
 ```http
 GET /v1/{service_id}/secrets
-X-Admin-Token: <PLATFORM_ADMIN_TOKEN | DOMAIN_ADMIN_TOKEN после §9.3>
+X-Admin-Token: <DOMAIN_ADMIN_TOKEN>
 → { "keys": ["contract_base_url", "graph_database_url", …] }   # без values
 ```
 
 ```http
 DELETE /v1/{service_id}/secrets/{key}
-X-Admin-Token: <PLATFORM_ADMIN_TOKEN | DOMAIN_ADMIN_TOKEN после §9.3>
+X-Admin-Token: <DOMAIN_ADMIN_TOKEN>
 ```
 
 После смены `contract_*` или graph URL — reload домена / рестарт API и worker.
 
-### 9.5. Стандартные ключи онбординга
+### 9.4. Стандартные ключи онбординга
 
 | key | Кто читает | Зачем |
 |-----|------------|-------|
@@ -815,16 +806,12 @@ X-Admin-Token: <PLATFORM_ADMIN_TOKEN | DOMAIN_ADMIN_TOKEN после §9.3>
 
 Отдельно — **credentials** сторонних API (произвольные имена ключей, JSON value): см. §10.
 
-### 9.6. Цепочка использования
+### 9.5. Цепочка использования
 
 ```text
-Текущая реализация:
-  Оператор: domain_services + PLATFORM_ADMIN_TOKEN → PUT secrets
-
-После реализации §9.3:
-  Tenant login → register domain → DOMAIN_ADMIN_TOKEN
-  DOMAIN_ADMIN_TOKEN → PUT secrets/credentials своего service_id
-       ↓
+Tenant register/verify/login → DOMAIN_ADMIN_TOKEN → register domain
+DOMAIN_ADMIN_TOKEN → весь /v1/{service_id}/… только своих доменов
+     ↓
 Boot / runtime:
   tenant_config.resolve_tenant_ref(service_id, ref)
     1) ref содержит :// → литерал URL
@@ -833,18 +820,20 @@ Boot / runtime:
   engines / contract_client / telegram / call_api
 ```
 
-Process `.env` платформы: `PLATFORM_DATABASE_URL`, `PLATFORM_SECRETS_KEY`, текущий `PLATFORM_ADMIN_TOKEN`, …. У worker — ещё `WORKER_SERVICE_ID`. Tenant-конфиг — в `domain_secrets`.
+Process `.env` платформы: `PLATFORM_DATABASE_URL`, `PLATFORM_SECRETS_KEY`,
+`PLATFORM_ADMIN_TOKEN`, `TENANT_AUTH_SECRET`, mail/SMTP config. У worker — ещё
+`WORKER_SERVICE_ID`. Tenant-конфиг — в `domain_secrets`.
 
-### 9.7. План миграции и критерии готовности
+### 9.6. Критерии готовности tenant auth
 
-1. Добавить таблицы tenant accounts, service membership, hashed admin tokens, audit events.
-2. Реализовать tenant registration/login и service-level authorization.
-3. Реализовать issue/rotate/revoke `DOMAIN_ADMIN_TOKEN`.
-4. Перевести secrets API с глобального токена на tenant token; ops-доступ оформить отдельной политикой.
-5. Перенести чтение credentials из domain process за Contract/platform boundary: domain получает credential material или выполняет внешний HTTP через platform-owned механизм без `PLATFORM_DATABASE_URL`/`PLATFORM_SECRETS_KEY`.
-6. Удалить зависимость domain service от platform DB после миграции `call_api`.
-7. Добавить security-тесты: cross-tenant deny, revoked/expired token, rate limit, audit, one-time raw token.
-8. Добавить E2E: register → login → domain register → token issue → secrets/credential CRUD → connect → worker ready.
+1. Таблицы tenant accounts, verification/refresh sessions, hashed admin tokens, audit events и owner FK в `domain_services`.
+2. Register/verify/login/refresh/logout.
+3. Issue/list/rotate/revoke tenant-scoped `DOMAIN_ADMIN_TOKEN`.
+4. Разделение Public Auth, Tenant Account, Platform Admin, Domain API и Domain Input в FastAPI/Swagger.
+5. Все `/v1/{service_id}/…` закрыты domain token; platform token только Platform Admin API.
+6. Domain register/connect и worker `1 process = 1 service_id`.
+7. Перенос чтения credentials из domain process за Contract/platform boundary без `PLATFORM_DATABASE_URL`/`PLATFORM_SECRETS_KEY` — ещё в разработке.
+8. Route-matrix/security/E2E: register → verify → login → token issue → domain register → secrets/credentials → connect → worker ready.
 
 ---
 
@@ -880,11 +869,12 @@ Credential — секрет в `domain_secrets`, value = **JSON-объект** �
 
 ### 10.2. Создание credential
 
-Текущая реализация использует `PLATFORM_ADMIN_TOKEN`. После реализации tenant auth (§9.3) credential создаёт арендатор с `DOMAIN_ADMIN_TOKEN`:
+Credential создаёт арендатор с tenant-scoped `DOMAIN_ADMIN_TOKEN`;
+platform token этот endpoint не принимает:
 
 ```http
 PUT /v1/{service_id}/secrets
-X-Admin-Token: <PLATFORM_ADMIN_TOKEN | DOMAIN_ADMIN_TOKEN после §9.3>
+X-Admin-Token: <DOMAIN_ADMIN_TOKEN>
 
 {
   "key": "PARTNER_API",
@@ -915,7 +905,7 @@ resp = side_effects.call_api(
 
 Имя стороннего продукта и его протокол принадлежат картриджу; платформа использует обобщённый credential и канал `http_external`.
 
-Сейчас этот вызов из domain process использует platform DB и `PLATFORM_SECRETS_KEY`. Целевая реализация **в разработке**: credential разрешается/применяется платформой без передачи domain process доступа к platform DB (§9.7).
+Сейчас этот вызов из domain process использует platform DB и `PLATFORM_SECRETS_KEY`. Целевая реализация **в разработке**: credential разрешается/применяется платформой без передачи domain process доступа к platform DB (§9.6).
 
 ### 10.4. Асинхронная доставка через outbox
 
@@ -1229,7 +1219,8 @@ Exit: `0` ok, `1` fail сценария, `2` path/API unavailable.
 - `wait_instance: true` — ждать terminal status через Public API poll
 - `capture_instance` — взять значение из ответа poll instance
 - `wait_until` — повторять шаг до выполнения условия/таймаута
-- Auth: при `PLATFORM_AUTH_SECRET` + `PLATFORM_AUTH_DEV_TOKENS=1` клиент сам берёт Bearer на actor
+- Auth: `DOMAIN_ADMIN_TOKEN` обязателен для invoke/poll; готовый actor Bearer
+  передаётся отдельно, если включён `PLATFORM_AUTH_SECRET`
 
 Сценарии courier покрывают happy-path и отдельные ветки. Порядок зависимых сценариев — в README e2e.
 
@@ -1247,15 +1238,19 @@ E2E — приёмочный контур «стек живой»; рядом с
 
 ---
 
-## 17. Public API (справка)
+## 17. HTTP API и границы авторизации (справка)
 
-Префикс `/v1/{service_id}/…`.
+Все routes с префиксом `/v1/{service_id}/…` требуют
+`X-Admin-Token: DOMAIN_ADMIN_TOKEN`. Проверяется, что account токена владеет
+`service_id`. `PLATFORM_ADMIN_TOKEN` на этих routes не принимается.
 
 | Метод | Назначение |
 |-------|------------|
-| `GET /v1/health` | Health + readiness доменов |
-| `GET /v1/metrics` | Метрики |
-| `GET /v1/auth/token` | Dev actor token при включённом dev-режиме |
+| `GET /v1/health` | Platform health; политика Platform Admin |
+| `GET /v1/metrics` | Метрики; политика Platform Admin |
+| `POST /v1/auth/register|verify-email|login|refresh|logout` | Public/session tenant auth |
+| `POST/GET /v1/tenant/admin-tokens…` | Выпуск/управление domain token по login access token |
+| `POST /v1/tenant/domains` | Регистрация домена по `DOMAIN_ADMIN_TOKEN` |
 | `POST …/invoke` | sync command/query → Contract |
 | `POST …/fsm/enqueue` | async process; поддерживает `Idempotency-Key` (§8.2) |
 | `GET …/fsm/instances/{id}` | статус instance |
@@ -1269,14 +1264,18 @@ E2E — приёмочный контур «стек живой»; рядом с
 | `POST/GET …/schedules` (+ pause/resume) | периодические процессы |
 | `POST …/graph/publish` | Публикация новой версии графа |
 | `POST …/hooks/{channel}` | Generic inbound → Contract hook |
-| `PUT/GET/DELETE …/secrets` | Сейчас `PLATFORM_ADMIN_TOKEN`; target `DOMAIN_ADMIN_TOKEN` (§9) |
-| `POST /v1/admin/domains/{id}/reload` | Сейчас `PLATFORM_ADMIN_TOKEN` |
+| `PUT/GET/DELETE …/secrets` | `DOMAIN_ADMIN_TOKEN` |
+| `POST …/connect|reload` | Tenant lifecycle по `DOMAIN_ADMIN_TOKEN` |
+| Platform Admin routes | Только `PLATFORM_ADMIN_TOKEN` |
 | `POST /input/telegram/{service_id}/webhook` | Telegram Update |
 | `GET /input/telegram/{service_id}/link` | deep-link |
 
 Основные статусы: domain business error → HTTP 409; tenant не ready → 503 `DOMAIN_NOT_READY`; reload bootstrap failure → 502 `DOMAIN_BOOTSTRAP_FAILED`.
 
-Текущие routes schedules, graph publish и generic inbound hooks не имеют отдельной admin-проверки. Tenant authorization для административных операций входит в работы §9.3.
+`/input/telegram/…` использует Telegram/link security, а Domain Contract API —
+HMAC. Они не используют admin tokens. Browser frontend не получает
+`DOMAIN_ADMIN_TOKEN`: доступ к service API и WebSocket идёт через доверенный
+backend/BFF.
 
 ---
 
@@ -1298,10 +1297,11 @@ E2E — приёмочный контур «стек живой»; рядом с
 - Исполнение бизнес-логики — через Contract API (`RemoteRef`).
 - Business SQL — в domain service; `fsm_platform.core` работает с platform DB и graph SQL.
 - Tenant-конфиг (graph/contract/Telegram/credentials) — в `domain_secrets`.
-- Сейчас admin endpoints используют глобальный `PLATFORM_ADMIN_TOKEN`; per-tenant `DOMAIN_ADMIN_TOKEN` — в разработке (§9).
+- Tenant account имеет одну роль `domain_admin`; владение доменами хранится в `domain_services.tenant_account_id`.
+- Tenant-scoped `DOMAIN_ADMIN_TOKEN` закрывает весь `/v1/{service_id}/…`; `PLATFORM_ADMIN_TOKEN` действует только на Platform Admin API (§9).
 - Platform `.env` — process config (`PLATFORM_*`, у воркера ещё `WORKER_SERVICE_ID`).
 - `DOMAIN_DATABASE_URL` — в env процесса домена.
-- Временная зависимость courier domain от platform DB для `call_api` должна быть удалена в рамках §9.7.
+- Временная зависимость courier domain от platform DB для `call_api` должна быть удалена в рамках §9.6.
 - Telegram I/O — `input/` / `output/`; привязка аккаунта — доменная команда по конвенции `bind_telegram` (§8.4).
 - Сторонний API — credentials + `call_api` / outbox `http_external` (§10); имена вендоров — у картриджа.
 - Commit platform-транзакций — host (`request_runtime`, worker).
@@ -1317,26 +1317,28 @@ E2E — приёмочный контур «стек живой»; рядом с
 - [x] Remote Contract catalog, commands, queries, context, guards, effects, on_failed
 - [x] Graph engines + Validator + reload
 - [x] Worker claim scope по `WORKER_SERVICE_ID`
+- [x] Tenant-scoped worker boot (`boot(service_id)`)
+- [x] Локальный worker provisioning/lifecycle через connect
 - [x] Timers, state-timeouts, schedules, outbox, reconcile
 - [x] Invoke/enqueue/status/actions/history/events/webhooks
 - [x] Guard routing, `guard_params`/`effect_params`, companions
 - [x] Telegram input/output и webhook output
 - [x] Зашифрованные `domain_secrets` и credentials JSON
-- [x] E2E YAML runner
+- [x] Tenant registration/verification/login/refresh (§9.2)
+- [x] Выпуск/rotate/revoke tenant-scoped `DOMAIN_ADMIN_TOKEN`
+- [x] Ownership authorization всего `/v1/{service_id}/…`, включая WebSocket
+- [x] Разделение Public/Tenant/Platform Admin/Domain/Input routers и Swagger
+- [x] Регистрация нескольких `service_id` одним tenant account
+- [x] E2E YAML runner + tenant onboarding E2E
 
 ### В разработке
 
-- [ ] Tenant registration/login/service membership (§9.3)
-- [ ] Выпуск/rotate/revoke per-tenant `DOMAIN_ADMIN_TOKEN`
-- [ ] Tenant authorization secrets/credentials/schedules/graph/hooks
-- [ ] Удаление глобального `PLATFORM_ADMIN_TOKEN` из tenant admin path
 - [ ] Изоляция domain process от platform DB при `call_api`
-- [ ] Автоматический worker provisioning/lifecycle
-- [ ] Tenant-scoped worker boot (не только claim)
 - [ ] Worker log redaction + SQLAlchemy `hide_parameters=True`
 - [ ] Scoped Secret Broker/KMS вместо master secrets key в worker
 - [ ] CI-проверки SQL injection и динамического SQL
 - [ ] Reconcile для invoke с одними `notify` / `cancel_instances` / `entity_states`
+- [ ] Worker provisioner backends: systemd / Docker / Kubernetes
 
 ---
 
@@ -1344,10 +1346,10 @@ E2E — приёмочный контур «стек живой»; рядом с
 
 | Термин | Смысл |
 |--------|--------|
-| `service_id` | Уникальный id арендатора; назначает оператор платформы |
+| `service_id` | Уникальный id domain service; назначает платформа, владелец — tenant account |
 | `cartridge_type` | Тип картриджа (`courier`, …) |
-| `PLATFORM_ADMIN_TOKEN` | Текущий глобальный admin token для secrets/reload |
-| `DOMAIN_ADMIN_TOKEN` | Целевой per-tenant token для secrets/credentials; в разработке (§9.3) |
+| `PLATFORM_ADMIN_TOKEN` | Platform-wide token только для Platform Admin API |
+| `DOMAIN_ADMIN_TOKEN` | Tenant-scoped token для регистрации доменов и всего API принадлежащих `service_id` |
 | Contract API | HTTP API доменного сервиса |
 | `RemoteRef` | Дескриптор удалённого handler на платформе |
 | Catalog | JSON operations/processes/guards/effects |

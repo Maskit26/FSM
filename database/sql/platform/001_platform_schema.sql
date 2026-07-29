@@ -1,8 +1,23 @@
 -- Platform DB schema — matches live platform DB.
 -- Apply to PLATFORM database only (not domain DB).
 
+CREATE TABLE IF NOT EXISTS tenant_accounts (
+    id                  BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    email               VARCHAR(255) NOT NULL,
+    password_hash       VARCHAR(255) NOT NULL,
+    status              VARCHAR(32)  NOT NULL DEFAULT 'pending_verification',
+    email_verified_at   DATETIME     NULL,
+    failed_login_count  INT          NOT NULL DEFAULT 0,
+    locked_until        DATETIME     NULL,
+    created_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_tenant_accounts_email (email),
+    KEY idx_tenant_accounts_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 CREATE TABLE IF NOT EXISTS domain_services (
     service_id          VARCHAR(64)  NOT NULL PRIMARY KEY,
+    tenant_account_id   BIGINT       NOT NULL,
     cartridge_type      VARCHAR(64)  NOT NULL,
     version             VARCHAR(32)  NOT NULL,
     package_ref         VARCHAR(512) NULL,
@@ -15,7 +30,86 @@ CREATE TABLE IF NOT EXISTS domain_services (
     validation_report   TEXT         NULL,
     activated_by        VARCHAR(128) NULL,
     created_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_domain_services_tenant (tenant_account_id),
+    CONSTRAINT fk_domain_services_tenant
+        FOREIGN KEY (tenant_account_id) REFERENCES tenant_accounts(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS tenant_email_verifications (
+    id                  BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    tenant_account_id   BIGINT       NOT NULL,
+    token_hash          CHAR(64)     NOT NULL,
+    expires_at          DATETIME     NOT NULL,
+    used_at             DATETIME     NULL,
+    created_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_tenant_email_verifications_hash (token_hash),
+    KEY idx_tenant_email_verifications_account (tenant_account_id, used_at),
+    CONSTRAINT fk_tenant_email_verifications_account
+        FOREIGN KEY (tenant_account_id) REFERENCES tenant_accounts(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS tenant_refresh_tokens (
+    id                  BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    tenant_account_id   BIGINT       NOT NULL,
+    token_hash          CHAR(64)     NOT NULL,
+    family_id           CHAR(36)     NOT NULL,
+    expires_at          DATETIME     NOT NULL,
+    revoked_at          DATETIME     NULL,
+    replaced_by_id      BIGINT       NULL,
+    last_used_at        DATETIME     NULL,
+    source_ip           VARCHAR(64)  NULL,
+    user_agent          VARCHAR(512) NULL,
+    created_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_tenant_refresh_tokens_hash (token_hash),
+    KEY idx_tenant_refresh_tokens_account (tenant_account_id, revoked_at, expires_at),
+    KEY idx_tenant_refresh_tokens_family (family_id),
+    CONSTRAINT fk_tenant_refresh_tokens_account
+        FOREIGN KEY (tenant_account_id) REFERENCES tenant_accounts(id)
+        ON DELETE CASCADE,
+    CONSTRAINT fk_tenant_refresh_tokens_replacement
+        FOREIGN KEY (replaced_by_id) REFERENCES tenant_refresh_tokens(id)
+        ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS domain_admin_tokens (
+    id                  BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    tenant_account_id   BIGINT       NOT NULL,
+    token_hash          CHAR(64)     NOT NULL,
+    token_prefix        VARCHAR(16)  NOT NULL,
+    name                VARCHAR(128) NULL,
+    expires_at          DATETIME     NULL,
+    revoked_at          DATETIME     NULL,
+    last_used_at        DATETIME     NULL,
+    created_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_domain_admin_tokens_hash (token_hash),
+    KEY idx_domain_admin_tokens_account (tenant_account_id, revoked_at, expires_at),
+    CONSTRAINT fk_domain_admin_tokens_account
+        FOREIGN KEY (tenant_account_id) REFERENCES tenant_accounts(id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS platform_audit_events (
+    id                      BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    tenant_account_id       BIGINT       NULL,
+    service_id              VARCHAR(64)  NULL,
+    domain_admin_token_id   BIGINT       NULL,
+    event_type              VARCHAR(64)  NOT NULL,
+    result                  VARCHAR(32)  NOT NULL,
+    source_ip               VARCHAR(64)  NULL,
+    user_agent              VARCHAR(512) NULL,
+    detail_json             JSON         NULL,
+    created_at              DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_platform_audit_tenant (tenant_account_id, created_at),
+    KEY idx_platform_audit_service (service_id, created_at),
+    KEY idx_platform_audit_event (event_type, created_at),
+    CONSTRAINT fk_platform_audit_tenant
+        FOREIGN KEY (tenant_account_id) REFERENCES tenant_accounts(id)
+        ON DELETE SET NULL,
+    CONSTRAINT fk_platform_audit_token
+        FOREIGN KEY (domain_admin_token_id) REFERENCES domain_admin_tokens(id)
+        ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 -- Per-tenant encrypted secrets (API keys, bot tokens, credentials JSON, …).

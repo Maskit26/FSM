@@ -2,64 +2,43 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
 
 class ApiClient:
-    def __init__(self, base_url: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        domain_admin_token: str,
+        platform_admin_token: str,
+        actor_bearer_token: str = "",
+        timeout: float = 30.0,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.domain_admin_token = domain_admin_token.strip()
+        self.platform_admin_token = platform_admin_token.strip()
+        self.actor_bearer_token = actor_bearer_token.strip()
         self._session = requests.Session()
         self._session.headers.update(
             {"Accept": "application/json", "Content-Type": "application/json"}
         )
-        # cache: "service_id|actor_type:actor_id" → "Bearer …"
-        self._token_by_key: dict[str, str] = {}
-        self._auth_mode: Optional[str] = None  # None | "on" | "off"
-
     def health(self) -> tuple[int, dict[str, Any]]:
-        r = self._session.get(f"{self.base_url}/v1/health", timeout=self.timeout)
-        return r.status_code, _json_or_text(r)
-
-    def _authorization_for_actor(
-        self, actor: dict[str, Any], *, service_id: str = ""
-    ) -> dict[str, str]:
-        """
-        Если PLATFORM_AUTH включён и DEV_TOKENS=1 — Bearer из GET /v1/auth/token
-        (per-actor; ключ кэша включает service_id для multi-tenant прогонов).
-        Если auth выключен — пустой dict (actor остаётся в body).
-        """
-        actor_type = str((actor or {}).get("actor_type") or "user").strip() or "user"
-        actor_id = str((actor or {}).get("actor_id") or "").strip()
-        if not actor_id:
-            return {}
-
-        cache_key = f"{service_id}|{actor_type}:{actor_id}"
-        if cache_key in self._token_by_key:
-            return {"Authorization": self._token_by_key[cache_key]}
-
-        if self._auth_mode == "off":
-            return {}
-
         r = self._session.get(
-            f"{self.base_url}/v1/auth/token",
-            params={"actor_id": actor_id, "actor_type": actor_type},
+            f"{self.base_url}/v1/health",
+            headers={"X-Admin-Token": self.platform_admin_token},
             timeout=self.timeout,
         )
-        if r.status_code == 200:
-            data = _json_or_text(r)
-            auth = str(data.get("authorization") or "").strip()
-            if not auth:
-                return {}
-            self._auth_mode = "on"
-            self._token_by_key[cache_key] = auth
-            return {"Authorization": auth}
+        return r.status_code, _json_or_text(r)
 
-        # 400 PLATFORM_AUTH_SECRET not set; 403 DEV_TOKENS disabled
-        self._auth_mode = "off"
-        return {}
+    def _domain_headers(self) -> dict[str, str]:
+        headers = {"X-Admin-Token": self.domain_admin_token}
+        if self.actor_bearer_token:
+            headers["Authorization"] = f"Bearer {self.actor_bearer_token}"
+        return headers
 
     def invoke(
         self,
@@ -69,11 +48,10 @@ class ApiClient:
         actor: dict[str, Any],
     ) -> tuple[int, dict[str, Any]]:
         url = f"{self.base_url}/v1/{service_id}/invoke"
-        headers = self._authorization_for_actor(actor, service_id=service_id)
         r = self._session.post(
             url,
             json={"operation": operation, "params": params, "actor": actor},
-            headers=headers or None,
+            headers=self._domain_headers(),
             timeout=self.timeout,
         )
         return r.status_code, _json_or_text(r)
@@ -82,7 +60,9 @@ class ApiClient:
         self, service_id: str, instance_id: int
     ) -> tuple[int, dict[str, Any]]:
         url = f"{self.base_url}/v1/{service_id}/fsm/instances/{instance_id}"
-        r = self._session.get(url, timeout=self.timeout)
+        r = self._session.get(
+            url, headers=self._domain_headers(), timeout=self.timeout
+        )
         return r.status_code, _json_or_text(r)
 
 

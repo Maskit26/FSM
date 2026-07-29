@@ -32,11 +32,13 @@
 ```bash
 # schema (platform DB)
 mysql … < database/sql/platform/001_platform_schema.sql
+# or additive upgrade on existing DB:
+python database/apply_tenant_auth.py
 
 # env
-# platform: .env (см. .env.example)
+# platform: .env (см. .env.example) — TENANT_AUTH_SECRET, PLATFORM_ADMIN_TOKEN, …
 # domain: domains/courier/.env (см. domains/courier/.env.example)
-# tenant secrets: domain_services + domain_secrets (admin PUT /v1/{service_id}/secrets)
+# tenant onboarding: register → login → DOMAIN_ADMIN_TOKEN → domains → secrets → connect
 
 # domain service
 uvicorn domains.courier.main:app --host 127.0.0.1 --port 8100
@@ -44,9 +46,17 @@ uvicorn domains.courier.main:app --host 127.0.0.1 --port 8100
 # platform API
 uvicorn main:app --host 127.0.0.1 --port 8000
 
-# worker (WORKER_SERVICE_ID в .env процесса)
+# worker (обычно поднимается через POST /v1/{service_id}/connect)
 python fsm_worker.py
 ```
+
+### Tenant auth (кратко)
+
+1. `POST /v1/auth/register` → verify email → `POST /v1/auth/login`
+2. `POST /v1/tenant/admin-tokens` (Bearer access) → raw `DOMAIN_ADMIN_TOKEN`
+3. `POST /v1/tenant/domains` + `X-Admin-Token` → `service_id`
+4. `PUT /v1/{service_id}/secrets` → `POST /v1/{service_id}/connect`
+5. Live check: `python tools/tenant_e2e.py --contract-base-url …` (см. args)
 
 ### Telegram-уведомления
 
@@ -62,5 +72,6 @@ python fsm_worker.py
 ## Тесты без БД
 
 ```bash
+python -m unittest tests.test_tenant_auth -v
 python -m pytest tests/test_fsm_platform_unit.py -q
 ```

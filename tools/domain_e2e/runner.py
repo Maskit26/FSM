@@ -8,6 +8,7 @@ CLI: run YAML domain scenarios against live API.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -286,6 +287,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Override YAML service_id (optional; scenarios must declare service_id)",
     )
     parser.add_argument(
+        "--domain-admin-token",
+        default=os.environ.get("DOMAIN_ADMIN_TOKEN", ""),
+        help="Tenant DOMAIN_ADMIN_TOKEN (default: DOMAIN_ADMIN_TOKEN env)",
+    )
+    parser.add_argument(
+        "--platform-admin-token",
+        default=os.environ.get("PLATFORM_ADMIN_TOKEN", ""),
+        help="Platform token used only for health check",
+    )
+    parser.add_argument(
+        "--actor-bearer-token",
+        default=os.environ.get("E2E_ACTOR_BEARER_TOKEN", ""),
+        help="Optional actor Bearer when PLATFORM_AUTH_SECRET is enabled",
+    )
+    parser.add_argument(
         "--report",
         default="",
         help="Write Markdown report to this path",
@@ -321,7 +337,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"No YAML scenarios under {target}", file=sys.stderr)
         return 2
 
-    client = ApiClient(args.base_url)
+    if not args.domain_admin_token:
+        print("DOMAIN_ADMIN_TOKEN is required", file=sys.stderr)
+        return 2
+    if not args.platform_admin_token:
+        print("PLATFORM_ADMIN_TOKEN is required for health check", file=sys.stderr)
+        return 2
+    client = ApiClient(
+        args.base_url,
+        domain_admin_token=args.domain_admin_token,
+        platform_admin_token=args.platform_admin_token,
+        actor_bearer_token=args.actor_bearer_token,
+    )
     try:
         code, _ = client.health()
         if code != 200:

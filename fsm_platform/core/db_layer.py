@@ -1719,6 +1719,518 @@ class FsmDbLayer:
         ).first()
         return row is not None
 
+    # --- tenant accounts and authentication ---
+
+    def create_tenant_account(
+        self, session: SessionLike, *, email: str, password_hash: str
+    ) -> int:
+        result = session.execute(
+            text(
+                """
+                INSERT INTO tenant_accounts
+                    (email, password_hash, status, created_at, updated_at)
+                VALUES
+                    (:email, :password_hash, 'pending_verification',
+                     UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                """
+            ),
+            {"email": email, "password_hash": password_hash},
+        )
+        return int(result.lastrowid)
+
+    def get_tenant_account_by_email(
+        self, session: SessionLike, *, email: str
+    ) -> Optional[dict[str, Any]]:
+        row = session.execute(
+            text(
+                """
+                SELECT id, email, password_hash, status, email_verified_at,
+                       failed_login_count, locked_until, created_at, updated_at
+                FROM tenant_accounts
+                WHERE email = :email
+                LIMIT 1
+                """
+            ),
+            {"email": email},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def get_tenant_account(
+        self, session: SessionLike, *, tenant_account_id: int
+    ) -> Optional[dict[str, Any]]:
+        row = session.execute(
+            text(
+                """
+                SELECT id, email, password_hash, status, email_verified_at,
+                       failed_login_count, locked_until, created_at, updated_at
+                FROM tenant_accounts
+                WHERE id = :id
+                LIMIT 1
+                """
+            ),
+            {"id": int(tenant_account_id)},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def create_email_verification(
+        self,
+        session: SessionLike,
+        *,
+        tenant_account_id: int,
+        token_hash: str,
+        expires_at: datetime,
+    ) -> int:
+        session.execute(
+            text(
+                """
+                UPDATE tenant_email_verifications
+                SET used_at = UTC_TIMESTAMP()
+                WHERE tenant_account_id = :tenant_account_id
+                  AND used_at IS NULL
+                """
+            ),
+            {"tenant_account_id": int(tenant_account_id)},
+        )
+        result = session.execute(
+            text(
+                """
+                INSERT INTO tenant_email_verifications
+                    (tenant_account_id, token_hash, expires_at, created_at)
+                VALUES
+                    (:tenant_account_id, :token_hash, :expires_at, UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "tenant_account_id": int(tenant_account_id),
+                "token_hash": token_hash,
+                "expires_at": expires_at,
+            },
+        )
+        return int(result.lastrowid)
+
+    def consume_email_verification(
+        self, session: SessionLike, *, token_hash: str
+    ) -> Optional[int]:
+        row = session.execute(
+            text(
+                """
+                SELECT id, tenant_account_id
+                FROM tenant_email_verifications
+                WHERE token_hash = :token_hash
+                  AND used_at IS NULL
+                  AND expires_at > UTC_TIMESTAMP()
+                FOR UPDATE
+                """
+            ),
+            {"token_hash": token_hash},
+        ).mappings().first()
+        if row is None:
+            return None
+        account_id = int(row["tenant_account_id"])
+        session.execute(
+            text(
+                """
+                UPDATE tenant_email_verifications
+                SET used_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                """
+            ),
+            {"id": int(row["id"])},
+        )
+        session.execute(
+            text(
+                """
+                UPDATE tenant_accounts
+                SET status = 'active', email_verified_at = UTC_TIMESTAMP(),
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                """
+            ),
+            {"id": account_id},
+        )
+        return account_id
+
+    def record_tenant_login_success(
+        self, session: SessionLike, *, tenant_account_id: int
+    ) -> None:
+        session.execute(
+            text(
+                """
+                UPDATE tenant_accounts
+                SET failed_login_count = 0, locked_until = NULL,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                """
+            ),
+            {"id": int(tenant_account_id)},
+        )
+
+    def record_tenant_login_failure(
+        self, session: SessionLike, *, tenant_account_id: int, lock_after: int = 5
+    ) -> None:
+        session.execute(
+            text(
+                """
+                UPDATE tenant_accounts
+                SET failed_login_count = failed_login_count + 1,
+                    locked_until = CASE
+                        WHEN failed_login_count + 1 >= :lock_after
+                        THEN DATE_ADD(UTC_TIMESTAMP(), INTERVAL 15 MINUTE)
+                        ELSE locked_until
+                    END,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                """
+            ),
+            {"id": int(tenant_account_id), "lock_after": int(lock_after)},
+        )
+
+    # --- tenant refresh sessions ---
+
+    def create_refresh_token(
+        self,
+        session: SessionLike,
+        *,
+        tenant_account_id: int,
+        token_hash: str,
+        family_id: str,
+        expires_at: datetime,
+        source_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> int:
+        result = session.execute(
+            text(
+                """
+                INSERT INTO tenant_refresh_tokens
+                    (tenant_account_id, token_hash, family_id, expires_at,
+                     source_ip, user_agent, created_at)
+                VALUES
+                    (:tenant_account_id, :token_hash, :family_id, :expires_at,
+                     :source_ip, :user_agent, UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "tenant_account_id": int(tenant_account_id),
+                "token_hash": token_hash,
+                "family_id": family_id,
+                "expires_at": expires_at,
+                "source_ip": source_ip,
+                "user_agent": user_agent,
+            },
+        )
+        return int(result.lastrowid)
+
+    def get_refresh_token_for_update(
+        self, session: SessionLike, *, token_hash: str
+    ) -> Optional[dict[str, Any]]:
+        row = session.execute(
+            text(
+                """
+                SELECT id, tenant_account_id, token_hash, family_id, expires_at,
+                       revoked_at, replaced_by_id, last_used_at
+                FROM tenant_refresh_tokens
+                WHERE token_hash = :token_hash
+                LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {"token_hash": token_hash},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def rotate_refresh_token(
+        self,
+        session: SessionLike,
+        *,
+        old_token_id: int,
+        new_token_id: int,
+    ) -> bool:
+        result = session.execute(
+            text(
+                """
+                UPDATE tenant_refresh_tokens
+                SET revoked_at = UTC_TIMESTAMP(), replaced_by_id = :new_token_id,
+                    last_used_at = UTC_TIMESTAMP()
+                WHERE id = :old_token_id AND revoked_at IS NULL
+                """
+            ),
+            {
+                "old_token_id": int(old_token_id),
+                "new_token_id": int(new_token_id),
+            },
+        )
+        return int(result.rowcount or 0) == 1
+
+    def revoke_refresh_family(
+        self, session: SessionLike, *, family_id: str
+    ) -> None:
+        session.execute(
+            text(
+                """
+                UPDATE tenant_refresh_tokens
+                SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP())
+                WHERE family_id = :family_id
+                """
+            ),
+            {"family_id": family_id},
+        )
+
+    # --- tenant-scoped DOMAIN_ADMIN_TOKEN ---
+
+    def create_domain_admin_token(
+        self,
+        session: SessionLike,
+        *,
+        tenant_account_id: int,
+        token_hash: str,
+        token_prefix: str,
+        name: Optional[str],
+        expires_at: Optional[datetime],
+    ) -> int:
+        result = session.execute(
+            text(
+                """
+                INSERT INTO domain_admin_tokens
+                    (tenant_account_id, token_hash, token_prefix, name,
+                     expires_at, created_at)
+                VALUES
+                    (:tenant_account_id, :token_hash, :token_prefix, :name,
+                     :expires_at, UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "tenant_account_id": int(tenant_account_id),
+                "token_hash": token_hash,
+                "token_prefix": token_prefix,
+                "name": name,
+                "expires_at": expires_at,
+            },
+        )
+        return int(result.lastrowid)
+
+    def get_domain_admin_token(
+        self, session: SessionLike, *, token_hash: str
+    ) -> Optional[dict[str, Any]]:
+        row = session.execute(
+            text(
+                """
+                SELECT id, tenant_account_id, token_hash, token_prefix, name, expires_at,
+                       revoked_at, last_used_at, created_at
+                FROM domain_admin_tokens
+                WHERE token_hash = :token_hash
+                LIMIT 1
+                """
+            ),
+            {"token_hash": token_hash},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def list_domain_admin_tokens(
+        self, session: SessionLike, *, tenant_account_id: int
+    ) -> list[dict[str, Any]]:
+        rows = session.execute(
+            text(
+                """
+                SELECT id, token_prefix, name, expires_at, revoked_at,
+                       last_used_at, created_at
+                FROM domain_admin_tokens
+                WHERE tenant_account_id = :tenant_account_id
+                ORDER BY id DESC
+                """
+            ),
+            {"tenant_account_id": int(tenant_account_id)},
+        ).mappings().all()
+        return [dict(row) for row in rows]
+
+    def revoke_domain_admin_token(
+        self,
+        session: SessionLike,
+        *,
+        tenant_account_id: int,
+        token_id: int,
+    ) -> bool:
+        result = session.execute(
+            text(
+                """
+                UPDATE domain_admin_tokens
+                SET revoked_at = COALESCE(revoked_at, UTC_TIMESTAMP())
+                WHERE id = :token_id
+                  AND tenant_account_id = :tenant_account_id
+                """
+            ),
+            {
+                "tenant_account_id": int(tenant_account_id),
+                "token_id": int(token_id),
+            },
+        )
+        return int(result.rowcount or 0) == 1
+
+    def touch_domain_admin_token(
+        self, session: SessionLike, *, token_id: int
+    ) -> None:
+        session.execute(
+            text(
+                """
+                UPDATE domain_admin_tokens
+                SET last_used_at = UTC_TIMESTAMP()
+                WHERE id = :token_id
+                """
+            ),
+            {"token_id": int(token_id)},
+        )
+
+    # --- domain ownership and audit ---
+
+    def tenant_owns_service(
+        self,
+        session: SessionLike,
+        *,
+        tenant_account_id: int,
+        service_id: str,
+    ) -> bool:
+        row = session.execute(
+            text(
+                """
+                SELECT 1
+                FROM domain_services
+                WHERE service_id = :service_id
+                  AND tenant_account_id = :tenant_account_id
+                LIMIT 1
+                """
+            ),
+            {
+                "tenant_account_id": int(tenant_account_id),
+                "service_id": service_id,
+            },
+        ).first()
+        return row is not None
+
+    def create_domain_service(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        tenant_account_id: int,
+        cartridge_type: str,
+        version: str,
+        package_ref: Optional[str],
+        package_checksum: Optional[str],
+        db_secret_ref: str,
+        db_graph_secret_ref: Optional[str],
+        db_graph_write_secret_ref: Optional[str],
+    ) -> None:
+        session.execute(
+            text(
+                """
+                INSERT INTO domain_services
+                    (service_id, tenant_account_id, cartridge_type, version,
+                     package_ref, package_checksum, db_secret_ref,
+                     db_graph_secret_ref, db_graph_write_secret_ref, status,
+                     created_at, updated_at)
+                VALUES
+                    (:service_id, :tenant_account_id, :cartridge_type, :version,
+                     :package_ref, :package_checksum, :db_secret_ref,
+                     :db_graph_secret_ref, :db_graph_write_secret_ref,
+                     'pending_configuration', UTC_TIMESTAMP(), UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "service_id": service_id,
+                "tenant_account_id": int(tenant_account_id),
+                "cartridge_type": cartridge_type,
+                "version": version,
+                "package_ref": package_ref,
+                "package_checksum": package_checksum,
+                "db_secret_ref": db_secret_ref,
+                "db_graph_secret_ref": db_graph_secret_ref,
+                "db_graph_write_secret_ref": db_graph_write_secret_ref,
+            },
+        )
+
+    def set_domain_service_status(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        status: str,
+        validation_report: Optional[str] = None,
+    ) -> bool:
+        result = session.execute(
+            text(
+                """
+                UPDATE domain_services
+                SET status = :status, validation_report = :validation_report,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE service_id = :service_id
+                """
+            ),
+            {
+                "service_id": service_id,
+                "status": status,
+                "validation_report": validation_report,
+            },
+        )
+        return int(result.rowcount or 0) == 1
+
+    def get_domain_service(
+        self, session: SessionLike, *, service_id: str
+    ) -> Optional[dict[str, Any]]:
+        row = session.execute(
+            text(
+                """
+                SELECT service_id, tenant_account_id, cartridge_type, version,
+                       package_ref, package_checksum, db_secret_ref,
+                       db_graph_secret_ref, db_graph_write_secret_ref,
+                       pool_options_json, status, validation_report,
+                       created_at, updated_at
+                FROM domain_services
+                WHERE service_id = :service_id
+                LIMIT 1
+                """
+            ),
+            {"service_id": service_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def insert_platform_audit_event(
+        self,
+        session: SessionLike,
+        *,
+        event_type: str,
+        result: str,
+        tenant_account_id: Optional[int] = None,
+        service_id: Optional[str] = None,
+        domain_admin_token_id: Optional[int] = None,
+        source_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        detail: Optional[dict[str, Any]] = None,
+    ) -> int:
+        inserted = session.execute(
+            text(
+                """
+                INSERT INTO platform_audit_events
+                    (tenant_account_id, service_id, domain_admin_token_id,
+                     event_type, result, source_ip, user_agent, detail_json,
+                     created_at)
+                VALUES
+                    (:tenant_account_id, :service_id, :domain_admin_token_id,
+                     :event_type, :result, :source_ip, :user_agent, :detail_json,
+                     UTC_TIMESTAMP())
+                """
+            ),
+            {
+                "tenant_account_id": tenant_account_id,
+                "service_id": service_id,
+                "domain_admin_token_id": domain_admin_token_id,
+                "event_type": event_type,
+                "result": result,
+                "source_ip": source_ip,
+                "user_agent": user_agent,
+                "detail_json": json.dumps(detail) if detail is not None else None,
+            },
+        )
+        return int(inserted.lastrowid)
+
     # --- domain_secrets ---
 
     def get_domain_secret(
@@ -1797,19 +2309,32 @@ class FsmDbLayer:
     # --- domain_services (boot) ---
 
     def list_active_domain_services(
-        self, session: SessionLike
+        self, session: SessionLike, *, service_id: Optional[str] = None
     ) -> list[dict[str, Any]]:
-        """Возвращает список активных доменных сервисов из domain_services. Используется при bootstrap для регистрации картриджей из БД."""
-        rows = session.execute(
-            text(
-                """
-                SELECT service_id, db_secret_ref,
-                       db_graph_secret_ref, db_graph_write_secret_ref, status
-                FROM domain_services
-                WHERE status = 'active'
-                """
-            )
-        ).mappings().all()
+        """Active domain_services; optional single-tenant filter for worker boot."""
+        if service_id:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT service_id, db_secret_ref,
+                           db_graph_secret_ref, db_graph_write_secret_ref, status
+                    FROM domain_services
+                    WHERE status = 'active' AND service_id = :service_id
+                    """
+                ),
+                {"service_id": service_id},
+            ).mappings().all()
+        else:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT service_id, db_secret_ref,
+                           db_graph_secret_ref, db_graph_write_secret_ref, status
+                    FROM domain_services
+                    WHERE status = 'active'
+                    """
+                )
+            ).mappings().all()
         return [dict(r) for r in rows]
 
 

@@ -11,3 +11,4 @@ sse-starlette==1.8.2
 starlette==0.27.0
 PyYAML>=6.0
 cryptography>=42.0.0
+argon2-cffi>=23.1.0

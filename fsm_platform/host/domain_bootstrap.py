@@ -233,14 +233,16 @@ def bootstrap_domain(service_id: str, *, raise_on_error: bool = False) -> bool:
     return True
 
 
-def _list_service_ids() -> list[str]:
+def _list_service_ids(service_id: Optional[str] = None) -> list[str]:
     ids: list[str] = []
     try:
         from fsm_platform.core.db_layer import default_db_layer
 
         sp = platform_session()
         try:
-            for row in default_db_layer.list_active_domain_services(sp):
+            for row in default_db_layer.list_active_domain_services(
+                sp, service_id=service_id
+            ):
                 ids.append(str(row["service_id"]))
         finally:
             sp.close()
@@ -261,12 +263,12 @@ def _try_graph_session(service_id: str) -> Optional[object]:
         return None
 
 
-def bootstrap_active_domains() -> None:
+def bootstrap_active_domains(*, service_id: Optional[str] = None) -> None:
     """
     Best-effort bootstrap всех active domain_services.
     Ошибки логируются; platform API/worker стартуют в любом случае.
     """
-    service_ids = _list_service_ids()
+    service_ids = _list_service_ids(service_id)
     if not service_ids:
         logger.info("no active domain_services — platform starts without remote domains")
         return

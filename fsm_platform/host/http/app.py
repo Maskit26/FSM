@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from fsm_platform.host.auth import AuthError, auth_enabled, make_token, resolve_actor
+from fsm_platform.host.auth import AuthError, resolve_actor
+from fsm_platform.host.http.auth_routes import router as auth_router
+from fsm_platform.host.http.dependencies import (
+    require_domain_service_access,
+    require_platform_admin,
+)
 from fsm_platform.host.domain_bootstrap import get_bootstrap_status, is_domain_ready
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.http.events_ws import router as events_ws_router
+from fsm_platform.host.http.tenant_routes import router as tenant_router
 from fsm_platform.host.hook_registry import (
     HookError,
     default_webhook_registry,
@@ -25,8 +30,26 @@ from fsm_platform.core.registry import default_process_registry
 from fsm_platform.host.engines import graph_write_session, platform_session
 from fsm_platform.host.graph_version import publish_graph_version
 
-app = FastAPI(title="FSM Platform", version="0.1.0")
-app.include_router(events_ws_router)
+app = FastAPI(
+    title="FSM Platform",
+    version="0.2.0",
+    openapi_tags=[
+        {"name": "Public Auth", "description": "Tenant registration and sessions"},
+        {"name": "Tenant Account", "description": "Tokens and domain registration"},
+        {"name": "Platform Admin", "description": "Platform-wide operator API"},
+        {"name": "Domain API", "description": "DOMAIN_ADMIN_TOKEN protected API"},
+        {"name": "Domain Input", "description": "Signed external integrations"},
+    ],
+)
+platform_router = APIRouter(
+    tags=["Platform Admin"], dependencies=[Depends(require_platform_admin)]
+)
+domain_router = APIRouter(
+    prefix="/v1/{service_id}",
+    tags=["Domain API"],
+    dependencies=[Depends(require_domain_service_access)],
+)
+input_router = APIRouter(tags=["Domain Input"])
 
 
 class Actor(BaseModel):
@@ -80,41 +103,13 @@ def _startup() -> None:
     boot()
 
 
-@app.get("/v1/health")
+@platform_router.get("/v1/health")
 def health() -> dict[str, Any]:
     """Живость platform API. Domain service может быть offline — это не ошибка health."""
     return {"status": "ok", "domains": get_bootstrap_status()}
 
 
-@app.get("/v1/auth/token")
-def auth_token(
-    actor_id: str,
-    actor_type: str = "user",
-) -> dict[str, Any]:
-    """
-    Dev-хелпер: выдаёт Bearer для локалки.
-    Только если PLATFORM_AUTH_SECRET задан и PLATFORM_AUTH_DEV_TOKENS=1.
-    """
-    if not auth_enabled():
-        raise HTTPException(400, detail="PLATFORM_AUTH_SECRET not set")
-    if str(os.environ.get("PLATFORM_AUTH_DEV_TOKENS") or "").strip() not in (
-        "1",
-        "true",
-        "yes",
-    ):
-        raise HTTPException(403, detail="PLATFORM_AUTH_DEV_TOKENS disabled")
-    try:
-        token = make_token(actor_type=actor_type, actor_id=actor_id)
-    except AuthError as exc:
-        raise HTTPException(400, detail=exc.code) from exc
-    return {
-        "authorization": f"Bearer {token}",
-        "actor_type": actor_type,
-        "actor_id": actor_id,
-    }
-
-
-@app.get("/v1/metrics")
+@platform_router.get("/v1/metrics")
 def metrics() -> dict[str, Any]:
     """
     Снимок очередей platform: instances / outbox / reconcile / timers.
@@ -128,7 +123,7 @@ def metrics() -> dict[str, Any]:
         raise HTTPException(503, detail=f"METRICS_UNAVAILABLE: {exc}") from exc
 
 
-@app.get("/v1/{service_id}/catalog")
+@domain_router.get("/catalog")
 def catalog(service_id: str) -> dict[str, Any]:
     """Каталог операций, процессов и inbound hook channels домена."""
     domain_status = get_bootstrap_status(service_id)
@@ -145,7 +140,7 @@ def catalog(service_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/v1/{service_id}/invoke")
+@domain_router.post("/invoke")
 def invoke(
     service_id: str,
     body: InvokeBody,
@@ -207,7 +202,7 @@ def invoke(
     }
 
 
-@app.post("/v1/{service_id}/fsm/enqueue", status_code=202)
+@domain_router.post("/fsm/enqueue", status_code=202)
 def enqueue(
     service_id: str,
     body: EnqueueBody,
@@ -236,7 +231,7 @@ def enqueue(
         raise HTTPException(400, detail=str(exc)) from exc
 
 
-@app.get("/v1/{service_id}/fsm/instances/{instance_id}")
+@domain_router.get("/fsm/instances/{instance_id}")
 def instance_status(service_id: str, instance_id: int) -> dict[str, Any]:
     """Статус одного FSM-инстанса и текущее состояние сущности."""
     row = request_runtime.get_instance(service_id, instance_id)
@@ -255,7 +250,7 @@ class ActionsBody(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-@app.post("/v1/{service_id}/entities/{entity_type}/{entity_id}/actions")
+@domain_router.post("/entities/{entity_type}/{entity_id}/actions")
 def entity_actions(
     service_id: str,
     entity_type: str,
@@ -280,7 +275,7 @@ def entity_actions(
         raise HTTPException(500, detail=str(exc)) from exc
 
 
-@app.get("/v1/{service_id}/entities/{entity_type}/{entity_id}/history")
+@domain_router.get("/entities/{entity_type}/{entity_id}/history")
 def entity_history(
     service_id: str,
     entity_type: str,
@@ -298,7 +293,7 @@ def entity_history(
     )
 
 
-@app.get("/v1/{service_id}/events")
+@domain_router.get("/events")
 def list_events(
     service_id: str,
     after_id: int = 0,
@@ -317,7 +312,7 @@ class WebhookBody(BaseModel):
     active: bool = True
 
 
-@app.post("/v1/{service_id}/webhooks")
+@domain_router.post("/webhooks")
 def create_webhook(service_id: str, body: WebhookBody) -> dict[str, Any]:
     """Регистрация outbound webhook (HMAC secret)."""
     url = (body.url or "").strip()
@@ -349,7 +344,7 @@ def create_webhook(service_id: str, body: WebhookBody) -> dict[str, Any]:
         sp.close()
 
 
-@app.get("/v1/{service_id}/webhooks")
+@domain_router.get("/webhooks")
 def list_webhooks(service_id: str) -> dict[str, Any]:
     """Список webhook_subscriptions (secret не отдаём)."""
     sp = platform_session()
@@ -378,7 +373,7 @@ def list_webhooks(service_id: str) -> dict[str, Any]:
         sp.close()
 
 
-@app.post("/v1/{service_id}/webhooks/{subscription_id}/deactivate")
+@domain_router.post("/webhooks/{subscription_id}/deactivate")
 def deactivate_webhook(service_id: str, subscription_id: int) -> dict[str, Any]:
     sp = platform_session()
     try:
@@ -411,7 +406,7 @@ class ScheduleBody(BaseModel):
     initial_state: str = "idle"
 
 
-@app.post("/v1/{service_id}/schedules")
+@domain_router.post("/schedules")
 def create_schedule(service_id: str, body: ScheduleBody) -> dict[str, Any]:
     """
     Периодический процесс: каждые interval_seconds → enqueue process_name.
@@ -475,7 +470,7 @@ def create_schedule(service_id: str, body: ScheduleBody) -> dict[str, Any]:
         sp.close()
 
 
-@app.get("/v1/{service_id}/schedules")
+@domain_router.get("/schedules")
 def list_schedules(service_id: str) -> dict[str, Any]:
     sp = platform_session()
     try:
@@ -489,7 +484,7 @@ def list_schedules(service_id: str) -> dict[str, Any]:
         sp.close()
 
 
-@app.post("/v1/{service_id}/schedules/{schedule_id}/pause")
+@domain_router.post("/schedules/{schedule_id}/pause")
 def pause_schedule(service_id: str, schedule_id: int) -> dict[str, Any]:
     sp = platform_session()
     try:
@@ -510,7 +505,7 @@ def pause_schedule(service_id: str, schedule_id: int) -> dict[str, Any]:
         sp.close()
 
 
-@app.post("/v1/{service_id}/schedules/{schedule_id}/resume")
+@domain_router.post("/schedules/{schedule_id}/resume")
 def resume_schedule(service_id: str, schedule_id: int) -> dict[str, Any]:
     sp = platform_session()
     try:
@@ -531,7 +526,7 @@ def resume_schedule(service_id: str, schedule_id: int) -> dict[str, Any]:
         sp.close()
 
 
-@app.post("/v1/{service_id}/graph/publish")
+@domain_router.post("/graph/publish")
 def graph_publish(service_id: str) -> dict[str, Any]:
     """
     Копирует transitions current→current+1 и поднимает fsm_graph_meta.
@@ -549,7 +544,134 @@ def graph_publish(service_id: str) -> dict[str, Any]:
         sd.close()
 
 
-@app.post("/v1/{service_id}/hooks/{channel}")
+@domain_router.post("/connect")
+def connect_domain(service_id: str) -> dict[str, Any]:
+    """Validate/bootstrap the configured domain and start its dedicated worker."""
+    from fsm_platform.host.boot import configure_graph_engines
+    from fsm_platform.host.domain_bootstrap import reload_domain
+    from fsm_platform.host.domain_validator import DomainValidationError
+    from fsm_platform.host.worker_provisioner import provision_worker
+
+    try:
+        configure_graph_engines(service_id)
+        bootstrap = reload_domain(service_id)
+    except DomainValidationError as exc:
+        sp = platform_session()
+        try:
+            default_db_layer.set_domain_service_status(
+                sp,
+                service_id=service_id,
+                status="validation_failed",
+                validation_report=json.dumps(exc.report.to_dict(), ensure_ascii=False),
+            )
+            sp.commit()
+        finally:
+            sp.close()
+        raise HTTPException(
+            422,
+            detail={
+                "error_code": "DOMAIN_VALIDATION_FAILED",
+                "report": exc.report.to_dict(),
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            detail={
+                "error_code": "DOMAIN_CONNECT_FAILED",
+                "message": str(exc),
+            },
+        ) from exc
+
+    sp = platform_session()
+    try:
+        default_db_layer.set_domain_service_status(
+            sp,
+            service_id=service_id,
+            status="active",
+            validation_report=json.dumps(bootstrap, ensure_ascii=False),
+        )
+        sp.commit()
+    except Exception:
+        sp.rollback()
+        raise
+    finally:
+        sp.close()
+    try:
+        worker = provision_worker(service_id)
+    except Exception as exc:
+        sp = platform_session()
+        try:
+            default_db_layer.set_domain_service_status(
+                sp,
+                service_id=service_id,
+                status="worker_failed",
+                validation_report=json.dumps(
+                    {"bootstrap": bootstrap, "worker_error": str(exc)},
+                    ensure_ascii=False,
+                ),
+            )
+            sp.commit()
+        finally:
+            sp.close()
+        raise HTTPException(
+            502,
+            detail={
+                "error_code": "WORKER_PROVISION_FAILED",
+                "message": str(exc),
+            },
+        ) from exc
+    return {"service_id": service_id, "status": "active", "bootstrap": bootstrap, "worker": worker}
+
+
+@domain_router.post("/reload")
+def reload_tenant_domain(service_id: str) -> dict[str, Any]:
+    """Reload catalog and validator state for one owned domain."""
+    from fsm_platform.host.domain_bootstrap import reload_domain
+    from fsm_platform.host.domain_validator import DomainValidationError
+
+    try:
+        return reload_domain(service_id)
+    except DomainValidationError as exc:
+        raise HTTPException(
+            502,
+            detail={
+                "error_code": "DOMAIN_BOOTSTRAP_FAILED",
+                "message": str(exc),
+                "report": exc.report.to_dict(),
+                "domain_bootstrap": get_bootstrap_status(service_id),
+            },
+        ) from exc
+
+
+@domain_router.get("/worker/status")
+def tenant_worker_status(service_id: str) -> dict[str, Any]:
+    from fsm_platform.host.worker_provisioner import worker_status
+
+    return worker_status(service_id)
+
+
+@domain_router.post("/worker/restart")
+def tenant_worker_restart(service_id: str) -> dict[str, Any]:
+    from fsm_platform.host.worker_provisioner import restart_worker
+
+    try:
+        return restart_worker(service_id)
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            detail={"error_code": "WORKER_RESTART_FAILED", "message": str(exc)},
+        ) from exc
+
+
+@domain_router.post("/worker/stop")
+def tenant_worker_stop(service_id: str) -> dict[str, Any]:
+    from fsm_platform.host.worker_provisioner import stop_worker
+
+    return stop_worker(service_id)
+
+
+@domain_router.post("/hooks/{channel}")
 async def inbound_hook(
     service_id: str,
     channel: str,
@@ -618,32 +740,18 @@ class SecretBody(BaseModel):
         return str(v)
 
 
-def _admin_or_raise(x_admin_token: Optional[str]) -> None:
-    from fsm_platform.host.secrets import SecretsError, require_admin
-
-    try:
-        require_admin(x_admin_token)
-    except SecretsError as exc:
-        code = 403 if exc.code == "ADMIN_FORBIDDEN" else 503
-        raise HTTPException(
-            code, detail={"error_code": exc.code, "message": str(exc)}
-        ) from exc
-
-
-@app.put("/v1/{service_id}/secrets")
+@domain_router.put("/secrets")
 def upsert_secret(
     service_id: str,
     body: SecretBody,
-    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
 ) -> dict[str, Any]:
     """
     Admin: upsert per-tenant secret (value хранится зашифрованным).
-    Header: X-Admin-Token: <PLATFORM_ADMIN_TOKEN>
+    Header: X-Admin-Token: <DOMAIN_ADMIN_TOKEN>
     """
     from fsm_platform.host.runtime_context import service_scope
     from fsm_platform.host.secrets import SecretsError, set_domain_secret
 
-    _admin_or_raise(x_admin_token)
     try:
         with service_scope(service_id):
             set_domain_secret(body.key, body.value)
@@ -654,16 +762,12 @@ def upsert_secret(
     return {"service_id": service_id, "key": body.key.strip(), "ok": True}
 
 
-@app.get("/v1/{service_id}/secrets")
-def list_secrets(
-    service_id: str,
-    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
-) -> dict[str, Any]:
+@domain_router.get("/secrets")
+def list_secrets(service_id: str) -> dict[str, Any]:
     """Admin: список имён ключей (значения не отдаём)."""
     from fsm_platform.host.runtime_context import service_scope
     from fsm_platform.host.secrets import SecretsError, list_domain_secret_keys
 
-    _admin_or_raise(x_admin_token)
     try:
         with service_scope(service_id):
             keys = list_domain_secret_keys()
@@ -674,17 +778,15 @@ def list_secrets(
     return {"service_id": service_id, "keys": keys}
 
 
-@app.delete("/v1/{service_id}/secrets/{key}")
+@domain_router.delete("/secrets/{key}")
 def delete_secret(
     service_id: str,
     key: str,
-    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
 ) -> dict[str, Any]:
     """Admin: удалить секрет по имени ключа."""
     from fsm_platform.host.runtime_context import service_scope
     from fsm_platform.host.secrets import SecretsError, delete_domain_secret
 
-    _admin_or_raise(x_admin_token)
     try:
         with service_scope(service_id):
             ok = delete_domain_secret(key)
@@ -697,11 +799,8 @@ def delete_secret(
     return {"service_id": service_id, "key": key, "deleted": True}
 
 
-@app.post("/v1/admin/domains/{service_id}/reload")
-def admin_reload_domain(
-    service_id: str,
-    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
-) -> dict[str, Any]:
+@platform_router.post("/v1/admin/domains/{service_id}/reload")
+def admin_reload_domain(service_id: str) -> dict[str, Any]:
     """
     Admin: повторный bootstrap catalog domain service без рестарта platform.
     Header: X-Admin-Token: <PLATFORM_ADMIN_TOKEN>
@@ -709,7 +808,6 @@ def admin_reload_domain(
     from fsm_platform.host.domain_bootstrap import get_bootstrap_status, reload_domain
     from fsm_platform.host.domain_validator import DomainValidationError
 
-    _admin_or_raise(x_admin_token)
     try:
         return reload_domain(service_id)
     except DomainValidationError as exc:
@@ -724,7 +822,7 @@ def admin_reload_domain(
         ) from exc
 
 
-@app.post("/input/telegram/{service_id}/webhook")
+@input_router.post("/input/telegram/{service_id}/webhook")
 def telegram_webhook_tenant(
     service_id: str, update: dict[str, Any]
 ) -> dict[str, Any]:
@@ -738,7 +836,7 @@ def telegram_webhook_tenant(
     return handle_telegram_update(update, service_id=service_id)
 
 
-@app.get("/input/telegram/{service_id}/link")
+@input_router.get("/input/telegram/{service_id}/link")
 def telegram_link_tenant(service_id: str, user_id: int) -> dict[str, Any]:
     """
     Deep-link для фронта арендатора.
@@ -759,3 +857,11 @@ def telegram_link_tenant(service_id: str, user_id: int) -> dict[str, Any]:
         }
     except RuntimeError as exc:
         raise HTTPException(400, detail=str(exc)) from exc
+
+
+app.include_router(auth_router)
+app.include_router(tenant_router)
+app.include_router(platform_router)
+app.include_router(domain_router)
+app.include_router(events_ws_router)
+app.include_router(input_router)
