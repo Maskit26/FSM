@@ -1,75 +1,51 @@
 """
-Inbound hook registry: сторонние API → домен (снаружи внутрь).
+Inbound hook registry + dispatch через Domain Contract API.
 
-Не путать с host/webhooks.py (outbound webhook_subscriptions → клиент).
-
-Домен объявляет channels в catalog; dispatch — через domain service (часть 6).
-
-HTTP: POST /v1/{service_id}/hooks/{channel}
+Домен объявляет channels в catalog; platform проксирует HTTP → domain service.
 """
 
 from __future__ import annotations
 
-import inspect
-from typing import Any, Callable, Optional
-
-WebhookHandler = Callable[..., Any]
+import base64
+from typing import Any, Optional
 
 
 class WebhookRegistry:
-    """(service_id, channel) → handler. Channel — короткое имя источника (leo4, tinkoff, …)."""
+    """(service_id, channel) → declared. Handler живёт только в domain service."""
 
     def __init__(self) -> None:
-        self._hooks: dict[tuple[str, str], Optional[WebhookHandler]] = {}
-
-    def register(
-        self, service_id: str, channel: str, handler: WebhookHandler
-    ) -> None:
-        """Регистрирует inbound-обработчик для channel."""
-        sid = str(service_id or "").strip()
-        ch = str(channel or "").strip().lower()
-        if not sid or not ch:
-            raise ValueError("service_id and channel required")
-        if not callable(handler):
-            raise TypeError("handler must be callable")
-        self._hooks[(sid, ch)] = handler
+        self._channels: set[tuple[str, str]] = set()
 
     def register_channel(self, service_id: str, channel: str) -> None:
-        """Channel из catalog (без handler — dispatch в domain service, часть 6)."""
         sid = str(service_id or "").strip()
         ch = str(channel or "").strip().lower()
         if not sid or not ch:
             raise ValueError("service_id and channel required")
-        self._hooks[(sid, ch)] = None
-
-    def get(self, service_id: str, channel: str) -> Optional[WebhookHandler]:
-        """Handler или None."""
-        return self._hooks.get(
-            (str(service_id).strip(), str(channel or "").strip().lower())
-        )
+        self._channels.add((sid, ch))
 
     def has(self, service_id: str, channel: str) -> bool:
-        return self.get(service_id, channel) is not None
+        return (
+            str(service_id).strip(),
+            str(channel or "").strip().lower(),
+        ) in self._channels
 
     def list_channels(self, service_id: str) -> list[str]:
-        """Имена channel для catalog / диагностики."""
         sid = str(service_id).strip()
-        return sorted(ch for (s, ch) in self._hooks if s == sid)
+        return sorted(ch for (s, ch) in self._channels if s == sid)
 
     def clear(self) -> None:
-        self._hooks.clear()
+        self._channels.clear()
 
     def unregister(self, service_id: str) -> None:
-        """Удаляет все hooks одного service_id."""
-        for key in [k for k in self._hooks if k[0] == service_id]:
-            del self._hooks[key]
+        sid = str(service_id).strip()
+        self._channels = {(s, ch) for (s, ch) in self._channels if s != sid}
 
 
 default_webhook_registry = WebhookRegistry()
 
 
 class HookError(Exception):
-    """Доменный отказ inbound hook → HTTP status."""
+    """Отказ inbound hook → HTTP status."""
 
     def __init__(
         self,
@@ -83,69 +59,6 @@ class HookError(Exception):
         super().__init__(message or code)
 
 
-def _call_handler(
-    handler: WebhookHandler,
-    *,
-    body: Any,
-    headers: dict[str, str],
-    query: dict[str, str],
-    raw_body: bytes,
-    domain_session: Any,
-    platform_session: Any,
-    service_id: str,
-    channel: str,
-) -> Any:
-    """Подбирает args/kwargs по сигнатуре handler."""
-    available = {
-        "body": body,
-        "headers": headers,
-        "query": query,
-        "raw_body": raw_body,
-        "domain_session": domain_session,
-        "platform_session": platform_session,
-        "service_id": service_id,
-        "channel": channel,
-    }
-    sig = inspect.signature(handler)
-    params = list(sig.parameters.values())
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
-
-    args: list[Any] = []
-    kwargs: dict[str, Any] = {}
-    skip_name: Optional[str] = None
-
-    if params:
-        first = params[0]
-        if first.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        ):
-            # def handle(body, *, headers=...): или def handle(payload, ...):
-            args.append(available.get(first.name, body))
-            skip_name = first.name
-
-    for p in params:
-        if p.name == skip_name:
-            continue
-        if p.kind in (
-            inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD,
-        ):
-            continue
-        if p.name in available:
-            kwargs[p.name] = available[p.name]
-        elif has_var_kw and p.name in available:
-            kwargs[p.name] = available[p.name]
-
-    if has_var_kw:
-        for k, v in available.items():
-            if k == skip_name:
-                continue
-            kwargs.setdefault(k, v)
-
-    return handler(*args, **kwargs)
-
-
 def dispatch_inbound_hook(
     service_id: str,
     channel: str,
@@ -155,68 +68,56 @@ def dispatch_inbound_hook(
     query: dict[str, str],
     raw_body: bytes = b"",
 ) -> dict[str, Any]:
-    """
-    Биндит service_scope, открывает sessions, вызывает handler домена, commit.
-
-    Типичный handler:
-      def handle(body, *, headers, query, domain_session, platform_session):
-          ...
-          return {"ok": True}
-    """
-    from fsm_platform.host.engines import domain_session, platform_session
+    """Проксирует inbound hook в domain service (Contract API)."""
+    from fsm_platform.host.contract_client import ContractError, get_contract_client
+    from fsm_platform.host.contract_side_effects import apply_declared
+    from fsm_platform.host.domain_bootstrap import is_domain_ready
+    from fsm_platform.host.engines import platform_session
     from fsm_platform.host.runtime_context import service_scope
 
     ch = str(channel or "").strip().lower()
-    handler = default_webhook_registry.get(service_id, ch)
-    if handler is None:
-        if default_webhook_registry.has(service_id, ch):
-            raise HookError(
-                "HOOK_REMOTE_NOT_IMPLEMENTED",
-                f"inbound hook channel={ch!r} declared in catalog; "
-                f"domain service dispatch pending",
-                status_code=501,
-            )
+    if not default_webhook_registry.has(service_id, ch):
         raise HookError(
             "UNKNOWN_HOOK_CHANNEL",
             f"no inbound hook for channel={ch!r}",
             status_code=404,
         )
+    if not is_domain_ready(service_id):
+        raise HookError(
+            "DOMAIN_NOT_READY",
+            "domain service catalog not loaded",
+            status_code=503,
+        )
 
-    sp = platform_session()
-    sd = domain_session(service_id)
+    raw_b64 = base64.b64encode(raw_body).decode("ascii") if raw_body else None
     try:
         with service_scope(service_id):
-            result = _call_handler(
-                handler,
+            result = get_contract_client(service_id).call_hook(
+                ch,
                 body=body,
                 headers=headers,
                 query=query,
-                raw_body=raw_body,
-                domain_session=sd,
-                platform_session=sp,
-                service_id=service_id,
-                channel=ch,
+                raw_body_b64=raw_b64,
             )
-        sd.commit()
+    except ContractError as exc:
+        status = 503 if exc.transient else (exc.status_code or 502)
+        if status == 404:
+            status = 404
+        raise HookError(exc.code, exc.message, status_code=int(status)) from exc
+
+    sp = platform_session()
+    try:
+        with service_scope(service_id):
+            apply_declared(sp, service_id=service_id, data=result)
         sp.commit()
-        if result is None:
-            return {"ok": True, "service_id": service_id, "channel": ch}
-        if isinstance(result, dict):
-            return result
-        return {
-            "ok": True,
-            "service_id": service_id,
-            "channel": ch,
-            "data": result,
-        }
-    except HookError:
-        sd.rollback()
-        sp.rollback()
-        raise
     except Exception:
-        sd.rollback()
         sp.rollback()
         raise
     finally:
-        sd.close()
         sp.close()
+
+    if result is None:
+        return {"ok": True, "service_id": service_id, "channel": ch}
+    if isinstance(result, dict):
+        return result
+    return {"ok": True, "service_id": service_id, "channel": ch, "data": result}

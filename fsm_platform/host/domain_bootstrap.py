@@ -253,7 +253,7 @@ def _list_service_ids() -> list[str]:
 def _try_graph_session(service_id: str) -> Optional[object]:
     try:
         return graph_session(service_id)
-    except KeyError:
+    except (KeyError, RuntimeError):
         logger.warning(
             "no graph engine for %s — Validator skips graph DB checks",
             service_id,
@@ -279,3 +279,15 @@ def bootstrap_active_domains() -> None:
         ok_count,
         len(service_ids),
     )
+
+
+def reload_domain(service_id: str) -> dict[str, Any]:
+    """
+    Повторный bootstrap одного tenant (admin / после старта domain service).
+    Raises DomainValidationError при неудаче.
+    """
+    sid = str(service_id or "").strip()
+    if not sid:
+        raise ValueError("service_id is required")
+    bootstrap_domain(sid, raise_on_error=True)
+    return get_bootstrap_status(sid)

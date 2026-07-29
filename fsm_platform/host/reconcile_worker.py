@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.sagas import on_child_terminal
-from fsm_platform.host.engines import platform_session
+from fsm_platform.host.engines import graph_session, platform_session
 from fsm_platform.host.webhooks import emit_event_with_webhooks
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,38 @@ def _payload_dict(row: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
     return {}
+
+
+def dock_invoke_command(row: dict[str, Any]) -> None:
+    """
+    Идемпотентный докат platform bootstrap после успешного invoke command.
+    Запрещено: повторный HTTP-вызов domain command.
+    """
+    from fsm_platform.host.http.request_runtime import _bootstrap_and_maybe_enqueue
+
+    service_id = str(row["service_id"])
+    payload = _payload_dict(row)
+    result = payload.get("result")
+    actor = payload.get("actor") or {}
+    if not isinstance(result, dict) or not result.get("entity_type"):
+        return
+
+    sp = platform_session()
+    sg = None
+    try:
+        sg = graph_session(service_id)
+        _bootstrap_and_maybe_enqueue(sp, sg, service_id, result, actor=actor)
+        from fsm_platform.host.contract_side_effects import apply_declared
+
+        apply_declared(sp, service_id=service_id, data=result)
+        sp.commit()
+    except Exception:
+        sp.rollback()
+        raise
+    finally:
+        if sg is not None:
+            sg.close()
+        sp.close()
 
 
 def dock_platform(row: dict[str, Any]) -> None:
@@ -109,6 +141,11 @@ def dock_platform(row: dict[str, Any]) -> None:
             correlation_id=f"reconcile:{instance_id}:{transition_id}",
         )
 
+        from fsm_platform.host.contract_side_effects import apply_declared
+
+        # Повтор notify/cancel/entity_states из FsmResult (идемпотентно по keys)
+        apply_declared(sp, service_id=service_id, data=payload)
+
         on_child_terminal(sp, instance_id=instance_id, status="COMPLETED")
         sp.commit()
     except Exception:
@@ -143,7 +180,11 @@ def process_one(*, batch_size: int = 10, service_id: Optional[str] = None) -> bo
         rid = int(row["id"])
         attempts = int(row.get("attempts") or 1)
         try:
-            dock_platform(row)
+            payload = _payload_dict(row)
+            if payload.get("kind") == "invoke_command":
+                dock_invoke_command(row)
+            else:
+                dock_platform(row)
             sp2 = platform_session()
             try:
                 default_db_layer.mark_reconcile_done(sp2, rid)

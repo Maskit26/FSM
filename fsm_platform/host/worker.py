@@ -153,7 +153,8 @@ def _fire_due_schedules(*, limit: int = 20, service_id: Optional[str] = None) ->
 
 
 def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
-    """ProcessDef.on_failed — domain recovery после терминального FAILED."""
+    """ProcessDef.on_failed — domain recovery; platform применяет side-effects из ответа."""
+    from fsm_platform.host.contract_side_effects import apply_declared
     from fsm_platform.host.runtime_context import service_scope
 
     service_id = str(instance["service_id"])
@@ -167,12 +168,13 @@ def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
         from fsm_platform.host.contract_invoke import call_on_failed
 
         with service_scope(service_id):
-            call_on_failed(
+            declared = call_on_failed(
                 process_def.on_failed,
                 instance=instance,
                 last_error=last_error or "",
                 process_name=process_name,
             )
+            apply_declared(sp, service_id=service_id, data=declared)
         sp.commit()
     except Exception:
         try:
@@ -334,6 +336,13 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
         )
 
         if result.new_state == "COMPLETED":
+            from fsm_platform.host.contract_side_effects import apply_declared
+
+            apply_declared(
+                sp,
+                service_id=service_id,
+                data=result.payload,
+            )
             emit_event_with_webhooks(
                 sp,
                 service_id=service_id,

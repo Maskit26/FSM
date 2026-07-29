@@ -132,6 +132,11 @@ class TransitionRunner:
         selected: TransitionDef = primary["selected"]
         domain_context = primary["domain_context"]
         effect_payload = primary["effect_payload"]
+        side_effects = {
+            "notify": list(primary.get("notify") or []),
+            "cancel_instances": list(primary.get("cancel_instances") or []),
+            "entity_states": list(primary.get("entity_states") or []),
+        }
 
         # 3. COMPANIONS (effect_params выбранного primary-ребра)
         try:
@@ -161,20 +166,27 @@ class TransitionRunner:
                 return FsmResult(new_state="FAILED", last_error=step["error"])
             domain_context = step["domain_context"]
             companion_payloads.append(step["payload"])
+            for key in ("notify", "cancel_instances", "entity_states"):
+                side_effects[key].extend(step.get(key) or [])
+
+        payload: dict[str, Any] = {
+            "transition_id": selected.id,
+            "from_state": selected.from_state,
+            "to_state": selected.to_state,
+            "event_name": event_name,
+            "entity_type": str(entity_type),
+            "entity_id": entity_id,
+            "effect": effect_payload,
+            "companions": companion_payloads,
+        }
+        for key, vals in side_effects.items():
+            if vals:
+                payload[key] = vals
 
         return FsmResult(
             new_state="COMPLETED",
             attempts_increment=1,
-            payload={
-                "transition_id": selected.id,
-                "from_state": selected.from_state,
-                "to_state": selected.to_state,
-                "event_name": event_name,
-                "entity_type": str(entity_type),
-                "entity_id": entity_id,
-                "effect": effect_payload,
-                "companions": companion_payloads,
-            },
+            payload=payload,
         )
 
     def _run_companion(
@@ -266,6 +278,9 @@ class TransitionRunner:
                 "event_name": str(c_event),
                 "effect": result["effect_payload"],
             },
+            "notify": list(result.get("notify") or []),
+            "cancel_instances": list(result.get("cancel_instances") or []),
+            "entity_states": list(result.get("entity_states") or []),
         }
 
     def _run_entity_step(
@@ -431,6 +446,9 @@ class TransitionRunner:
         }
 
         effect_payload = None
+        notify: list = []
+        cancel_instances: list = []
+        entity_states: list = []
         if selected.effect_name:
             effect_fn = self._effects.get(service_id, selected.effect_name)
             if effect_fn is None:
@@ -461,9 +479,15 @@ class TransitionRunner:
                     )
                 }
             effect_payload = effect_result.payload
+            notify = list(effect_result.notify or [])
+            cancel_instances = list(effect_result.cancel_instances or [])
+            entity_states = list(effect_result.entity_states or [])
 
         return {
             "selected": selected,
             "domain_context": domain_context,
             "effect_payload": effect_payload,
+            "notify": notify,
+            "cancel_instances": cancel_instances,
+            "entity_states": entity_states,
         }

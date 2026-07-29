@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from domains.courier import db_layer
 from domains.courier.errors import DomainError
+
+logger = logging.getLogger(__name__)
 
 
 def _require_str(params: dict[str, Any], key: str) -> str:
@@ -161,6 +164,7 @@ def create_order(
     params: dict[str, Any],
     actor: dict[str, Any],
     platform_session=None,
+    db=None,
 ) -> dict[str, Any]:
     """
     Шаг 2: создать заказ по готовому request_id (order_requests.id).
@@ -256,45 +260,45 @@ def create_order(
     db_layer.create_stage_order(domain_session, order_id, "pickup")
     db_layer.create_stage_order(domain_session, order_id, "delivery")
 
-    if platform_session is not None:
-        from domains.courier.notifications import enqueue_order_progress_notifications
+    from domains.courier.core.enqueue import core_notify
+    from domains.courier.notifications import build_order_progress_notifications
 
-        enqueue_order_progress_notifications(
-            domain_session,
-            {"platform": platform_session},
-            order_id=order_id,
-            to_state="order_created",
-            platform_session=platform_session,
-        )
+    notify: list[dict[str, Any]] = build_order_progress_notifications(
+        domain_session,
+        order_id=order_id,
+        to_state="order_created",
+    )
 
-        # Core: create main + courier suborders via outbox (after commit)
-        core_u = db_layer.get_core_u_id_by_local_user_id(
-            domain_session, client_user_id
+    # Core sync — best-effort: без mapping/token заказ всё равно создаём.
+    core_u = db_layer.get_core_u_id_by_local_user_id(
+        domain_session, client_user_id
+    )
+    if not core_u:
+        logger.warning(
+            "create_order skip core_notify: no core mapping client=%s order=%s",
+            client_user_id,
+            order_id,
         )
-        if not core_u:
-            raise DomainError(
-                "CLIENT_NOT_MAPPED_TO_CORE",
-                "Сначала register_user / login_user для клиента",
-            )
+    else:
         token, u_hash = db_layer.get_user_core_tokens(domain_session, int(core_u))
         if not token or not u_hash:
-            raise DomainError(
-                "MISSING_CORE_TOKENS",
-                "Нет token/u_hash — выполните login_user",
+            logger.warning(
+                "create_order skip core_notify: missing tokens core_u=%s order=%s",
+                core_u,
+                order_id,
             )
-        from domains.courier.core.enqueue import enqueue_core
-
-        enqueue_core(
-            {"platform": platform_session},
-            op="create_order",
-            payload={
-                "local_order_id": order_id,
-                "pickup_type": pickup_type,
-                "delivery_type": delivery_type,
-            },
-            idempotency_key=f"core:create_order:{order_id}",
-            platform_session=platform_session,
-        )
+        else:
+            notify.append(
+                core_notify(
+                    op="create_order",
+                    payload={
+                        "local_order_id": order_id,
+                        "pickup_type": pickup_type,
+                        "delivery_type": delivery_type,
+                    },
+                    idempotency_key=f"core:create_order:{order_id}",
+                )
+            )
 
     return {
         "entity_type": "order",
@@ -317,6 +321,7 @@ def create_order(
                 "initial_state": "COMPLETED",
             },
         ],
+        "notify": notify,
         "data": {
             "order_id": order_id,
             "request_id": request_id,
@@ -1232,6 +1237,38 @@ def confirm_courier2_delivery(
 
 
 # --- Core auth (sync call_api) ---
+
+
+def bind_telegram(
+    domain_session,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    platform_session=None,
+) -> dict[str, Any]:
+    """
+    Привязка Telegram chat_id к users (вызывает platform input после /start).
+    Домен только пишет business-поле; протокол webhook — на платформе.
+    """
+    _ = actor
+    _ = platform_session
+    try:
+        user_id = int(params.get("user_id") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("user_id required") from exc
+    chat_id = str(params.get("chat_id") or "").strip()
+    if not user_id or not chat_id:
+        raise ValueError("user_id and chat_id required")
+
+    user = db_layer.get_user(domain_session, user_id)
+    if user is None:
+        raise DomainError("USER_NOT_FOUND", f"user {user_id} not found")
+
+    db_layer.bind_telegram_chat_id(domain_session, user_id, chat_id)
+    return {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "name": str(user.get("name") or f"#{user_id}"),
+    }
 
 
 def register_user(

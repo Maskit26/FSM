@@ -1,11 +1,9 @@
-"""TG-уведомления о прогрессе заказа (platform.notify → outbox)."""
+"""TG-уведомления о прогрессе заказа — только сборка notify[] для ответа Contract API."""
 
 from __future__ import annotations
 
 import logging
 from typing import Any, Optional
-
-from fsm_platform.host import side_effects
 
 from domains.courier import db_layer
 
@@ -29,34 +27,21 @@ _ORDER_PROGRESS_TEMPLATES: dict[str, dict[str, str]] = {
         ),
     },
     "order_picked_up_from_post1": {
-        "client": (
-            "Посылка по заказу №{order_id} забрана из постамата отправления "
-            "и готовится к отправке."
-        ),
+        "client": "Курьер забрал посылку №{order_id} из постамата отправления.",
     },
-    "order_in_transit_to_post2": {
-        "client": "Заказ №{order_id}: посылка в пути.",
-        "recipient": "Вам отправление №{order_id}: посылка в пути к вам.",
-    },
-    "order_parcel_confirmed_post2": {
-        "client": (
-            "Заказ №{order_id}: посылка прибыла в постамат назначения "
-            "({locker_address})."
-        ),
-        "recipient": (
-            "Ваша посылка №{order_id} в постамате: "
-            "{locker_address} (ячейка {cell_code})."
-        ),
+    "order_in_transit": {
+        "client": "Заказ №{order_id} в пути.",
+        "recipient": "Вам едет посылка №{order_id}.",
     },
     "order_courier2_assigned": {
         "recipient": (
-            "Заказ №{order_id} принял курьер {courier_name} для доставки вам."
+            "Заказ №{order_id}: курьер {courier_name} назначен на доставку."
         ),
     },
     "order_courier2_parcel_delivered": {
         "recipient": (
-            "Курьер доставил посылку по заказу №{order_id}. "
-            "Ожидается подтверждение получения."
+            "Посылка №{order_id} доставлена в постамат: "
+            "{locker_address} (ячейка {cell_code})."
         ),
     },
     "order_completed": {
@@ -64,12 +49,6 @@ _ORDER_PROGRESS_TEMPLATES: dict[str, dict[str, str]] = {
         "recipient": "Заказ №{order_id}: получение подтверждено. Спасибо!",
     },
 }
-
-
-def _platform_session(db: Any):
-    if isinstance(db, dict):
-        return db.get("platform")
-    return None
 
 
 def _cell_fields(session_domain, cell_id: Optional[int]) -> dict[str, str]:
@@ -84,34 +63,25 @@ def _cell_fields(session_domain, cell_id: Optional[int]) -> dict[str, str]:
     }
 
 
-def enqueue_order_progress_notifications(
+def build_order_progress_notifications(
     session_domain,
-    db: Any,
     *,
     order_id: int,
     to_state: str,
-    service_id: str = "svc_courier_01",
     instance_id: Optional[int] = None,
     courier_user_id: Optional[int] = None,
-    platform_session=None,
-) -> int:
+) -> list[dict[str, Any]]:
     """
-    Кладёт TG-сообщения в platform_outbox для client/recipient по to_state.
-    Нужен users.telegram_chat_id (после deep-link /start из приложения).
-    Без chat_id — skip. Возвращает число enqueued.
+    Собирает notify[] для TG (client/recipient) по to_state.
+    Без chat_id — skip. Платформа применяет список из ответа effect/command.
     """
-    sp = platform_session or _platform_session(db)
-    if sp is None:
-        logger.debug("skip order notify: no platform session order_id=%s", order_id)
-        return 0
-
     templates = _ORDER_PROGRESS_TEMPLATES.get(str(to_state) or "")
     if not templates:
-        return 0
+        return []
 
     order = db_layer.get_order(session_domain, int(order_id))
     if order is None:
-        return 0
+        return []
 
     courier_name = ""
     if courier_user_id:
@@ -136,7 +106,7 @@ def enqueue_order_progress_notifications(
         "recipient": order.get("recipient_user_id"),
     }
 
-    enqueued = 0
+    items: list[dict[str, Any]] = []
     for audience, template in templates.items():
         user_id = audience_user.get(audience)
         if not user_id:
@@ -157,29 +127,19 @@ def enqueue_order_progress_notifications(
         idem = f"tg:{order_id}:{to_state}:{audience}"
         if instance_id:
             idem = f"{idem}:i{instance_id}"
-        try:
-            side_effects.notify(
-                sp,
-                service_id=service_id,
-                channel="telegram",
-                destination=chat_id,
-                event_type=f"order.progress.{to_state}",
-                payload={
+        items.append(
+            {
+                "channel": "telegram",
+                "destination": chat_id,
+                "event_type": f"order.progress.{to_state}",
+                "payload": {
                     "text": text,
                     "order_id": int(order_id),
                     "to_state": to_state,
                     "audience": audience,
                     "user_id": int(user_id),
                 },
-                idempotency_key=idem,
-            )
-            enqueued += 1
-        except Exception:
-            logger.debug(
-                "notify skip/dup order_id=%s state=%s audience=%s",
-                order_id,
-                to_state,
-                audience,
-                exc_info=True,
-            )
-    return enqueued
+                "idempotency_key": idem,
+            }
+        )
+    return items

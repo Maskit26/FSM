@@ -1,4 +1,4 @@
-"""Domain Validator: стыковка пакета, RAM-реестров и графа domain DB (§7)."""
+"""Domain Validator: catalog ↔ RAM-реестры и FSM-граф (SQL) для remote domain."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -27,16 +26,6 @@ from fsm_platform.host.operations import OperationRegistry, default_operation_re
 logger = logging.getLogger(__name__)
 
 _OPERATION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-
-_DEFAULT_REQUIRED_MODULES = (
-    "processes",
-    "commands",
-    "queries",
-    "guards",
-    "effects",
-    "context",
-    "db_layer",
-)
 
 
 @dataclass
@@ -106,76 +95,11 @@ class DomainValidationError(Exception):
         )
 
 
-def load_manifest(package_dir: Path) -> dict[str, Any]:
-    """
-    Читает manifest.yaml картриджа.
-    Без PyYAML: поддерживает простой subset (ключ: значение, списки `- item`).
-    """
-    path = package_dir / "manifest.yaml"
-    if not path.is_file():
-        raise FileNotFoundError(str(path))
-    try:
-        import yaml  # type: ignore
-
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("manifest root must be a mapping")
-        return data
-    except ImportError:
-        return _parse_simple_yaml(path.read_text(encoding="utf-8"))
-
-
-def _parse_simple_yaml(text: str) -> dict[str, Any]:
-    """Минимальный YAML для manifest без внешней зависимости."""
-    result: dict[str, Any] = {}
-    current_list_key: Optional[str] = None
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        if line.startswith("  - ") or line.startswith("- "):
-            if current_list_key is None:
-                raise ValueError(f"list item without key: {line!r}")
-            item = line.split("-", 1)[1].strip().strip("\"'")
-            result.setdefault(current_list_key, []).append(item)
-            continue
-        if ":" not in line:
-            raise ValueError(f"invalid manifest line: {line!r}")
-        key, _, value = line.partition(":")
-        key = key.strip()
-        value = value.strip()
-        if value == "":
-            current_list_key = key
-            result[key] = []
-            continue
-        current_list_key = None
-        if (value.startswith('"') and value.endswith('"')) or (
-            value.startswith("'") and value.endswith("'")
-        ):
-            value = value[1:-1]
-        result[key] = value
-    return result
-
-
-def package_dir_from_entry(entry: str) -> Path:
-    """
-    domains.courier.processes:register_all → каталог domains/courier.
-    """
-    module_name = entry.split(":", 1)[0].strip()
-    parts = module_name.split(".")
-    if len(parts) < 2:
-        raise ValueError(f"cannot resolve package dir from entry={entry!r}")
-    # domains.courier.processes → domains/courier
-    root = Path(__file__).resolve().parents[2]
-    return root.joinpath(*parts[:2])
-
-
 class DomainValidator:
     """
-    Проверяет контракт §6/§7 для одного service_id после register_all.
-    Не исполняет handlers и не проверяет бизнес-логику.
+    Проверяет catalog ↔ RAM-реестры и FSM-граф (SQL) для remote domain service.
+    Не исполняет handlers и не читает Python-пакет домена.
     """
-
     def __init__(
         self,
         *,
@@ -203,6 +127,7 @@ class DomainValidator:
         report.cartridge_type = str(catalog.get("cartridge_type") or "") or None
 
         self._validate_catalog(report, catalog)
+        self._validate_catalog_vs_ram(report, service_id, catalog)
         self._validate_ram(report, service_id)
 
         if session_graph is not None and report.ok:
@@ -235,6 +160,106 @@ class DomainValidator:
                     "CATALOG_INVALID",
                     f"catalog missing required field {key!r}",
                 )
+
+    def _validate_catalog_vs_ram(
+        self,
+        report: ValidationReport,
+        service_id: str,
+        catalog: dict[str, Any],
+    ) -> None:
+        """Catalog (Contract API) ↔ RAM после register_catalog."""
+        catalog_ops: dict[str, str] = {}
+        for item in catalog.get("operations") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("operation") or "").strip()
+            kind = str(item.get("kind") or "").strip()
+            if name:
+                catalog_ops[name] = kind
+
+        ram_ops = {
+            str(item["operation"]): str(item["kind"])
+            for item in self._ops.items(service_id)
+        }
+        for name, kind in catalog_ops.items():
+            if name not in ram_ops:
+                report.add_error(
+                    "CATALOG_OPERATION_NOT_REGISTERED",
+                    f"catalog operation {name!r} missing in OperationRegistry",
+                )
+            elif ram_ops[name] != kind:
+                report.add_error(
+                    "CATALOG_OPERATION_KIND_MISMATCH",
+                    f"operation {name!r}: catalog kind={kind!r} ram={ram_ops[name]!r}",
+                )
+        for name in sorted(set(ram_ops) - set(catalog_ops)):
+            report.add_warning(
+                "RAM_OPERATION_NOT_IN_CATALOG",
+                f"operation {name!r} registered but absent from catalog",
+            )
+
+        catalog_guards = {
+            str(g).strip()
+            for g in (catalog.get("guards") or [])
+            if str(g or "").strip()
+        }
+        catalog_effects = {
+            str(e).strip()
+            for e in (catalog.get("effects") or [])
+            if str(e or "").strip()
+        }
+        ram_guards = set(self._guards.list_names(service_id))
+        ram_effects = set(self._effects.list_names(service_id))
+
+        for g in sorted(catalog_guards - ram_guards):
+            report.add_error(
+                "CATALOG_GUARD_NOT_REGISTERED",
+                f"catalog guard {g!r} missing in GuardRegistry",
+            )
+        for e in sorted(catalog_effects - ram_effects):
+            report.add_error(
+                "CATALOG_EFFECT_NOT_REGISTERED",
+                f"catalog effect {e!r} missing in EffectRegistry",
+            )
+
+        catalog_processes: dict[str, dict[str, Any]] = {}
+        for proc in catalog.get("processes") or []:
+            if not isinstance(proc, dict):
+                continue
+            pname = str(proc.get("process_name") or "").strip()
+            if pname:
+                catalog_processes[pname] = proc
+
+        ram_processes = {
+            p.process_name: p for p in self._processes.list_for_service(service_id)
+        }
+        for pname, proc in catalog_processes.items():
+            if pname not in ram_processes:
+                report.add_error(
+                    "CATALOG_PROCESS_NOT_REGISTERED",
+                    f"catalog process {pname!r} missing in ProcessRegistry",
+                )
+                continue
+            ram_p = ram_processes[pname]
+            cb = str(proc.get("context_builder") or "").strip()
+            if cb and ram_p.context_builder is not None:
+                if ram_p.context_builder.name != cb:
+                    report.add_error(
+                        "CATALOG_CONTEXT_BUILDER_MISMATCH",
+                        f"process {pname!r}: catalog context_builder={cb!r} "
+                        f"ram={ram_p.context_builder.name!r}",
+                    )
+            if bool(proc.get("on_failed")) and ram_p.on_failed is None:
+                report.add_error(
+                    "CATALOG_ON_FAILED_MISMATCH",
+                    f"process {pname!r}: catalog on_failed=true but RAM has none",
+                )
+
+        for pname in sorted(set(ram_processes) - set(catalog_processes)):
+            report.add_warning(
+                "RAM_PROCESS_NOT_IN_CATALOG",
+                f"process {pname!r} registered but absent from catalog",
+            )
 
     def _validate_ram(self, report: ValidationReport, service_id: str) -> None:
         ops = self._ops.items(service_id)

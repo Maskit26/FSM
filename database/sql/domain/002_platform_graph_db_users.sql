@@ -22,6 +22,10 @@
 --   DOMAIN_GRAPH_WRITE_DATABASE_URL=mysql+mysqlconnector://fsm_graph_rw:PASS@host:3306/your_domain_db
 --
 -- domain_services (platform DB):
+--   db_graph_secret_ref        = 'graph_database_url'       -- key in domain_secrets
+--   db_graph_write_secret_ref  = 'graph_write_database_url' -- key in domain_secrets
+-- URLs живут в domain_secrets, не в platform .env.
+-- Онбординг: domain_services refs + PUT /v1/{service_id}/secrets
 --   db_graph_secret_ref        = DOMAIN_GRAPH_DATABASE_URL
 --   db_graph_write_secret_ref  = DOMAIN_GRAPH_WRITE_DATABASE_URL
 

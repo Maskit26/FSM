@@ -30,6 +30,7 @@ def _actor_id_from_actor(actor: Optional[dict[str, Any]]) -> Optional[int]:
 
 def run_operation(
     service_id: str,
+    operation: str,
     handler: Any,
     kind: str,
     params: dict[str, Any],
@@ -38,6 +39,7 @@ def run_operation(
     """
     Invoke command/query через Contract API; platform commit + bootstrap/enqueue.
     Domain DB commit — на стороне domain service до ответа HTTP.
+    При dual-commit сбое (domain ok / platform fail) — очередь reconcile.
     """
     from fsm_platform.core.remote import RemoteRef
     from fsm_platform.host.contract_invoke import call_operation
@@ -48,24 +50,135 @@ def run_operation(
 
     sp = platform_session()
     sg = None
+    result: Any = None
+    domain_committed = False
+    platform_committed = False
     try:
         with service_scope(service_id):
             result = call_operation(
                 handler, kind=kind, params=params, actor=actor
             )
-            if kind == "command" and isinstance(result, dict) and result.get("entity_type"):
+            domain_committed = True
+            if (
+                kind == "command"
+                and isinstance(result, dict)
+                and result.get("entity_type")
+            ):
                 sg = graph_session(service_id)
                 _bootstrap_and_maybe_enqueue(
                     sp, sg, service_id, result, actor=actor
                 )
+            if kind == "command" and isinstance(result, dict):
+                from fsm_platform.host.contract_side_effects import apply_declared
+
+                apply_declared(sp, service_id=service_id, data=result)
         sp.commit()
+        platform_committed = True
         return result if isinstance(result, dict) else {"data": result}
     except Exception:
         sp.rollback()
+        if (
+            domain_committed
+            and not platform_committed
+            and kind == "command"
+            and isinstance(result, dict)
+            and _invoke_needs_reconcile(result)
+        ):
+            _enqueue_invoke_reconcile(
+                service_id,
+                operation=operation,
+                result=result,
+                actor=actor,
+            )
         raise
     finally:
         if sg is not None:
             sg.close()
+        sp.close()
+
+
+def _invoke_needs_reconcile(result: dict[str, Any]) -> bool:
+    """Есть platform-side эффекты, которые нужно докатить после сбоя commit."""
+    if result.get("entity_type"):
+        return True
+    if result.get("enqueue") or result.get("enqueues") or result.get("saga"):
+        return True
+    if result.get("timers") or result.get("cancel_timers"):
+        return True
+    return False
+
+
+def _invoke_reconcile_transition_id(
+    service_id: str, operation: str, result: dict[str, Any]
+) -> int:
+    """Стабильный ключ для UNIQUE (instance_id, transition_id) invoke-reconcile."""
+    import zlib
+
+    entity_type = str(result.get("entity_type") or "")
+    entity_id = int(result.get("entity_id") or 0)
+    key = f"invoke:{service_id}:{operation}:{entity_type}:{entity_id}"
+    tid = zlib.crc32(key.encode("utf-8")) & 0x7FFFFFFF
+    return tid or 1
+
+
+def _enqueue_invoke_reconcile(
+    service_id: str,
+    *,
+    operation: str,
+    result: dict[str, Any],
+    actor: dict[str, Any],
+) -> None:
+    """
+    Domain command уже закоммичен; platform commit/bootstrap упали —
+    ставим идемпотентный докат platform-части (§4.7.1, invoke).
+    """
+    entity_type = str(result.get("entity_type") or "_")
+    entity_id = int(result.get("entity_id") or 0)
+    instance_ids = result.get("instance_ids")
+    instance_id = int(result.get("instance_id") or 0)
+    if not instance_id and isinstance(instance_ids, list) and instance_ids:
+        instance_id = int(instance_ids[0])
+    transition_id = _invoke_reconcile_transition_id(service_id, operation, result)
+    to_state = str(result.get("initial_state") or "bootstrap")
+    payload = {
+        "kind": "invoke_command",
+        "operation": operation,
+        "result": result,
+        "actor": dict(actor or {}),
+    }
+    sp = platform_session()
+    try:
+        default_db_layer.enqueue_reconcile(
+            sp,
+            service_id=service_id,
+            instance_id=instance_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            from_state=None,
+            to_state=to_state,
+            event_name=operation,
+            transition_id=transition_id,
+            payload=payload,
+        )
+        sp.commit()
+        logger.error(
+            "DUAL_COMMIT_PLATFORM_FAILED invoke operation=%s entity=%s:%s "
+            "queued reconcile transition_id=%s",
+            operation,
+            entity_type,
+            entity_id,
+            transition_id,
+        )
+    except Exception:
+        sp.rollback()
+        logger.exception(
+            "invoke reconcile enqueue failed operation=%s entity=%s:%s",
+            operation,
+            entity_type,
+            entity_id,
+        )
+        raise
+    finally:
         sp.close()
 
 

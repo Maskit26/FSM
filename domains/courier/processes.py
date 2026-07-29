@@ -1,17 +1,19 @@
-"""Регистрация картриджа courier: операции, процессы и effects."""
+"""Регистрация картриджа courier: операции, процессы, guards, effects."""
 
 from __future__ import annotations
 
-from fsm_platform import ProcessDef
-from fsm_platform.core.registry import (
-    default_effect_registry,
-    default_guard_registry,
-    default_process_registry,
+from fsm_platform.domain_runtime import (
+    DomainProcessDef,
+    effects as effect_registry,
+    guards as guard_registry,
+    operations as operation_registry,
+    processes as process_registry,
+    set_outbox_handler,
 )
-from fsm_platform.host.operations import default_operation_registry
 
 from domains.courier.commands import (
     assign_executor,
+    bind_telegram,
     cancel_courier_order,
     cancel_reservation,
     close_cell,
@@ -82,99 +84,95 @@ from domains.courier.queries import (
 def register_all(service_id: str) -> None:
     """
     Подключает операции и FSM-процессы домена к service_id.
-    Назначение/снятие/открытие/закрытие — процессы assign/remove/open/close_cell;
-    цепочки задаются guard_params на рёбрах графа.
+    Вызывается domain_runtime при старте domain service.
     """
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "create_order_request", "command", create_order_request
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "create_order", "command", create_order
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "register_user", "command", register_user
     )
-    default_operation_registry.register(
+    operation_registry.register(
+        service_id, "bind_telegram", "command", bind_telegram
+    )
+    operation_registry.register(
         service_id, "login_user", "command", login_user
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "logout_user", "command", logout_user
     )
-    default_operation_registry.register(
-        service_id, "create_car", "command", create_car
-    )
-    default_operation_registry.register(
+    operation_registry.register(service_id, "create_car", "command", create_car)
+    operation_registry.register(
         service_id, "verify_user", "command", verify_user
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "assign_executor", "command", assign_executor
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "take_courier_order", "command", take_courier_order
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "remove_executor", "command", remove_executor
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "cancel_courier_order", "command", cancel_courier_order
     )
-    default_operation_registry.register(
-        service_id, "open_cell", "command", open_cell
-    )
-    default_operation_registry.register(
-        service_id, "close_cell", "command", close_cell
-    )
-    default_operation_registry.register(
+    operation_registry.register(service_id, "open_cell", "command", open_cell)
+    operation_registry.register(service_id, "close_cell", "command", close_cell)
+    operation_registry.register(
         service_id,
         "request_locker_access_code",
         "command",
         request_locker_access_code,
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "reserve_direction_slot", "command", reserve_direction_slot
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "start_loading", "command", start_loading
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "cancel_reservation", "command", cancel_reservation
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "complete_loading", "command", complete_loading
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "start_trip", "command", start_trip
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "complete_trip", "command", complete_trip
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id,
         "confirm_courier2_delivery",
         "command",
         confirm_courier2_delivery,
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "list_client_orders", "query", list_client_orders
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "list_courier_exchange", "query", list_courier_exchange
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "list_courier_orders", "query", list_courier_orders
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "list_driver_exchange", "query", list_driver_exchange
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "list_driver_trips", "query", list_driver_trips
     )
-    default_operation_registry.register(
+    operation_registry.register(
         service_id, "view_locker_access_code", "query", view_locker_access_code
     )
 
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="assign_executor",
             entity_type="order",
@@ -183,8 +181,8 @@ def register_all(service_id: str) -> None:
             initial_state="order_created",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="remove_executor",
             entity_type="order",
@@ -193,8 +191,8 @@ def register_all(service_id: str) -> None:
             initial_state="order_created",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="open_cell",
             entity_type="order",
@@ -203,8 +201,8 @@ def register_all(service_id: str) -> None:
             initial_state="order_created",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="close_cell",
             entity_type="order",
@@ -213,8 +211,8 @@ def register_all(service_id: str) -> None:
             initial_state="order_created",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="start_loading",
             entity_type="driver_reservations",
@@ -223,8 +221,8 @@ def register_all(service_id: str) -> None:
             initial_state="reservation_active",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="complete_loading",
             entity_type="driver_reservations",
@@ -233,8 +231,8 @@ def register_all(service_id: str) -> None:
             initial_state="reservation_active",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="cancel_reservation",
             entity_type="driver_reservations",
@@ -243,8 +241,8 @@ def register_all(service_id: str) -> None:
             initial_state="reservation_active",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="expire_reservation",
             entity_type="driver_reservations",
@@ -255,8 +253,8 @@ def register_all(service_id: str) -> None:
     )
     from domains.courier.recovery import on_locker_reserve_failed
 
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="locker_reserve",
             entity_type="locker",
@@ -266,8 +264,8 @@ def register_all(service_id: str) -> None:
             on_failed=on_locker_reserve_failed,
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="start_trip",
             entity_type="trip",
@@ -276,8 +274,8 @@ def register_all(service_id: str) -> None:
             initial_state="trip_assigned",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="complete_trip",
             entity_type="trip",
@@ -286,8 +284,8 @@ def register_all(service_id: str) -> None:
             initial_state="trip_in_progress",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="confirm_courier2_delivery",
             entity_type="order",
@@ -296,8 +294,8 @@ def register_all(service_id: str) -> None:
             initial_state="order_courier2_parcel_delivered",
         )
     )
-    default_process_registry.register(
-        ProcessDef(
+    process_registry.register(
+        DomainProcessDef(
             service_id=service_id,
             process_name="start_order_transit",
             entity_type="order",
@@ -307,75 +305,64 @@ def register_all(service_id: str) -> None:
         )
     )
 
-    default_guard_registry.register(
-        service_id, "can_assign_executor", can_assign_executor
-    )
-    default_guard_registry.register(
-        service_id, "can_remove_executor", can_remove_executor
-    )
-    default_guard_registry.register(service_id, "can_open_cell", can_open_cell)
-    default_guard_registry.register(service_id, "can_close_cell", can_close_cell)
-    default_guard_registry.register(
+    guard_registry.register(service_id, "can_assign_executor", can_assign_executor)
+    guard_registry.register(service_id, "can_remove_executor", can_remove_executor)
+    guard_registry.register(service_id, "can_open_cell", can_open_cell)
+    guard_registry.register(service_id, "can_close_cell", can_close_cell)
+    guard_registry.register(
         service_id, "can_confirm_courier2_delivery", can_confirm_courier2_delivery
     )
-    default_guard_registry.register(
-        service_id, "can_start_loading", can_start_loading
-    )
-    default_guard_registry.register(
+    guard_registry.register(service_id, "can_start_loading", can_start_loading)
+    guard_registry.register(
         service_id, "can_complete_loading", can_complete_loading
     )
-    default_guard_registry.register(
+    guard_registry.register(
         service_id, "can_cancel_reservation", can_cancel_reservation
     )
-    default_guard_registry.register(
+    guard_registry.register(
         service_id, "can_expire_reservation", can_expire_reservation
     )
-    default_guard_registry.register(
+    guard_registry.register(
         service_id, "can_reserve_locker_cell", can_reserve_locker_cell
     )
-    default_guard_registry.register(
+    guard_registry.register(
         service_id, "can_reserve_direction_slot", can_reserve_direction_slot
     )
-    default_guard_registry.register(service_id, "can_create_trip", can_create_trip)
-    default_guard_registry.register(service_id, "can_start_trip", can_start_trip)
-    default_guard_registry.register(
-        service_id, "can_complete_trip", can_complete_trip
-    )
-    default_guard_registry.register(
+    guard_registry.register(service_id, "can_create_trip", can_create_trip)
+    guard_registry.register(service_id, "can_start_trip", can_start_trip)
+    guard_registry.register(service_id, "can_complete_trip", can_complete_trip)
+    guard_registry.register(
         service_id, "can_start_order_transit", can_start_order_transit
     )
-    default_effect_registry.register(
+
+    effect_registry.register(
         service_id, "assign_executor_effect", assign_executor_effect
     )
-    default_effect_registry.register(
+    effect_registry.register(
         service_id, "remove_executor_effect", remove_executor_effect
     )
-    default_effect_registry.register(
-        service_id, "open_cell_effect", open_cell_effect
-    )
-    default_effect_registry.register(
-        service_id, "close_cell_effect", close_cell_effect
-    )
-    default_effect_registry.register(
+    effect_registry.register(service_id, "open_cell_effect", open_cell_effect)
+    effect_registry.register(service_id, "close_cell_effect", close_cell_effect)
+    effect_registry.register(
         service_id, "sync_locker_cell_status", sync_locker_cell_status
     )
-    default_effect_registry.register(
+    effect_registry.register(
         service_id, "reserve_locker_cell_effect", reserve_locker_cell_effect
     )
-    default_effect_registry.register(
+    effect_registry.register(
         service_id, "sync_reservation_status", sync_reservation_status
     )
-    default_effect_registry.register(
+    effect_registry.register(
         service_id, "cancel_reservation_effect", cancel_reservation_effect
     )
-    default_effect_registry.register(
-        service_id, "sync_trip_status", sync_trip_status
-    )
-    default_effect_registry.register(
-        service_id, "sync_order_status", sync_order_status
-    )
-    default_effect_registry.register(
+    effect_registry.register(service_id, "sync_trip_status", sync_trip_status)
+    effect_registry.register(service_id, "sync_order_status", sync_order_status)
+    effect_registry.register(
         service_id,
         "confirm_courier2_delivery_effect",
         confirm_courier2_delivery_effect,
     )
+
+    from domains.courier.core.deliver import handle_core_outbox
+
+    set_outbox_handler(handle_core_outbox)

@@ -2,20 +2,31 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from fsm_platform.core.remote import RemoteRef
 from fsm_platform.core.types import InstanceDict, RuntimeContext
 
 
+def _payload_as_dict(raw: Any) -> dict[str, Any]:
+    """MySQL JSON часто приходит str — для Contract API нужен object."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
 def instance_to_contract(instance: InstanceDict) -> dict[str, Any]:
     """Snapshot instance для тела Contract API (FsmInstance)."""
-    payload = instance.get("payload_json")
-    if payload is None:
-        payload = {}
     out: dict[str, Any] = {
         "service_id": str(instance.get("service_id") or ""),
-        "payload_json": payload if isinstance(payload, dict) else {},
+        "payload_json": _payload_as_dict(instance.get("payload_json")),
     }
     for key in (
         "id",
@@ -106,11 +117,12 @@ def call_on_failed(
     instance: InstanceDict,
     last_error: str,
     process_name: str,
-) -> None:
+) -> dict[str, Any]:
     from fsm_platform.host.contract_client import get_contract_client
 
-    get_contract_client(ref.service_id).call_on_failed(
+    data = get_contract_client(ref.service_id).call_on_failed(
         process_name,
         instance=instance_to_contract(instance),
         last_error=last_error or "",
     )
+    return data if isinstance(data, dict) else {}

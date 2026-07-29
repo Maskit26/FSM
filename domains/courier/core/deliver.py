@@ -1,11 +1,11 @@
-"""Outbox consumer: выполнить Core op и обновить mapping."""
+"""Outbox consumer: выполнить Core op и обновить mapping (domain service)."""
 
 from __future__ import annotations
 
 import logging
 from typing import Any, Optional
 
-from fsm_platform.host.engines import domain_session
+from fsm_platform.domain_runtime.session import domain_session
 
 from domains.courier import db_layer
 from domains.courier.core import client as core_client
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def handle_core_outbox(payload: dict[str, Any]) -> None:
-    """Вызывается из outbox_worker при channel=core|http_external."""
+    """Вызывается из domain_runtime при POST /contract/v1/outbox/deliver."""
     op = str(payload.get("op") or "").strip()
     if not op:
         raise CoreError("CORE_OP_REQUIRED", "payload.op required")

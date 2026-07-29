@@ -39,6 +39,10 @@ class EffectResult:
     ok: bool = True
     error: Optional[str] = None
     payload: Optional[dict[str, Any]] = None
+    # Декларативные platform side-effects (применяет платформа, не домен)
+    notify: Optional[list[dict[str, Any]]] = None
+    cancel_instances: Optional[list[dict[str, Any]]] = None
+    entity_states: Optional[list[dict[str, Any]]] = None
 
 
 # on_failed handler — только в domain service (ProcessDef.on_failed → RemoteRef на platform)
@@ -140,9 +144,15 @@ def normalize_effect_result(value: Any) -> EffectResult:
     if isinstance(value, bool):
         return EffectResult(ok=value, error=None if value else "effect_returned_false")
     if isinstance(value, dict):
+        notify = value.get("notify")
+        cancel = value.get("cancel_instances")
+        states = value.get("entity_states")
         return EffectResult(
             ok=bool(value.get("ok", True)),
             error=value.get("error"),
             payload=value.get("payload"),
+            notify=list(notify) if isinstance(notify, list) else None,
+            cancel_instances=list(cancel) if isinstance(cancel, list) else None,
+            entity_states=list(states) if isinstance(states, list) else None,
         )
     return EffectResult(ok=True)

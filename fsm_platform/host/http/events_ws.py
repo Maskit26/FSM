@@ -84,6 +84,7 @@ def _invoke_operation(
         raise LookupError(f"UNKNOWN_OPERATION: {operation}")
     result = request_runtime.run_operation(
         service_id,
+        operation,
         meta["handler"],
         meta["kind"],
         params,

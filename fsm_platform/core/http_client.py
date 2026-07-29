@@ -391,18 +391,3 @@ def call_api(
 
     assert last_err is not None
     raise last_err
-
-
-# alias для доменов, привыкших к имени json=
-def call_api_json(
-    credential_key: str,
-    method: str,
-    path: str,
-    *,
-    json: Any = None,
-    **kwargs: Any,
-) -> ApiResponse:
-    """То же что call_api, параметр json= вместо json_body=."""
-    return call_api(
-        credential_key, method, path, json_body=json, **kwargs
-    )

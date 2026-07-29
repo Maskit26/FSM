@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from typing import Any, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
@@ -97,14 +96,16 @@ def deliver_one(row: dict[str, Any]) -> None:
             return
 
         if channel in ("core", "http_external"):
-            # Vendor-семантика в домене; platform только роутит outbox.
-            # destination = credential key hint (CORE); payload.op обязателен.
-            from domains.courier.core.deliver import handle_core_outbox
+            # Vendor-логика в domain service; platform только роутит outbox.
+            from fsm_platform.host.contract_client import get_contract_client
 
+            if not service_id:
+                raise RuntimeError("SERVICE_ID_REQUIRED_FOR_CORE_OUTBOX")
             body = dict(payload)
             if destination and not body.get("credential_key"):
                 body["credential_key"] = destination
-            handle_core_outbox(body)
+            body.setdefault("service_id", service_id)
+            get_contract_client(service_id).call_outbox_deliver(body)
             return
 
         raise RuntimeError(f"UNSUPPORTED_CHANNEL:{channel}")
@@ -181,17 +182,3 @@ def process_one(*, batch_size: int = 10, service_id: Optional[str] = None) -> bo
         finally:
             sp2.close()
     return True
-
-
-def run_loop(
-    poll_seconds: float = 1.0, *, service_id: Optional[str] = None
-) -> None:
-    """Опциональный standalone-цикл outbox (обычно вызывается из fsm_worker)."""
-    logger.info(
-        "outbox-only loop started%s",
-        f" service_id={service_id}" if service_id else "",
-    )
-    while True:
-        worked = process_one(service_id=service_id)
-        if not worked:
-            time.sleep(poll_seconds)

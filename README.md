@@ -30,23 +30,21 @@
 ## Быстрый старт
 
 ```bash
-# schema
-mysql … < sql/platform/001_platform_schema.sql
+# schema (platform DB)
+mysql … < database/sql/platform/001_platform_schema.sql
 
 # env
-set PLATFORM_DATABASE_URL=mysql+mysqlconnector://...
-set DOMAIN_GRAPH_DATABASE_URL=mysql+mysqlconnector://...
-set DOMAIN_GRAPH_WRITE_DATABASE_URL=mysql+mysqlconnector://...
-set SERVICE_ID=svc_courier_01
-set CONTRACT_BASE_URL=http://127.0.0.1:8100
-set CONTRACT_SHARED_SECRET=...
+# platform: .env (см. .env.example)
+# domain: domains/courier/.env (см. domains/courier/.env.example)
+# tenant secrets: domain_services + domain_secrets (admin PUT /v1/{service_id}/secrets)
 
-# Platform стартует без domain service; invoke/FSM для tenant — когда catalog загружен
+# domain service
+uvicorn domains.courier.main:app --host 127.0.0.1 --port 8100
 
-# API
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+# platform API
+uvicorn main:app --host 127.0.0.1 --port 8000
 
-# worker (FSM + outbox/Telegram)
+# worker (WORKER_SERVICE_ID в .env процесса)
 python fsm_worker.py
 ```
 
@@ -58,8 +56,8 @@ python fsm_worker.py
 3. Пользователь открывает ссылку → бот получает `/start` с payload → пишется `telegram_chat_id`.
 4. Прогресс заказа: effect → `platform_outbox` → `fsm_worker` → Bot API.
 5. Шаблоны: `domains/courier/notifications.py`.  
-   Секреты: `domain_secrets` (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, опц. `TELEGRAM_LINK_SECRET`) или env fallback.  
-   Dev без сети: `TELEGRAM_DRY_RUN=1`.
+   Секреты арендатора: `domain_secrets` (`TELEGRAM_BOT_TOKEN`, …).  
+   Dev без сети: `TELEGRAM_DRY_RUN=1` (process-wide в platform `.env`).
 
 ## Тесты без БД
 

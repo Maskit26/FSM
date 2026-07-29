@@ -70,44 +70,62 @@ def _service_env_suffix(service_id: str) -> str:
 
 def resolve_contract_config(service_id: str) -> ContractConfig:
     """
-    Конфиг remote-домена для service_id.
-    base_url: CONTRACT_BASE_URL_{SVC} → CONTRACT_BASE_URL
-    secret: CONTRACT_SECRET_{SVC} → CONTRACT_SHARED_SECRET
-            → domain_secrets key contract_shared_secret (Fernet)
+    Конфиг remote-домена для service_id (из domain_secrets арендатора).
+
+    Ключи:
+      contract_base_url
+      contract_shared_secret
+
+    Legacy env (warning): CONTRACT_BASE_URL[_SVC], CONTRACT_SHARED_SECRET / CONTRACT_SECRET_SVC.
     """
     sid = str(service_id or "").strip()
     if not sid:
         raise ContractError("SERVICE_ID_REQUIRED", "service_id is empty")
 
-    suf = _service_env_suffix(sid)
-    base = (
-        os.environ.get(f"CONTRACT_BASE_URL_{suf}", "").strip()
-        or os.environ.get("CONTRACT_BASE_URL", "").strip()
-    ).rstrip("/")
+    from fsm_platform.host.tenant_config import (
+        SECRET_CONTRACT_BASE_URL,
+        SECRET_CONTRACT_SHARED_SECRET,
+        resolve_tenant_ref,
+    )
+
+    base = (resolve_tenant_ref(sid, SECRET_CONTRACT_BASE_URL) or "").rstrip("/")
+    if not base:
+        suf = _service_env_suffix(sid)
+        base = (
+            os.environ.get(f"CONTRACT_BASE_URL_{suf}", "").strip()
+            or os.environ.get("CONTRACT_BASE_URL", "").strip()
+        ).rstrip("/")
+        if base:
+            logger.warning(
+                "contract_base_url for %s from process env — "
+                "migrate to domain_secrets.%s",
+                sid,
+                SECRET_CONTRACT_BASE_URL,
+            )
     if not base:
         raise ContractError(
             "CONTRACT_BASE_URL_MISSING",
-            f"set CONTRACT_BASE_URL or CONTRACT_BASE_URL_{suf}",
+            f"set domain_secrets.{SECRET_CONTRACT_BASE_URL} for {sid}",
         )
 
-    secret = (
-        os.environ.get(f"CONTRACT_SECRET_{suf}", "").strip()
-        or os.environ.get("CONTRACT_SHARED_SECRET", "").strip()
-    )
+    secret = resolve_tenant_ref(sid, SECRET_CONTRACT_SHARED_SECRET) or ""
     if not secret:
-        try:
-            from fsm_platform.host.runtime_context import service_scope
-            from fsm_platform.host.secrets import get_domain_secret
-
-            with service_scope(sid):
-                secret = (get_domain_secret("contract_shared_secret") or "").strip()
-        except Exception:
-            secret = ""
+        suf = _service_env_suffix(sid)
+        secret = (
+            os.environ.get(f"CONTRACT_SECRET_{suf}", "").strip()
+            or os.environ.get("CONTRACT_SHARED_SECRET", "").strip()
+        )
+        if secret:
+            logger.warning(
+                "contract_shared_secret for %s from process env — "
+                "migrate to domain_secrets.%s",
+                sid,
+                SECRET_CONTRACT_SHARED_SECRET,
+            )
     if not secret:
         raise ContractError(
             "CONTRACT_SECRET_MISSING",
-            f"set CONTRACT_SHARED_SECRET or CONTRACT_SECRET_{suf} "
-            f"or domain_secrets.contract_shared_secret",
+            f"set domain_secrets.{SECRET_CONTRACT_SHARED_SECRET} for {sid}",
         )
 
     return ContractConfig(service_id=sid, base_url=base, secret=secret)
@@ -148,6 +166,10 @@ def _parse_error_body(text: str) -> tuple[str, str]:
     except json.JSONDecodeError:
         return "CONTRACT_HTTP_ERROR", text[:300]
     if isinstance(data, dict):
+        # FastAPI HTTPException: {"detail": {"error_code": "...", "message": "..."}}
+        detail = data.get("detail")
+        if isinstance(detail, dict):
+            data = detail
         code = str(data.get("error_code") or data.get("code") or "CONTRACT_HTTP_ERROR")
         msg = str(data.get("message") or data.get("detail") or text[:300])
         return code, msg
@@ -316,14 +338,61 @@ class ContractClient:
         *,
         instance: dict[str, Any],
         last_error: str,
-    ) -> None:
+    ) -> dict[str, Any]:
         body = {"instance": instance, "last_error": last_error}
-        self._request(
+        data = self._request(
             "POST",
             f"{CONTRACT_PREFIX}/processes/{process_name}/on-failed",
             json_body=body,
             timeout=_DEFAULT_COMMAND_QUERY_TIMEOUT,
         )
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise ContractError(
+                "ON_FAILED_INVALID", f"{process_name}: expected object"
+            )
+        return data
+
+    def call_hook(
+        self,
+        channel: str,
+        *,
+        body: Any = None,
+        headers: Optional[dict[str, str]] = None,
+        query: Optional[dict[str, str]] = None,
+        raw_body_b64: Optional[str] = None,
+    ) -> dict[str, Any]:
+        ch = str(channel or "").strip().lower()
+        payload = {
+            "body": body,
+            "headers": headers or {},
+            "query": query or {},
+            "raw_body_b64": raw_body_b64,
+        }
+        data = self._request(
+            "POST",
+            f"{CONTRACT_PREFIX}/hooks/{ch}",
+            json_body=payload,
+            timeout=_DEFAULT_COMMAND_QUERY_TIMEOUT,
+        )
+        if not isinstance(data, dict):
+            raise ContractError("HOOK_INVALID", f"{ch}: expected object")
+        return data
+
+    def call_outbox_deliver(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Domain executes vendor outbox op (channel=core, …)."""
+        data = self._request(
+            "POST",
+            f"{CONTRACT_PREFIX}/outbox/deliver",
+            json_body={"payload": dict(payload or {})},
+            timeout=float(os.environ.get("CONTRACT_TIMEOUT_OUTBOX", "30")),
+        )
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            raise ContractError("OUTBOX_DELIVER_INVALID", "expected object")
+        return data
 
     def _request(
         self,
@@ -425,8 +494,3 @@ def get_contract_client(service_id: str) -> ContractClient:
     if sid not in _client_cache:
         _client_cache[sid] = ContractClient(resolve_contract_config(sid))
     return _client_cache[sid]
-
-
-def clear_contract_clients() -> None:
-    """Сброс кэша (тесты)."""
-    _client_cache.clear()

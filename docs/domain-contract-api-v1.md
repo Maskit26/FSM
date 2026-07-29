@@ -53,8 +53,8 @@
 ### Секрет
 
 - Один shared secret на пару `(platform, service_id)` в v1.
-- Хранится на платформе зашифрованно (`domain_services.contract_secret_enc`).
-- На домене — `CONTRACT_SHARED_SECRET` в `.env` доменного сервиса (без `PLATFORM_*` переменных).
+- Хранится на платформе в `domain_secrets` под ключом `contract_shared_secret` (Fernet).
+- На домене — `CONTRACT_SHARED_SECRET` в `.env` доменного сервиса.
 
 ### Ответы домена
 
@@ -166,6 +166,11 @@ Snapshot строки `server_fsm_instances` + runtime-поля для guards/ef
 | `ok` | boolean | Успех effect |
 | `error` | string \| null | Текст ошибки при `ok: false` |
 | `payload` | object \| null | Доп. данные |
+| `notify` | array \| omit | Декларации outbox: `{channel, destination, event_type, payload, idempotency_key}` — **применяет платформа** |
+| `cancel_instances` | array \| omit | Отмена PENDING: `{process_name, payload_match, except_instance_id?, last_error?}` |
+| `entity_states` | array \| omit | UPSERT `entity_fsm_state`: `{entity_type, entity_id, state}` |
+
+Домен **не** пишет в platform DB и **не** вызывает HTTP callback на платформу. Side-effects только в ответе; платформа применяет их в своей транзакции после успешного Contract call.
 
 **Семантика commit:** домен **коммитит** domain DB транзакцию **до** ответа `200` на effects, commands и `on-failed`. Платформа коммитит platform DB отдельно (dual-commit + reconcile при сбое).
 
@@ -198,7 +203,7 @@ Snapshot строки `server_fsm_instances` + runtime-поля для guards/ef
   "guards": ["can_assign_executor"],
   "effects": ["assign_executor_effect"],
   "context_builders": ["build_order_context"],
-  "hooks": ["telegram"]
+  "hooks": []
 }
 ```
 
@@ -210,7 +215,7 @@ Snapshot строки `server_fsm_instances` + runtime-поля для guards/ef
 | `processes[]` | FSM-процессы платформы |
 | `processes[].on_failed` | `true` если зарегистрирован recovery handler |
 | `guards` / `effects` / `context_builders` | Имена для валидации графа |
-| `hooks` | Декларативно (telegram и т.д.) |
+| `hooks` | Имена optional generic inbound handlers |
 
 ---
 
@@ -381,12 +386,56 @@ Recovery после терминального `FAILED` instance.
 **Response 200:**
 
 ```json
-{}
+{
+  "entity_states": [
+    {"entity_type": "locker", "entity_id": 7, "state": "locker_free"}
+  ],
+  "cancel_instances": [
+    {
+      "process_name": "locker_reserve",
+      "payload_match": {"request_id": 42},
+      "except_instance_id": 100,
+      "last_error": "SIBLING_RESERVE_FAILED"
+    }
+  ]
+}
 ```
 
-Ack. Domain recovery logic committed in domain DB.
+Domain recovery committed in domain DB; `entity_states` / `cancel_instances` / `notify` применяет платформа.
 
 Если для процесса `on_failed: false` в catalog — домен отвечает **404**.
+
+---
+
+### 8. `POST /contract/v1/hooks/{channel}`
+
+Generic inbound delivery. Используется только если домен зарегистрировал handler с таким `channel`.
+
+```json
+{
+  "body": {},
+  "headers": {},
+  "query": {},
+  "raw_body_b64": ""
+}
+```
+
+Не относится к Telegram input платформы: Telegram обслуживается `/input/telegram/{service_id}/webhook`.
+
+---
+
+### 9. `POST /contract/v1/outbox/deliver`
+
+Асинхронная доставка сторонней интеграции в зарегистрированный domain outbox-handler.
+
+```json
+{
+  "payload": {
+    "credential_key": "PARTNER_API",
+    "event_type": "order.created"
+  }
+}
+```
 
 ---
 
@@ -399,6 +448,8 @@ Ack. Domain recovery logic committed in domain DB.
 | command | 10s | network / 503 → `CONTRACT_UNAVAILABLE`, retryable |
 | query | 10s | network / 503 |
 | on-failed | 10s | network / 503 |
+| hook | 10s | network / 503 |
+| outbox deliver | 30s (`CONTRACT_TIMEOUT_OUTBOX`) | network / 503 |
 
 Backoff — из `fsm_platform.host.retry_policy`.
 
@@ -410,19 +461,19 @@ Backoff — из `fsm_platform.host.retry_policy`.
 
 ## Чеклист реализации (courier pilot)
 
-- [ ] FastAPI app с эндпоинтами 1–7
-- [ ] HMAC middleware на все `/contract/v1/*`
-- [ ] Catalog собран из `processes.register_all` metadata (или статический JSON на старте)
-- [ ] Context builders: JSON-safe values
-- [ ] Commands/queries: без доступа к platform session (`db.get("platform")`)
-- [ ] Effects/commands/on-failed: commit domain session before 200
+- [x] FastAPI app с эндпоинтами 1–9
+- [x] HMAC middleware на Contract endpoints; `GET /catalog` — bootstrap exception
+- [x] Catalog собран из `processes.register_all` metadata
+- [x] Context builders возвращают JSON-safe values
+- [x] Commands/queries исполняются без переданной platform session
+- [x] Effects/commands/on-failed commit domain session before 200
 
 ## Связанные файлы (platform)
 
 | Файл | Роль |
 |------|------|
 | `fsm_platform/host/contract_client.py` | HTTP-клиент (часть 4 плана) |
-| `domains/bootstrap.py` | Загрузка catalog для remote |
+| `fsm_platform/host/domain_bootstrap.py` | Загрузка catalog для remote |
 | `fsm_platform/host/http/request_runtime.py` | Обработка command result |
 | `fsm_platform/core/types.py` | GuardResult, EffectResult, ProcessDef |
 

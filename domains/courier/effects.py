@@ -9,7 +9,8 @@ from typing import Any, Optional
 from fsm_platform.core.types import EffectResult
 
 from domains.courier import db_layer
-from domains.courier.notifications import enqueue_order_progress_notifications
+from domains.courier.core.enqueue import core_notify
+from domains.courier.notifications import build_order_progress_notifications
 
 logger = logging.getLogger(__name__)
 
@@ -45,36 +46,44 @@ def _service_id(instance: dict[str, Any]) -> str:
     return str(instance.get("service_id") or "svc_courier_01")
 
 
-def _enqueue_core(
-    db,
+def _core(
     *,
     op: str,
     payload: dict[str, Any],
     idempotency_key: str,
     service_id: str,
-) -> Optional[str]:
-    """None = ok; иначе error code если нет platform session."""
-    from domains.courier.core.enqueue import enqueue_core
+) -> dict[str, Any]:
+    return core_notify(
+        op=op,
+        payload=payload,
+        idempotency_key=idempotency_key,
+        service_id=service_id,
+    )
 
+
+def _order_notify(
+    session_domain,
+    instance: dict[str, Any],
+    *,
+    order_id: int,
+    to_state: str,
+    courier_user_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
     try:
-        enqueue_core(
-            db,
-            op=op,
-            payload=payload,
-            idempotency_key=idempotency_key,
-            service_id=service_id,
+        return build_order_progress_notifications(
+            session_domain,
+            order_id=int(order_id),
+            to_state=str(to_state),
+            instance_id=int(instance["id"]) if instance.get("id") else None,
+            courier_user_id=courier_user_id,
         )
-    except ValueError as exc:
-        logger.error("core enqueue failed: %s", exc)
-        return "PLATFORM_SESSION_REQUIRED_FOR_CORE"
     except Exception:
-        logger.exception("core enqueue failed op=%s", op)
-        return f"CORE_ENQUEUE_FAILED:{op}"
-    return None
-
-
-def _core_role_for_leg(leg: str) -> str:
-    return "courier1" if leg == "pickup" else "courier2"
+        logger.exception(
+            "order progress notify build failed order_id=%s state=%s",
+            order_id,
+            to_state,
+        )
+        return []
 
 
 def _cas_order_status(
@@ -93,32 +102,8 @@ def _cas_order_status(
     return None
 
 
-def _notify_order_progress(
-    session_domain,
-    db,
-    instance: dict[str, Any],
-    *,
-    order_id: int,
-    to_state: str,
-    courier_user_id: Optional[int] = None,
-) -> None:
-    """Best-effort enqueue TG; ошибки не валят effect."""
-    try:
-        enqueue_order_progress_notifications(
-            session_domain,
-            db,
-            order_id=int(order_id),
-            to_state=str(to_state),
-            service_id=_service_id(instance),
-            instance_id=int(instance["id"]) if instance.get("id") else None,
-            courier_user_id=courier_user_id,
-        )
-    except Exception:
-        logger.exception(
-            "order progress notify failed order_id=%s state=%s",
-            order_id,
-            to_state,
-        )
+def _core_role_for_leg(leg: str) -> str:
+    return "courier1" if leg == "pickup" else "courier2"
 
 
 def sync_order_status(session_domain, db, context, instance, effect_params) -> EffectResult:
@@ -139,15 +124,18 @@ def sync_order_status(session_domain, db, context, instance, effect_params) -> E
     cas_err = _cas_order_status(session_domain, order_id, str(to_state), context)
     if cas_err:
         return EffectResult(ok=False, error=cas_err)
-    _notify_order_progress(
+    notify = _order_notify(
         session_domain,
-        db,
         instance,
         order_id=order_id,
         to_state=str(to_state),
         courier_user_id=_executor_id(instance),
     )
-    return EffectResult(ok=True, payload={"order_id": order_id, "status": to_state})
+    return EffectResult(
+        ok=True,
+        payload={"order_id": order_id, "status": to_state},
+        notify=notify or None,
+    )
 
 
 def confirm_courier2_delivery_effect(
@@ -164,34 +152,33 @@ def confirm_courier2_delivery_effect(
 
     executor_id = _executor_id(instance)
     sid = _service_id(instance)
+    notify = list(result.notify or [])
     if executor_id:
-        err = _enqueue_core(
-            db,
-            op="complete_suborder",
-            payload={
-                "local_order_id": order_id,
-                "performer_local_user_id": int(executor_id),
-                "role": "courier2",
-            },
-            idempotency_key=f"core:complete_sub:{order_id}:courier2",
+        notify.append(
+            _core(
+                op="complete_suborder",
+                payload={
+                    "local_order_id": order_id,
+                    "performer_local_user_id": int(executor_id),
+                    "role": "courier2",
+                },
+                idempotency_key=f"core:complete_sub:{order_id}:courier2",
+                service_id=sid,
+            )
+        )
+    notify.append(
+        _core(
+            op="complete_main",
+            payload={"local_order_id": order_id},
+            idempotency_key=f"core:complete_main:{order_id}",
             service_id=sid,
         )
-        if err:
-            return EffectResult(ok=False, error=err)
-    err = _enqueue_core(
-        db,
-        op="complete_main",
-        payload={"local_order_id": order_id},
-        idempotency_key=f"core:complete_main:{order_id}",
-        service_id=sid,
     )
-    if err:
-        return EffectResult(ok=False, error=err)
 
     payload = dict(result.payload or {})
     payload["delivery_code_used"] = True
     payload["core_enqueued"] = True
-    return EffectResult(ok=True, payload=payload)
+    return EffectResult(ok=True, payload=payload, notify=notify or None)
 
 
 def assign_executor_effect(session_domain, db, context, instance, effect_params) -> EffectResult:
@@ -229,27 +216,24 @@ def assign_executor_effect(session_domain, db, context, instance, effect_params)
         return EffectResult(ok=False, error=cas_err)
 
     role = _core_role_for_leg(leg)
-    err = _enqueue_core(
-        db,
-        op="assign_executor",
-        payload={
-            "local_order_id": order_id,
-            "performer_local_user_id": int(executor_id),
-            "role": role,
-        },
-        idempotency_key=f"core:assign:{order_id}:{role}:{int(executor_id)}",
-        service_id=_service_id(instance),
-    )
-    if err:
-        return EffectResult(ok=False, error=err)
-
-    _notify_order_progress(
+    notify = _order_notify(
         session_domain,
-        db,
         instance,
         order_id=order_id,
         to_state=str(to_state),
         courier_user_id=int(executor_id),
+    )
+    notify.append(
+        _core(
+            op="assign_executor",
+            payload={
+                "local_order_id": order_id,
+                "performer_local_user_id": int(executor_id),
+                "role": role,
+            },
+            idempotency_key=f"core:assign:{order_id}:{role}:{int(executor_id)}",
+            service_id=_service_id(instance),
+        )
     )
     return EffectResult(
         ok=True,
@@ -260,6 +244,7 @@ def assign_executor_effect(session_domain, db, context, instance, effect_params)
             "executor_user_id": int(executor_id),
             "core_enqueued": True,
         },
+        notify=notify,
     )
 
 
@@ -299,19 +284,18 @@ def remove_executor_effect(session_domain, db, context, instance, effect_params)
         return EffectResult(ok=False, error=cas_err)
 
     role = _core_role_for_leg(leg)
-    err = _enqueue_core(
-        db,
-        op="remove_performer",
-        payload={
-            "local_order_id": order_id,
-            "performer_local_user_id": int(executor_id),
-            "role": role,
-        },
-        idempotency_key=f"core:remove:{order_id}:{role}:{int(executor_id)}",
-        service_id=_service_id(instance),
-    )
-    if err:
-        return EffectResult(ok=False, error=err)
+    notify = [
+        _core(
+            op="remove_performer",
+            payload={
+                "local_order_id": order_id,
+                "performer_local_user_id": int(executor_id),
+                "role": role,
+            },
+            idempotency_key=f"core:remove:{order_id}:{role}:{int(executor_id)}",
+            service_id=_service_id(instance),
+        )
+    ]
 
     return EffectResult(
         ok=True,
@@ -322,6 +306,7 @@ def remove_executor_effect(session_domain, db, context, instance, effect_params)
             "executor_user_id": int(executor_id),
             "core_enqueued": True,
         },
+        notify=notify,
     )
 
 
@@ -347,9 +332,8 @@ def open_cell_effect(session_domain, db, context, instance, effect_params) -> Ef
     cas_err = _cas_order_status(session_domain, order_id, str(to_state), ctx)
     if cas_err:
         return EffectResult(ok=False, error=cas_err)
-    _notify_order_progress(
+    notify = _order_notify(
         session_domain,
-        db,
         instance,
         order_id=order_id,
         to_state=str(to_state),
@@ -363,6 +347,7 @@ def open_cell_effect(session_domain, db, context, instance, effect_params) -> Ef
             "cell_id": ctx.get("cell_id"),
             "status": to_state,
         },
+        notify=notify or None,
     )
 
 
@@ -380,24 +365,28 @@ def close_cell_effect(session_domain, db, context, instance, effect_params) -> E
     to_state = str((result.payload or {}).get("status") or "")
     order_id = int(instance["entity_id"])
     executor_id = _executor_id(instance)
+    notify = list(result.notify or [])
 
     if to_state == "order_parcel_confirmed" and executor_id:
-        err = _enqueue_core(
-            db,
-            op="complete_suborder",
-            payload={
-                "local_order_id": order_id,
-                "performer_local_user_id": int(executor_id),
-                "role": "courier1",
-            },
-            idempotency_key=f"core:complete_sub:{order_id}:courier1",
-            service_id=_service_id(instance),
+        notify.append(
+            _core(
+                op="complete_suborder",
+                payload={
+                    "local_order_id": order_id,
+                    "performer_local_user_id": int(executor_id),
+                    "role": "courier1",
+                },
+                idempotency_key=f"core:complete_sub:{order_id}:courier1",
+                service_id=_service_id(instance),
+            )
         )
-        if err:
-            return EffectResult(ok=False, error=err)
 
     if to_state != "order_parcel_confirmed":
-        return result
+        return EffectResult(
+            ok=True,
+            payload=result.payload,
+            notify=notify or None,
+        )
 
     direction_id, err_bind = db_layer.bind_order_to_direction(session_domain, order_id)
     if err_bind:
@@ -406,7 +395,7 @@ def close_cell_effect(session_domain, db, context, instance, effect_params) -> E
     payload = dict(result.payload or {})
     payload["direction_id"] = direction_id
     payload["core_enqueued"] = bool(executor_id)
-    return EffectResult(ok=True, payload=payload)
+    return EffectResult(ok=True, payload=payload, notify=notify or None)
 
 
 def sync_locker_cell_status(
@@ -579,39 +568,39 @@ def sync_trip_status(
             order_ids = []
 
     sid = _service_id(instance)
+    notify: list[dict[str, Any]] = []
     if driver_id and order_ids:
         if str(to_state) == "trip_in_progress":
             for oid in order_ids:
-                err = _enqueue_core(
-                    db,
-                    op="assign_executor",
-                    payload={
-                        "local_order_id": int(oid),
-                        "performer_local_user_id": int(driver_id),
-                        "role": "driver",
-                    },
-                    idempotency_key=f"core:assign:{oid}:driver:{int(driver_id)}",
-                    service_id=sid,
+                notify.append(
+                    _core(
+                        op="assign_executor",
+                        payload={
+                            "local_order_id": int(oid),
+                            "performer_local_user_id": int(driver_id),
+                            "role": "driver",
+                        },
+                        idempotency_key=f"core:assign:{oid}:driver:{int(driver_id)}",
+                        service_id=sid,
+                    )
                 )
-                if err:
-                    return EffectResult(ok=False, error=err)
         elif str(to_state) == "trip_completed":
             for oid in order_ids:
-                err = _enqueue_core(
-                    db,
-                    op="complete_suborder",
-                    payload={
-                        "local_order_id": int(oid),
-                        "performer_local_user_id": int(driver_id),
-                        "role": "driver",
-                    },
-                    idempotency_key=f"core:complete_sub:{oid}:driver",
-                    service_id=sid,
+                notify.append(
+                    _core(
+                        op="complete_suborder",
+                        payload={
+                            "local_order_id": int(oid),
+                            "performer_local_user_id": int(driver_id),
+                            "role": "driver",
+                        },
+                        idempotency_key=f"core:complete_sub:{oid}:driver",
+                        service_id=sid,
+                    )
                 )
-                if err:
-                    return EffectResult(ok=False, error=err)
 
     return EffectResult(
         ok=True,
         payload={"trip_id": trip_id, "status": str(to_state)},
+        notify=notify or None,
     )

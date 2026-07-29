@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from fsm_platform.host.auth import AuthError, auth_enabled, make_token, resolve_actor
-from domains.bootstrap import get_bootstrap_status, is_domain_ready
+from fsm_platform.host.domain_bootstrap import get_bootstrap_status, is_domain_ready
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.http.events_ws import router as events_ws_router
 from fsm_platform.host.hook_registry import (
@@ -22,7 +22,7 @@ from fsm_platform.host.operations import default_operation_registry
 from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.registry import default_process_registry
-from fsm_platform.host.engines import domain_session, graph_write_session, platform_session
+from fsm_platform.host.engines import graph_write_session, platform_session
 from fsm_platform.host.graph_version import publish_graph_version
 
 app = FastAPI(title="FSM Platform", version="0.1.0")
@@ -178,6 +178,7 @@ def invoke(
     try:
         result = request_runtime.run_operation(
             service_id,
+            body.operation,
             meta["handler"],
             meta["kind"],
             body.params,
@@ -555,11 +556,8 @@ async def inbound_hook(
     request: Request,
 ) -> dict[str, Any]:
     """
-    Generic inbound webhook от стороннего API (снаружи → внутрь).
-    Платформа только диспетчерит (service_id, channel) → handler домена.
-    Разбор payload / проверка подписи — в domain handler
-    (register: default_webhook_registry.register(service_id, channel, fn)).
-    Не путать с outbound POST …/webhooks (подписки клиентов на platform_events).
+    Inbound webhook от стороннего API → Domain Contract API (hooks/{channel}).
+    Платформа не открывает domain business DB.
     """
     import json
 
@@ -697,6 +695,33 @@ def delete_secret(
     if not ok:
         raise HTTPException(404, detail="SECRET_NOT_FOUND")
     return {"service_id": service_id, "key": key, "deleted": True}
+
+
+@app.post("/v1/admin/domains/{service_id}/reload")
+def admin_reload_domain(
+    service_id: str,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """
+    Admin: повторный bootstrap catalog domain service без рестарта platform.
+    Header: X-Admin-Token: <PLATFORM_ADMIN_TOKEN>
+    """
+    from fsm_platform.host.domain_bootstrap import get_bootstrap_status, reload_domain
+    from fsm_platform.host.domain_validator import DomainValidationError
+
+    _admin_or_raise(x_admin_token)
+    try:
+        return reload_domain(service_id)
+    except DomainValidationError as exc:
+        raise HTTPException(
+            502,
+            detail={
+                "error_code": "DOMAIN_BOOTSTRAP_FAILED",
+                "message": str(exc),
+                "report": exc.report.to_dict(),
+                "domain_bootstrap": get_bootstrap_status(service_id),
+            },
+        ) from exc
 
 
 @app.post("/input/telegram/{service_id}/webhook")

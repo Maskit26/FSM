@@ -1,4 +1,4 @@
-"""Планирование и отмена fsm_timers через db_layer. Не опрашивает и не срабатывает таймеры."""
+"""Планирование fsm_timers через db_layer. Не опрашивает и не срабатывает таймеры."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def schedule_timer(
     owner: str = "domain",
     db_layer: FsmDbLayer | None = None,
 ) -> int:
-    """Планирует отложенный запуск процесса в fsm_timers. Возвращает id таймера для последующей отмены или трассировки."""
+    """Планирует отложенный запуск процесса в fsm_timers. Возвращает id таймера."""
     db = db_layer or default_db_layer
     return db.insert_timer(
         session,
@@ -34,14 +34,3 @@ def schedule_timer(
         idempotency_key=idempotency_key,
         owner=owner,
     )
-
-
-def cancel_timer(
-    session: SessionLike,
-    timer_id: int,
-    db: Any = None,
-    db_layer: FsmDbLayer | None = None,
-) -> None:
-    """Отменяет запланированный таймер по id. Вызывается, когда отложенный процесс больше не нужен."""
-    layer = db_layer or default_db_layer
-    layer.cancel_timer(session, timer_id)

@@ -6,7 +6,7 @@ fsm_platform.core — декларативный FSM runtime (в специфи�
 
 from .engine import run_instance
 from .errors import FsmErrorCodes
-from .http_client import ApiResponse, ExternalApiError, call_api, call_api_json
+from .http_client import ApiResponse, ExternalApiError, call_api
 from .registry import (
     EffectRegistry,
     GuardRegistry,
@@ -18,7 +18,7 @@ from .registry import (
 from .db_layer import FsmDbLayer
 from .sagas import on_child_terminal, start_saga
 from .state_store import EntityStateStore
-from .timers import cancel_timer, schedule_timer
+from .timers import schedule_timer
 from .transition_executor import TransitionExecutor
 from .transition_repository import TransitionRepository
 from .transition_runner import TransitionRunner
@@ -36,7 +36,6 @@ __all__ = [
     "ApiResponse",
     "ExternalApiError",
     "call_api",
-    "call_api_json",
     "ProcessRegistry",
     "GuardRegistry",
     "EffectRegistry",
@@ -49,7 +48,6 @@ __all__ = [
     "TransitionExecutor",
     "TransitionRunner",
     "schedule_timer",
-    "cancel_timer",
     "start_saga",
     "on_child_terminal",
     "FsmResult",

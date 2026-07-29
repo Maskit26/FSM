@@ -10,7 +10,6 @@ from fsm_platform.core.http_client import (
     ApiResponse,
     ExternalApiError,
     call_api,
-    call_api_json,
 )
 from fsm_platform.core.timers import schedule_timer as _schedule_timer
 
@@ -130,7 +129,6 @@ __all__ = [
     "start_saga",
     "emit_event",
     "call_api",
-    "call_api_json",
     "ApiResponse",
     "ExternalApiError",
 ]
