@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+import os
+
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from fsm_platform.host.auth import AuthError, resolve_actor
@@ -40,6 +43,19 @@ app = FastAPI(
         {"name": "Domain API", "description": "DOMAIN_ADMIN_TOKEN protected API"},
         {"name": "Domain Input", "description": "Signed external integrations"},
     ],
+)
+
+_cors_origins = [
+    o.strip()
+    for o in str(os.environ.get("CORS_ORIGINS") or "http://localhost:3000").split(",")
+    if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 platform_router = APIRouter(
     tags=["Platform Admin"], dependencies=[Depends(require_platform_admin)]
