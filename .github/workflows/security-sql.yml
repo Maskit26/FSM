@@ -1,0 +1,24 @@
+name: security-sql
+
+on:
+  push:
+    paths:
+      - "fsm_platform/**"
+      - "tools/check_dynamic_sql.py"
+      - ".github/workflows/security-sql.yml"
+  pull_request:
+    paths:
+      - "fsm_platform/**"
+      - "tools/check_dynamic_sql.py"
+      - ".github/workflows/security-sql.yml"
+
+jobs:
+  dynamic-sql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scan for risky dynamic SQL
+        run: python tools/check_dynamic_sql.py

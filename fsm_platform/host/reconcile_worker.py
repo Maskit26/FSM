@@ -25,26 +25,43 @@ def _payload_dict(row: dict[str, Any]) -> dict[str, Any]:
 
 def dock_invoke_command(row: dict[str, Any]) -> None:
     """
-    Идемпотентный докат platform bootstrap после успешного invoke command.
+    Идемпотентный докат platform bootstrap / side-effects после успешного invoke.
     Запрещено: повторный HTTP-вызов domain command.
+
+    Поддерживает:
+      - command с entity_type → bootstrap (+ enqueue) + apply_declared;
+      - только notify / cancel_instances / entity_states → apply_declared.
     """
+    from fsm_platform.host.contract_side_effects import apply_declared, extract_declared
     from fsm_platform.host.http.request_runtime import _bootstrap_and_maybe_enqueue
 
     service_id = str(row["service_id"])
     payload = _payload_dict(row)
     result = payload.get("result")
     actor = payload.get("actor") or {}
-    if not isinstance(result, dict) or not result.get("entity_type"):
+    if not isinstance(result, dict):
+        return
+
+    has_entity = bool(result.get("entity_type"))
+    declared = extract_declared(result)
+    has_side_effects = bool(
+        declared["notify"]
+        or declared["cancel_instances"]
+        or declared["entity_states"]
+    )
+    if not has_entity and not has_side_effects:
         return
 
     sp = platform_session()
     sg = None
     try:
-        sg = graph_session(service_id)
-        _bootstrap_and_maybe_enqueue(sp, sg, service_id, result, actor=actor)
-        from fsm_platform.host.contract_side_effects import apply_declared
-
-        apply_declared(sp, service_id=service_id, data=result)
+        if has_entity:
+            sg = graph_session(service_id)
+            _bootstrap_and_maybe_enqueue(sp, sg, service_id, result, actor=actor)
+        if has_side_effects or has_entity:
+            # apply_declared is idempotent enough for notify inserts with keys;
+            # always re-run when entity bootstrap path ran (matches prior behavior).
+            apply_declared(sp, service_id=service_id, data=result)
         sp.commit()
     except Exception:
         sp.rollback()

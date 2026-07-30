@@ -105,6 +105,15 @@ def _invoke_needs_reconcile(result: dict[str, Any]) -> bool:
         return True
     if result.get("timers") or result.get("cancel_timers"):
         return True
+    from fsm_platform.host.contract_side_effects import extract_declared
+
+    declared = extract_declared(result)
+    if (
+        declared["notify"]
+        or declared["cancel_instances"]
+        or declared["entity_states"]
+    ):
+        return True
     return False
 
 
@@ -114,9 +123,16 @@ def _invoke_reconcile_transition_id(
     """Стабильный ключ для UNIQUE (instance_id, transition_id) invoke-reconcile."""
     import zlib
 
+    from fsm_platform.host.contract_side_effects import extract_declared
+
     entity_type = str(result.get("entity_type") or "")
     entity_id = int(result.get("entity_id") or 0)
-    key = f"invoke:{service_id}:{operation}:{entity_type}:{entity_id}"
+    declared = extract_declared(result)
+    se_fp = ",".join(
+        f"{k}:{len(declared[k])}"
+        for k in ("notify", "cancel_instances", "entity_states")
+    )
+    key = f"invoke:{service_id}:{operation}:{entity_type}:{entity_id}:{se_fp}"
     tid = zlib.crc32(key.encode("utf-8")) & 0x7FFFFFFF
     return tid or 1
 

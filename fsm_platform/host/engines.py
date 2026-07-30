@@ -21,7 +21,12 @@ _platform_sessionmaker: Optional[sessionmaker] = None
 
 
 def _default_engine_kwargs() -> dict[str, object]:
-    return {"pool_pre_ping": True, "pool_size": 1, "max_overflow": 0}
+    return {
+        "pool_pre_ping": True,
+        "pool_size": 1,
+        "max_overflow": 0,
+        "hide_parameters": True,
+    }
 
 
 def _engine_for_url(url: str, **engine_kwargs: object) -> tuple[Engine, sessionmaker]:
@@ -56,9 +61,8 @@ def get_platform_engine() -> Engine:
         url = os.environ.get("PLATFORM_DATABASE_URL") or os.environ.get("DATABASE_URL")
         if not url:
             raise RuntimeError("PLATFORM_DATABASE_URL (or DATABASE_URL) is not set")
-        _platform_engine = create_engine(
-            url, pool_pre_ping=True, pool_size=1, max_overflow=0
-        )
+        kwargs = _default_engine_kwargs()
+        _platform_engine = create_engine(url, **kwargs)  # type: ignore[arg-type]
         _platform_sessionmaker = sessionmaker(bind=_platform_engine, autoflush=False)
     return _platform_engine
 

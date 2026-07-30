@@ -463,7 +463,7 @@ Worker всегда стартует с `boot(service_id=WORKER_SERVICE_ID)` и 
 - `boot(service_id)` / `bootstrap_active_domains(service_id=…)` загружают только этот tenant.
 - `host/worker.run_loop` передаёт `service_id` в timers, schedules, instances, outbox и reconcile.
 - Claim выполняется только по этому `service_id`.
-- `host/worker_provisioner.py` — локальный lifecycle: start/stop/restart/status.
+- `host/worker_provisioner.py` — lifecycle: start/stop/restart/status.
 - `POST /v1/{service_id}/connect` после Validator/bootstrap вызывает `provision_worker`.
 - Tenant API: `GET …/worker/status`, `POST …/worker/restart|stop`.
 - При ошибке provisioning статус домена → `worker_failed`.
@@ -471,14 +471,35 @@ Worker всегда стартует с `boot(service_id=WORKER_SERVICE_ID)` и 
 | Правило | Смысл |
 |---------|--------|
 | 1 процесс = 1 tenant | Env процесса содержит ровно один `WORKER_SERVICE_ID` |
-| Один бинарь | Все воркеры запускают `python fsm_worker.py` |
+| Один бинарь | Все воркеры запускают `python fsm_worker.py` (или образ с тем же entry) |
 | Claim filter | `claim_*(..., service_id=WORKER_SERVICE_ID)` |
 | Tenant-scoped boot | `boot(service_id)` только своего tenant |
 | Fail-closed | Без `WORKER_SERVICE_ID` процесс не стартует |
 | Lifecycle | connect поднимает worker; tenant stop/restart управляет им |
 
-Дальнейшие backend-адаптеры (systemd / Docker / Kubernetes) могут заменить локальный
-subprocess launcher без смены модели `1 worker = 1 service_id`.
+#### Worker provisioner backends
+
+**Зачем.** Local `subprocess` удобен в dev (Platform API сам поднимает child), но в
+проде worker обычно ведёт systemd / Docker / Kubernetes. Сменные бэкенды —
+**расширение вариантов деплоя**, не обязанность: можно оставаться на `local`.
+
+**Как работает.** `WORKER_PROVISION_BACKEND` выбирает адаптер; публичный API
+модуля не меняется (`provision_worker` / `worker_status` / `stop_worker` /
+`restart_worker`). Модель `1 worker = 1 service_id` одинакова для всех.
+
+| Backend | Env | Поведение |
+|---------|-----|-----------|
+| `local` (default) | опц. `WORKER_PROVISION_COMMAND` | `Popen(fsm_worker.py)` у процесса API |
+| `systemd` | `WORKER_SYSTEMD_UNIT_TEMPLATE` (default `fsm-worker-{service_id}.service`) | `systemctl start/stop/is-active`; unit’ы ставятся отдельно |
+| `docker` | **`WORKER_DOCKER_IMAGE`** обязателен; опц. `WORKER_DOCKER_NETWORK` | контейнер `fsm-worker-{service_id}` |
+| `kubernetes` / `k8s` | `WORKER_K8S_NAMESPACE`, `WORKER_K8S_DEPLOYMENT_PREFIX` | `kubectl scale` Deployment 0↔1; манифесты — снаружи |
+
+**Ограничения.** systemd/docker/k8s предполагают, что unit/image/Deployment уже
+описаны в инфраструктуре; provisioner только управляет lifecycle. На Windows
+dev остаётся `local`.
+
+**Проверка.** Без смены env — `WORKER_PROVISION_BACKEND` пуст → local; connect в ЛК
+по-прежнему поднимает child process.
 
 ### 7.2. Entrypoint и цикл
 
@@ -548,9 +569,28 @@ Backoff instance: `5 × 3^(attempt-1)` секунд, максимум 900 сек
 4. отдельный Contract-вызов `on_failed` (если зарегистрирован)
 5. `apply_declared` для recovery-ответа
 
-Reconcile используется, когда domain commit уже произошёл, а platform commit не прошёл. `reconcile_worker` докатывает только platform state/log/events/side-effects и **не повторяет** domain command/effect.
+Reconcile используется, когда domain commit уже произошёл, а platform commit не прошёл.
+`reconcile_worker` докатывает только platform state/log/events/side-effects и **не повторяет**
+domain command/effect.
 
-Для sync invoke `_invoke_needs_reconcile` сейчас ставит reconcile только если ответ содержит `entity_type`, enqueue/enqueues/saga или timers/cancel_timers. Команда только с `notify` / `cancel_instances` / `entity_states` при сбое platform commit в invoke-reconcile пока не попадает — это известный пробел реализации.
+**Зачем side-effects-only reconcile.** Sync invoke может вернуть только
+`notify` / `cancel_instances` / `entity_states` без `entity_type`. Раньше
+`_invoke_needs_reconcile` такие ответы пропускал — при сбое platform commit
+outbox/cancel/state не докатывались.
+
+**Как работает сейчас.**
+
+1. `_invoke_needs_reconcile` (в `host/http/request_runtime.py`) = true, если есть
+   `entity_type`, enqueue/saga/timers **или** непустые
+   `notify` / `cancel_instances` / `entity_states`.
+2. При dual-commit fail → `enqueue_reconcile` с `kind: invoke_command` и полным
+   `result` (idempotent `transition_id` учитывает fingerprint длин side-effect списков).
+3. `dock_invoke_command` (`host/reconcile_worker.py`):
+   - с `entity_type` — bootstrap/enqueue + `apply_declared`;
+   - только side-effects — только `apply_declared` (без graph bootstrap);
+   - domain command **не** вызывается повторно.
+
+**Проверка.** `python -m unittest tests.test_invoke_reconcile_side_effects`.
 
 ### 7.6. Безопасность worker
 
@@ -558,41 +598,107 @@ Worker — доверенный процесс платформы, выделе�
 
 #### 7.6.1. Логи и маскирование секретов
 
-Обязательные требования:
+**Зачем.** Worker и Platform API пишут в stdout/файл traceback SQLAlchemy и драйвера.
+Без защиты туда попадают пароли JDBC URL, bind-параметры SQL и значения
+`PLATFORM_SECRETS_KEY` / токенов — риск при шаринге логов, CI-артефактах и
+компрометации хоста. Tenant не должен видеть raw SQL/traceback в HTTP-ответах.
 
-1. Не логировать исходные `PLATFORM_DATABASE_URL`, graph URLs, имена пользователей БД, host/database, токены, пароли и `PLATFORM_SECRETS_KEY`.
-2. В сообщениях использовать логические идентификаторы: `db_role=platform`, `db_role=graph`, `service_id`, operation/error code.
-3. Создавать SQLAlchemy engines с `hide_parameters=True`, чтобы SQL-параметры не попадали в SQLAlchemy logs/tracebacks.
-4. Если URL нужен во внутренней диагностике, использовать `make_url(url).render_as_string(hide_password=True)`; tenant-visible log не должен содержать также host/user/database.
-5. Добавить централизованный logging filter/structured-log processor для маскирования:
-   - URI вида `driver://user:password@host/database`;
-   - ключей `*_TOKEN`, `*_SECRET`, `*_PASSWORD`;
-   - значений `PLATFORM_DATABASE_URL`, `DOMAIN_DATABASE_URL`, graph URL;
-   - credential payload.
-6. Разделить internal platform logs и tenant-visible logs. Tenant получает `service_id`, instance id, operation и безопасный error code без SQL/traceback.
-7. HTTP-ответы и события не возвращают raw exception, SQL statement, bind parameters или stack trace.
+**Как работает.**
 
-`hide_parameters=True` и logging filter — **в разработке**; до их внедрения логи worker считаются внутренними и недоступными tenant.
+1. Все SQLAlchemy engines создаются с `hide_parameters=True`
+   (`host/engines.py`, `domain_runtime/session.py`). В тексте
+   `StatementError` параметры заменяются на
+   `[SQL parameters hidden due to hide_parameters=True]`.
+2. Центральный `logging.Filter` — `host/log_redaction.py` (`RedactingFilter`):
+   - маскирует URI вида `scheme://user:password@host/…`;
+   - маскирует пары `*_TOKEN` / `*_SECRET` / `*_PASSWORD` / `*_API_KEY`;
+   - подставляет `***` вместо значений из env (`PLATFORM_DATABASE_URL`,
+     `DOMAIN_DATABASE_URL`, `PLATFORM_SECRETS_KEY`, admin/contract/telegram secrets).
+3. Фильтр ставится при старте процесса:
+   - `fsm_worker.py` — сразу после `basicConfig`;
+   - `main.py` (Platform API) — аналогично.
+4. Для осознанной диагностики URL: `safe_db_url(url)` →
+   `make_url(…).render_as_string(hide_password=True)`.
+
+**Границы.** Redaction — best-effort для текста логов; не замена ACL на файлы
+логов и не tenant-visible audit API. Разделение internal vs tenant-facing
+каналов (п.6) и scrubbing всех HTTP `detail=str(exc)` — отдельные усиления.
+Логи worker по-прежнему считаются **внутренними** (не отдаются арендатору).
+
+**Проверка.** Unit: `python -m unittest tests.test_log_redaction`. Вручную:
+спровоцировать DB error на worker и убедиться, что в traceback нет пароля URL
+и plaintext `PLATFORM_SECRETS_KEY`.
+
+Обязательные правила (итог):
+
+1. Не логировать исходные DB URL, graph URLs, user/host/database, токены, пароли, `PLATFORM_SECRETS_KEY`.
+2. В сообщениях предпочитать `db_role=platform|graph`, `service_id`, operation/error code.
+3. Engines с `hide_parameters=True`.
+4. Диагностический URL — только через `safe_db_url` / `hide_password=True`.
+5. Центральный logging filter на URI / secret keys / env values / credential-like payloads.
+6. Tenant-visible ответы: `service_id`, instance id, operation, безопасный error code — без SQL/traceback.
+7. HTTP/events не возвращают raw exception, SQL, bind parameters или stack trace арендатору.
 
 #### 7.6.2. Защита от SQL injection
 
-Правила platform DB и graph SQL:
+**Зачем.** Platform/worker выполняют SQL к platform и graph DB. Конкатенация
+пользовательских значений в текст запроса → классический SQL injection.
+Правила ниже — обязательный стиль кода; CI ловит регрессии.
 
-1. Все значения передаются bind-параметрами (`:service_id`, `:instance_id`, …); f-string/конкатенация пользовательских значений в SQL запрещены.
-2. Имена таблиц, колонок, `ORDER BY` и SQL fragments нельзя получать напрямую из Contract/domain payload. Для динамических identifiers используется закрытый whitelist.
+**Правила platform DB и graph SQL:**
+
+1. Все значения — bind-параметры (`:service_id`, `:instance_id`, …); f-string/конкатенация пользовательских значений в SQL запрещены.
+2. Имена таблиц, колонок, `ORDER BY` и SQL fragments нельзя брать напрямую из Contract/domain payload. Для динамических identifiers — закрытый whitelist.
 3. Domain Contract не принимает и не передаёт произвольный SQL для выполнения платформой.
-4. DB user worker получает минимальные `SELECT`/`INSERT`/`UPDATE`/`DELETE` grants только на необходимые platform-таблицы; DDL/GRANT/FILE и административные privileges запрещены.
-5. Multi-statements отключены; platform DB доступна только во внутренней сети.
-6. Ошибки SQL преобразуются в безопасные platform error codes; текст драйвера остаётся только в защищённом внутреннем журнале после redaction.
-7. CI выполняет Semgrep/Bandit-проверки на SQL через f-string/конкатенацию и тесты с injection payload.
-8. Любой динамический SQL проходит отдельный code review.
+4. DB user worker: минимальные `SELECT`/`INSERT`/`UPDATE`/`DELETE` только на нужные таблицы; без DDL/GRANT/FILE.
+5. Multi-statements отключены; platform DB — только во внутренней сети.
+6. Ошибки SQL → безопасные platform error codes; текст драйвера — только во внутреннем журнале после redaction (§7.6.1).
+7. **CI:** workflow `.github/workflows/security-sql.yml` запускает
+   `python tools/check_dynamic_sql.py` на `fsm_platform/**`.
+   Скрипт ищет f-string / `+` / `%` / `.format` со строками, содержащими
+   `SELECT|INSERT|UPDATE|DELETE`. Локально: тот же команда из корня репо.
+   Известные безопасные места (whitelist колонок + bind params) перечисляются в
+   `tools/check_dynamic_sql.py` → `WHITELIST`; расширение whitelist — только после review.
+8. Любой новый динамический SQL — отдельный code review.
+
+**Проверка.** `python tools/check_dynamic_sql.py` → exit 0.
 
 #### 7.6.3. Ограничение последствий компрометации
 
-- `WORKER_SERVICE_ID` обеспечивает логическую tenant-фильтрацию, но MySQL grants не ограничивают строки таблицы по `service_id`.
-- Ближайшая модель: worker остаётся platform-owned, изолируется от domain process и получает только необходимый DB role.
-- Master `PLATFORM_SECRETS_KEY` должен быть заменён scoped Secret Broker/KMS: workload identity worker разрешает secrets только своего `service_id` (**в разработке**).
-- Усиленная изоляция: Internal Worker API без прямого DB URL либо отдельная schema/DB с отдельным DB user для tenant.
+**Зачем.** Один master `PLATFORM_SECRETS_KEY` на API и всех worker означает: утечка
+ключа с одного worker-хоста даёт расшифровку secrets **всех** tenant. Нужна
+модель, где dedicated worker (`WORKER_SERVICE_ID`) может unwrap только свой
+`service_id`.
+
+**Как работает (scoped Secret Broker).**
+
+1. Master KEK по-прежнему в process env: `PLATFORM_SECRETS_KEY` (Fernet key).
+2. Per-tenant DEK = HKDF-SHA256(KEK, info=`domain_secrets:{service_id}`) —
+   модуль `host/secret_broker.py`.
+3. Записи шифруются только в envelope `v2.{service_id}.{fernet_token}` (`wrap`).
+4. `unwrap(service_id, ciphertext)` принимает **только** этот формат: сверяет
+   `service_id` в envelope и расшифровывает tenant DEK. Иные blob’ы →
+   `SECRETS_CIPHER_INVALID` (без fallback на master Fernet).
+5. **Fail-closed worker:** если задан `WORKER_SERVICE_ID` и он ≠ запрашиваемый
+   `service_id` → `SECRETS_SCOPE_DENIED` (worker чужие secrets не читает).
+6. Platform API без `WORKER_SERVICE_ID` может CRUD/unwrap любого tenant
+   (онбординг, admin secrets API).
+7. Публичный API домена: `host/secrets.py` → broker; `service_id` из
+   `runtime_context`.
+
+После смены формата все ключи в `domain_secrets` нужно записать заново
+(`PUT /v1/{service_id}/secrets`) — старые ciphertext без префикса `v2.` не читаются.
+
+Это **dev/self-hosted broker**, не внешний AWS KMS: KEK всё ещё в env процесса.
+Внешний KMS / Internal Worker API без DB URL — дальнейшее усиление.
+
+**Проверка.** `python -m unittest tests.test_secret_broker`.
+
+Прочие границы:
+
+- `WORKER_SERVICE_ID` даёт логическую фильтрацию claim/boot; MySQL grants по-прежнему
+  не режут строки по `service_id`.
+- Worker — platform-owned, изолирован от domain process, минимальный DB role.
 
 ---
 
@@ -1340,11 +1446,11 @@ backend/BFF.
 ### В разработке
 
 - [x] Изоляция domain process от platform DB при `call_api`
-- [ ] Worker log redaction + SQLAlchemy `hide_parameters=True`
-- [ ] Scoped Secret Broker/KMS вместо master secrets key в worker
-- [ ] CI-проверки SQL injection и динамического SQL
-- [ ] Reconcile для invoke с одними `notify` / `cancel_instances` / `entity_states`
-- [ ] Worker provisioner backends: systemd / Docker / Kubernetes
+- [x] Worker log redaction + SQLAlchemy `hide_parameters=True` (§7.6.1)
+- [x] Scoped Secret Broker/KMS вместо master-only decrypt на worker (§7.6.3)
+- [x] CI-проверки SQL injection и динамического SQL (§7.6.2)
+- [x] Reconcile для invoke с одними `notify` / `cancel_instances` / `entity_states` (§7.5)
+- [x] Worker provisioner backends: systemd / Docker / Kubernetes (§7.1)
 
 ---
 

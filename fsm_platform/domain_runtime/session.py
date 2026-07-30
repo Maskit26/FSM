@@ -20,7 +20,13 @@ def domain_session() -> Session:
         url = os.environ.get("DOMAIN_DATABASE_URL", "").strip()
         if not url:
             raise RuntimeError("DOMAIN_DATABASE_URL is not set")
-        _engine = create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=0)
+        _engine = create_engine(
+            url,
+            pool_pre_ping=True,
+            pool_size=2,
+            max_overflow=0,
+            hide_parameters=True,
+        )
         _sessionmaker = sessionmaker(bind=_engine, autoflush=False)
     return _sessionmaker()
 

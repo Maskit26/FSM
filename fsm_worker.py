@@ -14,6 +14,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
+from fsm_platform.host.log_redaction import install_log_redaction  # noqa: E402
+
+install_log_redaction()
+
 logger = logging.getLogger(__name__)
 
 
