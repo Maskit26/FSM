@@ -17,6 +17,7 @@ from fsm_platform.host.http.dependencies import (
     require_domain_service_access,
     require_platform_admin,
 )
+from fsm_platform.host.http.external_routes import router as external_router
 from fsm_platform.host.domain_bootstrap import get_bootstrap_status, is_domain_ready
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.http.events_ws import router as events_ws_router
@@ -41,6 +42,10 @@ app = FastAPI(
         {"name": "Tenant Account", "description": "Tokens and domain registration"},
         {"name": "Platform Admin", "description": "Platform-wide operator API"},
         {"name": "Domain API", "description": "DOMAIN_ADMIN_TOKEN protected API"},
+        {
+            "name": "Domain Runtime",
+            "description": "HMAC Contract reverse calls from domain process",
+        },
         {"name": "Domain Input", "description": "Signed external integrations"},
     ],
 )
@@ -879,5 +884,6 @@ app.include_router(auth_router)
 app.include_router(tenant_router)
 app.include_router(platform_router)
 app.include_router(domain_router)
+app.include_router(external_router)
 app.include_router(events_ws_router)
 app.include_router(input_router)

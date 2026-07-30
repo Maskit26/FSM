@@ -111,7 +111,9 @@ domains/<name>/     # картриджи (отдельные процессы)
 
 Правила core: platform session/commit — у host; callables домена — через Contract / `domain_runtime`.
 
-Текущий `core/http_client.py` — исключение: generic external HTTP импортирует `host.secrets` и `runtime_context`. Перенос credential resolution за границу domain/platform входит в работы §9.6.
+Текущий `core/http_client.py`: domain process при `PLATFORM_API_BASE_URL`
+проксирует `call_api` на platform `POST /v1/{service_id}/external/call` (HMAC);
+credentials читает только platform process.
 
 | Модуль | Назначение |
 |--------|------------|
@@ -386,7 +388,11 @@ UPSERT строки `entity_fsm_state` для арендатора.
 
 Telegram для send/webhook кладётся в platform `domain_secrets` при онбординге.
 
-Текущая интеграция `call_api` читает credentials через `host.secrets`, поэтому courier domain process временно также получает `PLATFORM_DATABASE_URL` и `PLATFORM_SECRETS_KEY`. Это нарушает целевую изоляцию и входит в работы §9.6: после миграции domain process должен работать без доступа к platform DB.
+`call_api` из domain process не читает platform DB: при `PLATFORM_API_BASE_URL`
+идёт HMAC-прокси на `POST /v1/{service_id}/external/call`, где platform
+резолвит credential из `domain_secrets` и выполняет исходящий HTTP.
+Domain `.env` содержит `SERVICE_ID`, `DOMAIN_DATABASE_URL`, `CONTRACT_SHARED_SECRET`,
+`PLATFORM_API_BASE_URL` — без `PLATFORM_DATABASE_URL` / `PLATFORM_SECRETS_KEY`.
 
 ### 5.6. Domain DB
 
@@ -832,7 +838,8 @@ Process `.env` платформы: `PLATFORM_DATABASE_URL`, `PLATFORM_SECRETS_KE
 4. Разделение Public Auth, Tenant Account, Platform Admin, Domain API и Domain Input в FastAPI/Swagger.
 5. Все `/v1/{service_id}/…` закрыты domain token; platform token только Platform Admin API.
 6. Domain register/connect и worker `1 process = 1 service_id`.
-7. Перенос чтения credentials из domain process за Contract/platform boundary без `PLATFORM_DATABASE_URL`/`PLATFORM_SECRETS_KEY` — ещё в разработке.
+7. Domain process без `PLATFORM_DATABASE_URL`/`PLATFORM_SECRETS_KEY`: `call_api`
+   через platform `POST /v1/{service_id}/external/call` (HMAC + `PLATFORM_API_BASE_URL`).
 8. Route-matrix/security/E2E: register → verify → login → token issue → domain register → secrets/credentials → connect → worker ready.
 
 ---
@@ -886,8 +893,6 @@ X-Admin-Token: <DOMAIN_ADMIN_TOKEN>
 
 ### 10.3. Вызов из домена: `call_api`
 
-В command / effect / outbox-handler домена:
-
 ```python
 from fsm_platform.host import side_effects
 
@@ -895,17 +900,17 @@ resp = side_effects.call_api(
     "PARTNER_API",          # credential_key = имя секрета
     method="POST",
     path="/v1/orders",
-    json={...},
+    json_body={...},
 )
 ```
 
-- Читает credential из `domain_secrets` в текущем `service_scope`.
-- Делает HTTP на `base_url` + path с нужной auth.
+- Domain process: HMAC → platform `POST /v1/{service_id}/external/call`
+  (`PLATFORM_API_BASE_URL` + `CONTRACT_SHARED_SECRET`).
+- Platform: читает credential из `domain_secrets` в `service_scope`, выполняет HTTP
+  на `base_url` + path с нужной auth.
 - Ошибки: `EXTERNAL_API` / `EXTERNAL_API_TRANSIENT` (для retry FSM).
-
-Имя стороннего продукта и его протокол принадлежат картриджу; платформа использует обобщённый credential и канал `http_external`.
-
-Сейчас этот вызов из domain process использует platform DB и `PLATFORM_SECRETS_KEY`. Целевая реализация **в разработке**: credential разрешается/применяется платформой без передачи domain process доступа к platform DB (§9.6).
+- Имя стороннего продукта и его протокол принадлежат картриджу; платформа
+  использует обобщённый credential и канал `http_external`.
 
 ### 10.4. Асинхронная доставка через outbox
 
@@ -1301,7 +1306,8 @@ backend/BFF.
 - Tenant-scoped `DOMAIN_ADMIN_TOKEN` закрывает весь `/v1/{service_id}/…`; `PLATFORM_ADMIN_TOKEN` действует только на Platform Admin API (§9).
 - Platform `.env` — process config (`PLATFORM_*`, у воркера ещё `WORKER_SERVICE_ID`).
 - `DOMAIN_DATABASE_URL` — в env процесса домена.
-- Временная зависимость courier domain от platform DB для `call_api` должна быть удалена в рамках §9.6.
+- Domain `call_api` → platform `POST /v1/{service_id}/external/call` (`PLATFORM_API_BASE_URL`);
+  domain process без `PLATFORM_DATABASE_URL` / `PLATFORM_SECRETS_KEY` (§9.6 / §10.3).
 - Telegram I/O — `input/` / `output/`; привязка аккаунта — доменная команда по конвенции `bind_telegram` (§8.4).
 - Сторонний API — credentials + `call_api` / outbox `http_external` (§10); имена вендоров — у картриджа.
 - Commit platform-транзакций — host (`request_runtime`, worker).
@@ -1333,7 +1339,7 @@ backend/BFF.
 
 ### В разработке
 
-- [ ] Изоляция domain process от platform DB при `call_api`
+- [x] Изоляция domain process от platform DB при `call_api`
 - [ ] Worker log redaction + SQLAlchemy `hide_parameters=True`
 - [ ] Scoped Secret Broker/KMS вместо master secrets key в worker
 - [ ] CI-проверки SQL injection и динамического SQL

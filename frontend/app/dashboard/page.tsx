@@ -1,117 +1,144 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   AdminTokenMeta,
   ApiRequestError,
-  connectDomain,
+  ScheduleRow,
+  WebhookRow,
   createAdminToken,
+  createSchedule,
+  createWebhook,
+  connectDomain,
+  deactivateWebhook,
+  deleteSecret,
+  fetchCatalog,
+  graphPublish,
+  inboundHookUrl,
+  isSessionExpiredError,
   listAdminTokens,
+  listSchedules,
   listSecrets,
+  listWebhooks,
   logout,
-  registerDomain,
+  pauseSchedule,
+  reloadDomain,
+  resumeSchedule,
   revokeAdminToken,
   rotateAdminToken,
+  telegramLink,
+  telegramWebhookUrl,
   upsertSecret,
+  workerRestart,
+  workerStatus,
+  workerStop,
 } from "@/lib/api";
 import {
+  clearAuthSession,
   clearSession,
   getAccessToken,
   getDomainAdminToken,
   getRefreshToken,
-  getSelectedTokenId,
   getServiceId,
+  isDomainConnected,
+  isEnvBannerDismissed,
   setDomainAdminToken,
+  setEnvBannerDismissed,
   setSelectedTokenId,
-  setServiceId,
 } from "@/lib/session";
+
+type TileId =
+  | "token"
+  | "worker"
+  | "domain"
+  | "input"
+  | "output"
+  | "secret"
+  | "schedule"
+  | null;
+
 
 function prefixOf(token: AdminTokenMeta): string {
   return token.token_prefix || token.prefix || `#${token.id}`;
 }
 
-export default function DashboardPage() {
+export default function CabinetPage() {
   const router = useRouter();
   const [ready, setReady] = useState(false);
-  const [accessToken, setAccessTokenState] = useState<string | null>(null);
-  const [tokens, setTokens] = useState<AdminTokenMeta[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [rawToken, setRawToken] = useState<string>("");
-  const [cartridgeType, setCartridgeType] = useState("courier");
-  const [serviceId, setServiceIdState] = useState<string>("");
-  const [attachOpen, setAttachOpen] = useState(false);
-  const [attachDraft, setAttachDraft] = useState("");
-  const [secretKeys, setSecretKeys] = useState<string[]>([]);
-  const [graphReadUrl, setGraphReadUrl] = useState("");
-  const [graphWriteUrl, setGraphWriteUrl] = useState("");
-  const [contractBaseUrl, setContractBaseUrl] = useState("http://127.0.0.1:8100");
-  const [contractSecret, setContractSecret] = useState("");
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [adminToken, setAdminToken] = useState("");
+  const [serviceId, setServiceIdState] = useState("");
+  const [openTile, setOpenTile] = useState<TileId>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
-  const [connectResult, setConnectResult] = useState<string | null>(null);
+  const [showEnvBanner, setShowEnvBanner] = useState(false);
 
-  const selected = useMemo(
-    () => tokens.find((t) => t.id === selectedId) || null,
-    [tokens, selectedId],
-  );
+  const [tokens, setTokens] = useState<AdminTokenMeta[]>([]);
+  const [rawToken, setRawToken] = useState("");
+  const [selectedTokenId, setSelectedTokenIdState] = useState<number | null>(null);
 
-  const refreshTokens = useCallback(async (token: string) => {
-    const res = await listAdminTokens(token);
-    const active = res.tokens.filter((t) => !t.revoked_at);
-    setTokens(active);
-    setSelectedId((current) => {
-      const preferred = getSelectedTokenId();
-      const next =
-        active.find((t) => t.id === preferred)?.id ??
-        active.find((t) => t.id === current)?.id ??
-        active[0]?.id ??
-        null;
-      if (next != null) setSelectedTokenId(next);
-      else setSelectedTokenId(null);
-      return next;
-    });
-  }, []);
+  const [workerInfo, setWorkerInfo] = useState<string>("");
+  const [webhooks, setWebhooks] = useState<WebhookRow[]>([]);
+  const [hookUrl, setHookUrl] = useState("");
+  const [hookSecret, setHookSecret] = useState("");
 
-  const refreshSecretKeys = useCallback(
-    async (sid: string, adminToken: string) => {
-      const res = await listSecrets(sid, adminToken);
-      setSecretKeys(res.keys || []);
-    },
-    [],
-  );
+  const [secretKeys, setSecretKeys] = useState<string[]>([]);
+  const [secretKey, setSecretKey] = useState("");
+  const [secretValue, setSecretValue] = useState("");
+
+  const [schedules, setSchedules] = useState<ScheduleRow[]>([]);
+  const [schedProcess, setSchedProcess] = useState("");
+  const [schedInterval, setSchedInterval] = useState("60");
+
+  const [domainResult, setDomainResult] = useState("");
+  const [hookChannels, setHookChannels] = useState<string[]>([]);
+  const [telegramUserId, setTelegramUserId] = useState("");
+  const [telegramLinkUrl, setTelegramLinkUrl] = useState("");
 
   useEffect(() => {
     const token = getAccessToken();
     if (!token) {
-      router.replace("/");
+      router.replace("/?reauth=1");
       return;
     }
-    setAccessTokenState(token);
-    const admin = getDomainAdminToken() || "";
-    setRawToken(admin);
-    const sid = getServiceId() || "";
-    setServiceIdState(sid);
-    setReady(true);
-    refreshTokens(token).catch((err) => {
-      setError(err instanceof Error ? err.message : "Не удалось загрузить токены");
-    });
-    if (sid && admin) {
-      refreshSecretKeys(sid, admin).catch(() => {
-        /* token may be stale */
-      });
+    const sid = getServiceId();
+    const admin = getDomainAdminToken();
+    if (!isDomainConnected() || !sid || !admin) {
+      router.replace("/domain-registration");
+      return;
     }
-  }, [router, refreshTokens, refreshSecretKeys]);
+    setAccessToken(token);
+    setServiceIdState(sid);
+    setAdminToken(admin);
+    setRawToken(admin);
+    setShowEnvBanner(!isEnvBannerDismissed());
+    setReady(true);
+  }, [router]);
+
+  function redirectToLogin() {
+    clearAuthSession();
+    router.replace("/?reauth=1");
+  }
 
   function fail(err: unknown) {
-    const message =
+    if (isSessionExpiredError(err)) {
+      redirectToLogin();
+      return;
+    }
+    setError(
       err instanceof ApiRequestError
         ? err.message
         : err instanceof Error
           ? err.message
-          : "Ошибка запроса";
-    setError(message);
+          : "Ошибка запроса",
+    );
+  }
+
+  function clearMsg() {
+    setError(null);
+    setInfo(null);
   }
 
   async function onLogout() {
@@ -122,23 +149,39 @@ export default function DashboardPage() {
       /* ignore */
     }
     clearSession();
-    setServiceId(null);
     router.replace("/");
   }
+
+  function dismissEnvBanner() {
+    setEnvBannerDismissed(true);
+    setShowEnvBanner(false);
+  }
+
+  function toggleTile(id: TileId) {
+    clearMsg();
+    setOpenTile((cur) => (cur === id ? null : id));
+  }
+
+  const loadTokens = useCallback(async () => {
+    if (!accessToken) return;
+    const res = await listAdminTokens(accessToken);
+    const active = res.tokens.filter((t) => !t.revoked_at);
+    setTokens(active);
+  }, [accessToken]);
 
   async function onCreateToken() {
     if (!accessToken) return;
     setBusy(true);
-    setError(null);
-    setInfo(null);
+    clearMsg();
     try {
       const created = await createAdminToken(accessToken, { name: "console" });
       setRawToken(created.token);
       setDomainAdminToken(created.token);
-      setSelectedId(created.id);
+      setAdminToken(created.token);
+      setSelectedTokenIdState(created.id);
       setSelectedTokenId(created.id);
-      setInfo("Токен создан. Сохраните значение — повторно его не покажем.");
-      await refreshTokens(accessToken);
+      setInfo("Токен создан.");
+      await loadTokens();
     } catch (err) {
       fail(err);
     } finally {
@@ -146,19 +189,12 @@ export default function DashboardPage() {
     }
   }
 
-  async function onRevoke() {
-    if (!accessToken || selectedId == null) return;
+  async function onListTokens() {
     setBusy(true);
-    setError(null);
-    setInfo(null);
+    clearMsg();
     try {
-      await revokeAdminToken(accessToken, selectedId);
-      if (rawToken) setDomainAdminToken(null);
-      setRawToken("");
-      setSelectedId(null);
-      setSelectedTokenId(null);
-      setInfo(`Токен #${selectedId} отозван.`);
-      await refreshTokens(accessToken);
+      await loadTokens();
+      setInfo(`Активных токенов: ${(await listAdminTokens(accessToken!)).tokens.filter((t) => !t.revoked_at).length}`);
     } catch (err) {
       fail(err);
     } finally {
@@ -166,21 +202,37 @@ export default function DashboardPage() {
     }
   }
 
-  async function onRotate() {
-    if (!accessToken || selectedId == null) return;
+  async function onRevokeToken() {
+    if (!accessToken || selectedTokenId == null) return;
     setBusy(true);
-    setError(null);
-    setInfo(null);
+    clearMsg();
     try {
-      const created = await rotateAdminToken(accessToken, selectedId, {
-        name: selected?.name || "console",
+      await revokeAdminToken(accessToken, selectedTokenId);
+      setInfo(`Токен #${selectedTokenId} отозван.`);
+      setSelectedTokenIdState(null);
+      await loadTokens();
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onRotateToken() {
+    if (!accessToken || selectedTokenId == null) return;
+    setBusy(true);
+    clearMsg();
+    try {
+      const created = await rotateAdminToken(accessToken, selectedTokenId, {
+        name: "console",
       });
       setRawToken(created.token);
       setDomainAdminToken(created.token);
-      setSelectedId(created.id);
+      setAdminToken(created.token);
+      setSelectedTokenIdState(created.id);
       setSelectedTokenId(created.id);
-      setInfo("Токен ротирован. Новое значение сохранено локально.");
-      await refreshTokens(accessToken);
+      setInfo("Токен ротирован.");
+      await loadTokens();
     } catch (err) {
       fail(err);
     } finally {
@@ -188,24 +240,74 @@ export default function DashboardPage() {
     }
   }
 
-  async function onRegisterDomain(e: FormEvent) {
-    e.preventDefault();
-    if (!rawToken.trim()) {
-      setError("Сначала создайте DOMAIN_ADMIN_TOKEN (кнопка «Создать токен»).");
-      return;
-    }
+  async function onWorkerStatus() {
     setBusy(true);
-    setError(null);
-    setInfo(null);
-    setConnectResult(null);
+    clearMsg();
     try {
-      const res = await registerDomain(rawToken.trim(), {
-        cartridge_type: cartridgeType.trim() || "courier",
+      const res = await workerStatus(serviceId, adminToken);
+      setWorkerInfo(JSON.stringify(res, null, 2));
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onWorkerRestart() {
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await workerRestart(serviceId, adminToken);
+      setWorkerInfo(JSON.stringify(res, null, 2));
+      setInfo("Worker restart выполнен.");
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onWorkerStop() {
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await workerStop(serviceId, adminToken);
+      setWorkerInfo(JSON.stringify(res, null, 2));
+      setInfo("Worker остановлен.");
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onListWebhooks() {
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await listWebhooks(serviceId, adminToken);
+      setWebhooks(res.webhooks || []);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCreateWebhook(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    clearMsg();
+    try {
+      await createWebhook(serviceId, adminToken, {
+        url: hookUrl.trim(),
+        secret: hookSecret.trim(),
       });
-      setServiceIdState(res.service_id);
-      setServiceId(res.service_id);
-      setInfo(`Домен зарегистрирован: ${res.service_id} (${res.status})`);
-      await refreshSecretKeys(res.service_id, rawToken.trim());
+      setHookUrl("");
+      setHookSecret("");
+      setInfo("Webhook создан.");
+      const res = await listWebhooks(serviceId, adminToken);
+      setWebhooks(res.webhooks || []);
     } catch (err) {
       fail(err);
     } finally {
@@ -213,27 +315,44 @@ export default function DashboardPage() {
     }
   }
 
-  async function onAttachExisting(e: FormEvent) {
+  async function onDeactivateWebhook(id: number) {
+    setBusy(true);
+    clearMsg();
+    try {
+      await deactivateWebhook(serviceId, adminToken, id);
+      setInfo(`Webhook #${id} деактивирован.`);
+      const res = await listWebhooks(serviceId, adminToken);
+      setWebhooks(res.webhooks || []);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onListSecrets() {
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await listSecrets(serviceId, adminToken);
+      setSecretKeys(res.keys || []);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onUpsertSecret(e: FormEvent) {
     e.preventDefault();
-    const sid = attachDraft.trim();
-    if (!sid) {
-      setError("Укажите service_id.");
-      return;
-    }
-    if (!rawToken.trim()) {
-      setError("Сначала нужен DOMAIN_ADMIN_TOKEN.");
-      return;
-    }
     setBusy(true);
-    setError(null);
-    setInfo(null);
+    clearMsg();
     try {
-      setServiceIdState(sid);
-      setServiceId(sid);
-      setAttachOpen(false);
-      setAttachDraft("");
-      await refreshSecretKeys(sid, rawToken.trim());
-      setInfo(`Привязан домен ${sid}`);
+      await upsertSecret(serviceId, adminToken, secretKey.trim(), secretValue);
+      setSecretValue("");
+      setInfo(`Secret «${secretKey.trim()}» сохранён.`);
+      const res = await listSecrets(serviceId, adminToken);
+      setSecretKeys(res.keys || []);
     } catch (err) {
       fail(err);
     } finally {
@@ -241,43 +360,46 @@ export default function DashboardPage() {
     }
   }
 
-  function clearBoundService() {
-    setServiceIdState("");
-    setServiceId(null);
-    setSecretKeys([]);
-    setConnectResult(null);
-    setAttachOpen(false);
+  async function onDeleteSecret(key: string) {
+    setBusy(true);
+    clearMsg();
+    try {
+      await deleteSecret(serviceId, adminToken, key);
+      setInfo(`Secret «${key}» удалён.`);
+      const res = await listSecrets(serviceId, adminToken);
+      setSecretKeys(res.keys || []);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
   }
 
-  async function onSaveSecrets(e: FormEvent) {
+  async function onListSchedules() {
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await listSchedules(serviceId, adminToken);
+      setSchedules(res.schedules || []);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCreateSchedule(e: FormEvent) {
     e.preventDefault();
-    if (!rawToken.trim() || !serviceId.trim()) {
-      setError("Нужны DOMAIN_ADMIN_TOKEN и service_id.");
-      return;
-    }
-    const pairs: [string, string][] = [
-      ["graph_database_url", graphReadUrl.trim()],
-      ["graph_write_database_url", graphWriteUrl.trim()],
-      ["contract_base_url", contractBaseUrl.trim()],
-      ["contract_shared_secret", contractSecret.trim()],
-    ];
-    const missing = pairs.filter(([, v]) => !v);
-    if (missing.length) {
-      setError(`Заполните поля: ${missing.map(([k]) => k).join(", ")}`);
-      return;
-    }
     setBusy(true);
-    setError(null);
-    setInfo(null);
+    clearMsg();
     try {
-      for (const [key, value] of pairs) {
-        await upsertSecret(serviceId.trim(), rawToken.trim(), key, value);
-      }
-      await refreshSecretKeys(serviceId.trim(), rawToken.trim());
-      setInfo("Secrets сохранены. Можно подключать домен.");
-      setGraphReadUrl("");
-      setGraphWriteUrl("");
-      setContractSecret("");
+      await createSchedule(serviceId, adminToken, {
+        process_name: schedProcess.trim(),
+        interval_seconds: Number(schedInterval) || 60,
+      });
+      setInfo("Расписание создано.");
+      const res = await listSchedules(serviceId, adminToken);
+      setSchedules(res.schedules || []);
     } catch (err) {
       fail(err);
     } finally {
@@ -285,19 +407,107 @@ export default function DashboardPage() {
     }
   }
 
-  async function onConnect() {
-    if (!rawToken.trim() || !serviceId.trim()) {
-      setError("Нужны DOMAIN_ADMIN_TOKEN и service_id.");
+  async function onPauseSchedule(id: number) {
+    setBusy(true);
+    clearMsg();
+    try {
+      await pauseSchedule(serviceId, adminToken, id);
+      setInfo(`Schedule #${id} paused.`);
+      const res = await listSchedules(serviceId, adminToken);
+      setSchedules(res.schedules || []);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onResumeSchedule(id: number) {
+    setBusy(true);
+    clearMsg();
+    try {
+      await resumeSchedule(serviceId, adminToken, id);
+      setInfo(`Schedule #${id} resumed.`);
+      const res = await listSchedules(serviceId, adminToken);
+      setSchedules(res.schedules || []);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onDomainReload() {
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await reloadDomain(serviceId, adminToken);
+      setDomainResult(JSON.stringify(res, null, 2));
+      setInfo("Catalog reload выполнен (процесс domain на :8100 не перезапускается).");
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onDomainConnect() {
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await connectDomain(serviceId, adminToken);
+      setDomainResult(JSON.stringify(res, null, 2));
+      setInfo("Connect выполнен.");
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onGraphPublish() {
+    if (!window.confirm("Опубликовать новую версию графа?")) return;
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await graphPublish(serviceId, adminToken);
+      setDomainResult(JSON.stringify(res, null, 2));
+      setInfo("Graph published.");
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onOpenInput() {
+    clearMsg();
+    if (openTile === "input") {
+      setOpenTile(null);
+      return;
+    }
+    setOpenTile("input");
+    try {
+      const cat = await fetchCatalog(serviceId, adminToken);
+      setHookChannels(cat.hooks || []);
+    } catch (err) {
+      fail(err);
+    }
+  }
+
+  async function onTelegramLink(e: FormEvent) {
+    e.preventDefault();
+    const uid = Number(telegramUserId);
+    if (!Number.isFinite(uid)) {
+      setError("Укажите user_id.");
       return;
     }
     setBusy(true);
-    setError(null);
-    setInfo(null);
-    setConnectResult(null);
+    clearMsg();
     try {
-      const res = await connectDomain(serviceId.trim(), rawToken.trim());
-      setConnectResult(JSON.stringify(res, null, 2));
-      setInfo(`Домен ${serviceId} подключён.`);
+      const res = await telegramLink(serviceId, uid);
+      setTelegramLinkUrl(res.url);
+      setInfo("Deep-link получен.");
     } catch (err) {
       fail(err);
     } finally {
@@ -317,287 +527,412 @@ export default function DashboardPage() {
     <main className="page">
       <div className="dash">
         <header className="dash-top">
-          <h1 className="dash-brand">FSM Platform</h1>
+          <div>
+            <h1 className="dash-brand">Личный кабинет</h1>
+            <p className="cabinet-sid">
+              <code>{serviceId}</code>
+            </p>
+          </div>
           <button type="button" className="btn btn-ghost" onClick={onLogout}>
             Выйти
           </button>
         </header>
 
-        <section className="section">
-          <h2>Tenant Account</h2>
-          <p>Токен домена и регистрация картриджа</p>
-
-          <div className="toolbar">
-            <button
-              type="button"
-              className="btn btn-primary"
-              style={{ width: "auto", minWidth: "10rem" }}
-              disabled={busy}
-              onClick={onCreateToken}
-            >
-              Создать токен
-            </button>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              disabled={busy || !accessToken}
-              onClick={() =>
-                accessToken &&
-                refreshTokens(accessToken).catch(fail)
-              }
-            >
-              Обновить список
-            </button>
-          </div>
-
-          {tokens.length > 0 ? (
-            <div className="token-list" role="listbox" aria-label="Admin tokens">
-              {tokens.map((t) => (
-                <button
-                  key={t.id}
-                  type="button"
-                  role="option"
-                  aria-selected={t.id === selectedId}
-                  data-active={t.id === selectedId}
-                  onClick={() => {
-                    setSelectedId(t.id);
-                    setSelectedTokenId(t.id);
-                  }}
-                >
-                  <strong>
-                    #{t.id}
-                    {t.name ? ` · ${t.name}` : ""}
-                  </strong>
-                  <span className="meta">
-                    {prefixOf(t)}
-                    {t.created_at ? ` · ${t.created_at}` : ""}
-                  </span>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <p style={{ marginBottom: "1.25rem", color: "var(--ink-soft)" }}>
-              Активных токенов пока нет — создайте первый.
-            </p>
-          )}
-
-          <div className="token-row">
-            <div className={`token-box${rawToken ? "" : " empty"}`}>
-              {rawToken ||
-                "Здесь появится raw DOMAIN_ADMIN_TOKEN после create / rotate"}
-            </div>
-            <div className="token-actions">
-              <button
-                type="button"
-                className="btn btn-danger"
-                disabled={busy || selectedId == null}
-                onClick={onRevoke}
-              >
-                Revoke
+        {showEnvBanner ? (
+          <div className="hint hint-warn env-banner" role="status">
+            <div className="env-banner-head">
+              <strong>Настройте SERVICE_ID в .env домена</strong>
+              <button type="button" className="linkish" onClick={dismissEnvBanner}>
+                Закрыть
               </button>
+            </div>
+            <p style={{ margin: "0.5rem 0 0" }}>
+              В <code>domains/&lt;domain&gt;/.env</code> пропишите и
+              перезапустите domain service:
+            </p>
+            <pre className="env-snippet">{`SERVICE_ID=${serviceId}`}</pre>
+            <p style={{ margin: "0.5rem 0 0", fontSize: "0.85rem" }}>
+              Для ручного worker в platform <code>.env</code>:{" "}
+              <code>WORKER_SERVICE_ID={serviceId}</code>
+            </p>
+          </div>
+        ) : null}
+
+        <div className="tile-grid">
+          <button
+            type="button"
+            className="tile"
+            onClick={() => router.push("/playground")}
+          >
+            <span className="tile-title">Operations</span>
+            <span className="tile-sub">catalog · entities · events</span>
+          </button>
+          <button
+            type="button"
+            className="tile"
+            onClick={() => router.push("/e2e")}
+          >
+            <span className="tile-title">E2E</span>
+            <span className="tile-sub">YAML scenario · report download</span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "secret" ? " tile-open" : ""}`}
+            onClick={() => toggleTile("secret")}
+          >
+            <span className="tile-title">Secret</span>
+            <span className="tile-sub">upsert / list / delete</span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "domain" ? " tile-open" : ""}`}
+            onClick={() => toggleTile("domain")}
+          >
+            <span className="tile-title">Domain</span>
+            <span className="tile-sub">register · connect · catalog reload · graph</span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "worker" ? " tile-open" : ""}`}
+            onClick={() => toggleTile("worker")}
+          >
+            <span className="tile-title">Worker</span>
+            <span className="tile-sub">status / restart / stop</span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "token" ? " tile-open" : ""}`}
+            onClick={() => toggleTile("token")}
+          >
+            <span className="tile-title">Token</span>
+            <span className="tile-sub">DOMAIN_ADMIN_TOKEN</span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "input" ? " tile-open" : ""}`}
+            onClick={() => onOpenInput()}
+          >
+            <span className="tile-title">Input</span>
+            <span className="tile-sub">telegram · inbound hooks</span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "output" ? " tile-open" : ""}`}
+            onClick={() => toggleTile("output")}
+          >
+            <span className="tile-title">Output</span>
+            <span className="tile-sub">outbound webhooks</span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "schedule" ? " tile-open" : ""}`}
+            onClick={() => toggleTile("schedule")}
+          >
+            <span className="tile-title">Schedules</span>
+            <span className="tile-sub">create / list / pause / resume</span>
+          </button>
+        </div>
+
+        {openTile === "domain" ? (
+          <section className="tile-panel">
+            <div className="toolbar">
               <button
                 type="button"
                 className="btn btn-ghost"
-                disabled={busy || selectedId == null}
-                onClick={onRotate}
+                onClick={() => router.push("/domain-registration")}
               >
+                Register
+              </button>
+              <button type="button" className="btn btn-primary" style={{ width: "auto" }} disabled={busy} onClick={onDomainConnect}>
+                Connect
+              </button>
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={onDomainReload}>
+                Reload catalog
+              </button>
+              <button type="button" className="btn btn-danger" disabled={busy} onClick={onGraphPublish}>
+                Graph publish
+              </button>
+            </div>
+            {domainResult ? (
+              <div className="probe-panel">
+                <pre>{domainResult}</pre>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
+
+        {openTile === "input" ? (
+          <section className="tile-panel">
+            <p className="muted" style={{ marginTop: 0 }}>
+              Внешние системы бьют в эти URL. Здесь — ссылки и deep-link.
+            </p>
+            <div className="field">
+              <label>Telegram webhook URL</label>
+              <div className="token-box">{telegramWebhookUrl(serviceId)}</div>
+            </div>
+            <form className="tile-form" onSubmit={onTelegramLink}>
+              <div className="field">
+                <label htmlFor="tg-uid">user_id → deep-link</label>
+                <input
+                  id="tg-uid"
+                  value={telegramUserId}
+                  onChange={(e) => setTelegramUserId(e.target.value)}
+                  required
+                />
+              </div>
+              <button type="submit" className="btn btn-primary" style={{ width: "auto" }} disabled={busy}>
+                Get link
+              </button>
+            </form>
+            {telegramLinkUrl ? (
+              <div className="token-box" style={{ marginTop: "0.75rem" }}>
+                {telegramLinkUrl}
+              </div>
+            ) : null}
+            <h3 style={{ margin: "1.25rem 0 0.5rem", fontSize: "1rem" }}>
+              Inbound hooks
+            </h3>
+            {hookChannels.length === 0 ? (
+              <p className="muted">Каналов в catalog нет (или catalog не загружен).</p>
+            ) : (
+              <ul className="plain-list">
+                {hookChannels.map((ch) => (
+                  <li key={ch}>
+                    <code>{ch}</code>
+                    <span className="meta" style={{ fontFamily: "var(--font-mono)", fontSize: "0.75rem" }}>
+                      {inboundHookUrl(serviceId, ch)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        ) : null}
+
+        {openTile === "output" ? (
+          <section className="tile-panel">
+            <div className="toolbar">
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={onListWebhooks}>
+                List webhooks
+              </button>
+            </div>
+            <form className="tile-form" onSubmit={onCreateWebhook}>
+              <div className="field">
+                <label htmlFor="hook-url">URL</label>
+                <input id="hook-url" value={hookUrl} onChange={(e) => setHookUrl(e.target.value)} required />
+              </div>
+              <div className="field">
+                <label htmlFor="hook-secret">Secret (HMAC)</label>
+                <input
+                  id="hook-secret"
+                  type="password"
+                  value={hookSecret}
+                  onChange={(e) => setHookSecret(e.target.value)}
+                  required
+                />
+              </div>
+              <button type="submit" className="btn btn-primary" style={{ width: "auto" }} disabled={busy}>
+                Create webhook
+              </button>
+            </form>
+            {webhooks.length > 0 ? (
+              <ul className="plain-list">
+                {webhooks.map((w) => (
+                  <li key={w.id}>
+                    <span>
+                      #{w.id} · {w.active ? "active" : "off"} · {w.url}
+                    </span>
+                    {w.active ? (
+                      <button
+                        type="button"
+                        className="btn btn-danger"
+                        disabled={busy}
+                        onClick={() => onDeactivateWebhook(w.id)}
+                      >
+                        Deactivate
+                      </button>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </section>
+        ) : null}
+
+        {openTile === "token" ? (
+          <section className="tile-panel">
+            <div className="toolbar">
+              <button type="button" className="btn btn-primary" style={{ width: "auto" }} disabled={busy} onClick={onCreateToken}>
+                Create
+              </button>
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={onListTokens}>
+                List
+              </button>
+              <button type="button" className="btn btn-danger" disabled={busy || selectedTokenId == null} onClick={onRevokeToken}>
+                Revoke
+              </button>
+              <button type="button" className="btn btn-ghost" disabled={busy || selectedTokenId == null} onClick={onRotateToken}>
                 Rotate
               </button>
             </div>
-          </div>
-
-          <form className="domain-block" onSubmit={onRegisterDomain}>
-            <div className="field">
-              <label htmlFor="cartridge">Тип картриджа</label>
-              <input
-                id="cartridge"
-                value={cartridgeType}
-                onChange={(e) => setCartridgeType(e.target.value)}
-                placeholder="courier"
-                required
-              />
+            <div className={`token-box${rawToken ? "" : " empty"}`}>
+              {rawToken || "Raw token после create / rotate"}
             </div>
-            <button
-              type="submit"
-              className="btn btn-accent"
-              style={{ minWidth: "14rem" }}
-              disabled={busy || Boolean(serviceId)}
-            >
-              Зарегистрировать домен
-            </button>
-          </form>
-
-          {!serviceId ? (
-            <div className="attach-wrap">
-              {!attachOpen ? (
-                <button
-                  type="button"
-                  className="linkish"
-                  onClick={() => setAttachOpen(true)}
-                >
-                  Уже есть service_id?
-                </button>
-              ) : (
-                <form className="attach-form" onSubmit={onAttachExisting}>
-                  <input
-                    value={attachDraft}
-                    onChange={(e) => setAttachDraft(e.target.value)}
-                    placeholder="svc_courier_…"
-                    aria-label="Существующий service_id"
-                    autoFocus
-                  />
-                  <button type="submit" className="btn btn-ghost" disabled={busy}>
-                    Привязать
-                  </button>
+            {tokens.length > 0 ? (
+              <div className="token-list" style={{ marginTop: "1rem" }}>
+                {tokens.map((t) => (
                   <button
+                    key={t.id}
                     type="button"
-                    className="btn btn-ghost"
-                    onClick={() => {
-                      setAttachOpen(false);
-                      setAttachDraft("");
-                    }}
+                    data-active={t.id === selectedTokenId}
+                    onClick={() => setSelectedTokenIdState(t.id)}
                   >
-                    Отмена
+                    <strong>
+                      #{t.id}
+                      {t.name ? ` · ${t.name}` : ""}
+                    </strong>
+                    <span className="meta">{prefixOf(t)}</span>
                   </button>
-                </form>
-              )}
-            </div>
-          ) : (
-            <div className="service-chip" role="status">
-              <div>
-                <span className="service-chip-label">Домен</span>
-                <code className="service-chip-id">{serviceId}</code>
+                ))}
               </div>
-              <button
-                type="button"
-                className="linkish"
-                onClick={clearBoundService}
-              >
-                Сбросить
+            ) : null}
+          </section>
+        ) : null}
+
+        {openTile === "worker" ? (
+          <section className="tile-panel">
+            <div className="toolbar">
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={onWorkerStatus}>
+                Status
+              </button>
+              <button type="button" className="btn btn-primary" style={{ width: "auto" }} disabled={busy} onClick={onWorkerRestart}>
+                Restart
+              </button>
+              <button type="button" className="btn btn-danger" disabled={busy} onClick={onWorkerStop}>
+                Stop
               </button>
             </div>
-          )}
+            {workerInfo ? (
+              <div className="probe-panel">
+                <pre>{workerInfo}</pre>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
 
-          {serviceId ? (
-            <div className="setup-block">
-              <h2>Подключение домена</h2>
-              <p className="lede">Заполните secrets и подключите картридж</p>
-
-              {secretKeys.length > 0 ? (
-                <p className="secret-keys">
-                  Уже заданы ключи:{" "}
-                  {secretKeys.map((k) => (
-                    <code key={k}>{k} </code>
-                  ))}
-                </p>
-              ) : null}
-
-              <form onSubmit={onSaveSecrets}>
-                <div className="hint">
-                  В целях безопасности создайте в вашей Domain DB отдельных
-                  пользователей, которые могут читать/писать только FSM-таблицы{" "}
-                  <code>fsm_states</code>, <code>fsm_transitions</code>,{" "}
-                  <code>fsm_graph_meta</code>, <code>fsm_actions</code> (не
-                  business-таблицы). Host и имя БД те же, в URL — user/password
-                  graph-учёток. Шаблон:{" "}
-                  <code>database/sql/domain/002_platform_graph_db_users.sql</code>
-                </div>
-
-                <div className="field">
-                  <label htmlFor="graph-read">graph_database_url (read)</label>
-                  <p className="hint-inline">
-                    Подсказка: пользователь вроде <code>fsm_graph_ro</code> —
-                    SELECT на graph-таблицы
-                  </p>
-                  <input
-                    id="graph-read"
-                    type="password"
-                    autoComplete="off"
-                    value={graphReadUrl}
-                    onChange={(e) => setGraphReadUrl(e.target.value)}
-                    placeholder="mysql+mysqlconnector://fsm_graph_ro:…@host:3306/db"
-                  />
-                </div>
-
-                <div className="field">
-                  <label htmlFor="graph-write">graph_write_database_url (write)</label>
-                  <p className="hint-inline">
-                    Подсказка: пользователь вроде <code>fsm_graph_rw</code> —
-                    SELECT/INSERT/UPDATE на graph-таблицы
-                  </p>
-                  <input
-                    id="graph-write"
-                    type="password"
-                    autoComplete="off"
-                    value={graphWriteUrl}
-                    onChange={(e) => setGraphWriteUrl(e.target.value)}
-                    placeholder="mysql+mysqlconnector://fsm_graph_rw:…@host:3306/db"
-                  />
-                </div>
-
-                <div className="field">
-                  <label htmlFor="contract-url">contract_base_url</label>
-                  <p className="hint-inline">
-                    URL вашего domain service (courier), например{" "}
-                    <code>http://127.0.0.1:8100</code>
-                  </p>
-                  <input
-                    id="contract-url"
-                    value={contractBaseUrl}
-                    onChange={(e) => setContractBaseUrl(e.target.value)}
-                    placeholder="http://127.0.0.1:8100"
-                    required
-                  />
-                </div>
-
-                <div className="field">
-                  <label htmlFor="contract-secret">contract_shared_secret</label>
-                  <p className="hint-inline">
-                    Тот же секрет, что <code>CONTRACT_SHARED_SECRET</code> в{" "}
-                    <code>.env</code> домена
-                  </p>
-                  <input
-                    id="contract-secret"
-                    type="password"
-                    autoComplete="off"
-                    value={contractSecret}
-                    onChange={(e) => setContractSecret(e.target.value)}
-                    placeholder="тот же, что в domains/courier/.env"
-                  />
-                </div>
-
-                <div className="toolbar" style={{ marginTop: "0.5rem" }}>
-                  <button
-                    type="submit"
-                    className="btn btn-primary"
-                    style={{ width: "auto", minWidth: "12rem" }}
-                    disabled={busy}
-                  >
-                    Сохранить secrets
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-accent"
-                    style={{ minWidth: "12rem" }}
-                    disabled={busy}
-                    onClick={onConnect}
-                  >
-                    Подключить домен
-                  </button>
-                </div>
-              </form>
-
-              {connectResult ? (
-                <div className="probe-panel" style={{ marginTop: "1rem" }}>
-                  <pre>{connectResult}</pre>
-                </div>
-              ) : null}
+        {openTile === "secret" ? (
+          <section className="tile-panel">
+            <div className="toolbar">
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={onListSecrets}>
+                List
+              </button>
             </div>
-          ) : null}
+            <form className="tile-form" onSubmit={onUpsertSecret}>
+              <div className="field">
+                <label htmlFor="sec-key">Key</label>
+                <input id="sec-key" value={secretKey} onChange={(e) => setSecretKey(e.target.value)} required />
+              </div>
+              <div className="field">
+                <label htmlFor="sec-val">Value</label>
+                <input
+                  id="sec-val"
+                  type="password"
+                  value={secretValue}
+                  onChange={(e) => setSecretValue(e.target.value)}
+                  required
+                />
+              </div>
+              <button type="submit" className="btn btn-primary" style={{ width: "auto" }} disabled={busy}>
+                Upsert
+              </button>
+            </form>
+            {secretKeys.length > 0 ? (
+              <ul className="plain-list">
+                {secretKeys.map((k) => (
+                  <li key={k}>
+                    <code>{k}</code>
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      disabled={busy}
+                      onClick={() => onDeleteSecret(k)}
+                    >
+                      Delete
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </section>
+        ) : null}
 
-          {error ? <div className="msg msg-error">{error}</div> : null}
-          {info ? <div className="msg msg-ok">{info}</div> : null}
-        </section>
+        {openTile === "schedule" ? (
+          <section className="tile-panel">
+            <div className="toolbar">
+              <button type="button" className="btn btn-ghost" disabled={busy} onClick={onListSchedules}>
+                List
+              </button>
+            </div>
+            <form className="tile-form" onSubmit={onCreateSchedule}>
+              <div className="field">
+                <label htmlFor="sched-proc">process_name</label>
+                <input
+                  id="sched-proc"
+                  value={schedProcess}
+                  onChange={(e) => setSchedProcess(e.target.value)}
+                  required
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="sched-int">interval_seconds</label>
+                <input
+                  id="sched-int"
+                  type="number"
+                  min={1}
+                  value={schedInterval}
+                  onChange={(e) => setSchedInterval(e.target.value)}
+                  required
+                />
+              </div>
+              <button type="submit" className="btn btn-primary" style={{ width: "auto" }} disabled={busy}>
+                Create
+              </button>
+            </form>
+            {schedules.length > 0 ? (
+              <ul className="plain-list">
+                {schedules.map((s) => (
+                  <li key={s.id}>
+                    <span>
+                      #{s.id} · {s.process_name} · {s.interval_seconds}s ·{" "}
+                      {s.status || "—"}
+                    </span>
+                    <span className="row-actions">
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        disabled={busy}
+                        onClick={() => onPauseSchedule(s.id)}
+                      >
+                        Pause
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        disabled={busy}
+                        onClick={() => onResumeSchedule(s.id)}
+                      >
+                        Resume
+                      </button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </section>
+        ) : null}
+
+        {error ? <div className="msg msg-error">{error}</div> : null}
+        {info ? <div className="msg msg-ok">{info}</div> : null}
       </div>
     </main>
   );

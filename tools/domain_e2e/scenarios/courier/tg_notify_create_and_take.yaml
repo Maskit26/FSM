@@ -16,7 +16,7 @@
 # Сиды: client 3 = Москва, courier 2 = Москва, recipient 4 = СПб.
 
 name: tg_notify_create_and_take
-service_id: svc_courier_01
+service_id: svc_courier_b86eeb87dfda
 vars:
   client_id: "3"
   courier_id: "2"

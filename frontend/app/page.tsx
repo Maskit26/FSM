@@ -3,7 +3,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { login, register, verifyEmail, ApiRequestError } from "@/lib/api";
-import { getAccessToken, setSession } from "@/lib/session";
+import { getAccessToken, postLoginPath, setSession } from "@/lib/session";
 
 type Mode = "login" | "register";
 
@@ -17,8 +17,18 @@ export default function LandingPage() {
   const [info, setInfo] = useState<string | null>(null);
 
   useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("reauth") === "1") {
+        setMode("login");
+        setInfo("Сессия истекла — войдите снова.");
+      }
+    }
+  }, []);
+
+  useEffect(() => {
     if (getAccessToken()) {
-      router.replace("/dashboard");
+      router.replace(postLoginPath());
     }
   }, [router]);
 
@@ -35,7 +45,7 @@ export default function LandingPage() {
           setInfo("Аккаунт создан и подтверждён. Выполняем вход…");
           const session = await login(email.trim(), password);
           setSession(session.access_token, session.refresh_token);
-          router.push("/dashboard");
+          router.push(postLoginPath());
           return;
         }
         setInfo(
@@ -47,7 +57,7 @@ export default function LandingPage() {
 
       const session = await login(email.trim(), password);
       setSession(session.access_token, session.refresh_token);
-      router.push("/dashboard");
+      router.push(postLoginPath());
     } catch (err) {
       const message =
         err instanceof ApiRequestError
@@ -72,7 +82,7 @@ export default function LandingPage() {
           </h1>
           <p className="brand-sub">
             Регистрация арендатора и управление доменом: токены и регистрация
-            картриджа.
+            домена.
           </p>
         </section>
 

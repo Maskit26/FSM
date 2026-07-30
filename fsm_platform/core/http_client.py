@@ -21,6 +21,10 @@ Signer (custom):
   → dict с опциональными ключами headers/json/params/data (merge).
 
 service_id — только из runtime_context (Фаза 0).
+
+Domain process: при PLATFORM_API_BASE_URL исходящий вызов идёт на
+platform POST /v1/{service_id}/external/call (HMAC). Platform process
+читает domain_secrets локально (PLATFORM_DATABASE_URL / PLATFORM_SECRETS_KEY).
 """
 
 from __future__ import annotations
@@ -37,7 +41,6 @@ from urllib.parse import urljoin
 import requests
 
 from fsm_platform.host.runtime_context import current_service_id
-from fsm_platform.host.secrets import get_domain_secret
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,34 @@ _MAX_ATTEMPTS = int(os.environ.get("EXTERNAL_API_MAX_ATTEMPTS", "3"))
 _AUTH_TYPES = frozenset(
     {"bearer_token", "api_key_header", "basic_auth", "custom", "none"}
 )
+
+
+def _use_platform_proxy() -> bool:
+    """Domain process: PLATFORM_API_BASE_URL set → credentials stay on platform."""
+    return bool((os.environ.get("PLATFORM_API_BASE_URL") or "").strip())
+
+
+def _is_domain_cartridge_process() -> bool:
+    """
+    Domain service process имеет DOMAIN_DATABASE_URL.
+    Platform API / worker — нет (только PLATFORM_DATABASE_URL).
+    """
+    return bool((os.environ.get("DOMAIN_DATABASE_URL") or "").strip())
+
+
+def _platform_proxy_base() -> str:
+    return (os.environ.get("PLATFORM_API_BASE_URL") or "").strip().rstrip("/")
+
+
+def _contract_shared_secret() -> str:
+    secret = (os.environ.get("CONTRACT_SHARED_SECRET") or "").strip()
+    if not secret:
+        raise ExternalApiError(
+            "CONTRACT_SECRET_MISSING",
+            "CONTRACT_SHARED_SECRET required for platform external/call proxy",
+        )
+    return secret
+
 
 
 class ExternalApiError(Exception):
@@ -119,6 +150,8 @@ def _load_signer(path: str) -> SignerFn:
 
 
 def _parse_credential(credential_key: str) -> dict[str, Any]:
+    from fsm_platform.host.secrets import get_domain_secret
+
     raw = get_domain_secret(credential_key)
     if raw is None:
         raise ExternalApiError(
@@ -245,6 +278,175 @@ def call_api(
     credential_key — имя секрета (JSON credential).
     path — относительный путь к base_url (или абсолютный URL).
     signer — optional override; иначе берётся из credential.type=custom → credential.signer.
+
+    Domain process (PLATFORM_API_BASE_URL): HMAC proxy на platform /external/call.
+    Platform process: читает domain_secrets локально и ходит во внешний API.
+    """
+    if _use_platform_proxy():
+        return call_api_via_platform(
+            credential_key,
+            method,
+            path,
+            json_body=json_body,
+            params=params,
+            data=data,
+            headers=headers,
+            signer=signer,
+            timeout=timeout,
+            max_attempts=max_attempts,
+        )
+    if _is_domain_cartridge_process():
+        raise ExternalApiError(
+            "PLATFORM_API_BASE_URL_REQUIRED",
+            "domain process must set PLATFORM_API_BASE_URL; "
+            "credentials are resolved by platform POST /v1/{service_id}/external/call "
+            "(do not set PLATFORM_DATABASE_URL / PLATFORM_SECRETS_KEY on domain)",
+        )
+    return call_api_local(
+        credential_key,
+        method,
+        path,
+        json_body=json_body,
+        params=params,
+        data=data,
+        headers=headers,
+        signer=signer,
+        timeout=timeout,
+        max_attempts=max_attempts,
+    )
+
+
+def call_api_via_platform(
+    credential_key: str,
+    method: str,
+    path: str,
+    *,
+    json_body: Any = None,
+    params: Optional[Mapping[str, Any]] = None,
+    data: Any = None,
+    headers: Optional[Mapping[str, str]] = None,
+    signer: Optional[str] = None,
+    timeout: Optional[float] = None,
+    max_attempts: Optional[int] = None,
+) -> ApiResponse:
+    """Domain → platform HMAC proxy; secrets never leave the platform process."""
+    from fsm_platform.host.contract_client import sign_contract_request
+
+    sid = current_service_id()
+    base = _platform_proxy_base()
+    if not base:
+        raise ExternalApiError(
+            "PLATFORM_API_BASE_URL_MISSING",
+            "PLATFORM_API_BASE_URL is required in domain process",
+        )
+    secret = _contract_shared_secret()
+    api_path = f"/v1/{sid}/external/call"
+    url = f"{base}{api_path}"
+    payload = {
+        "credential_key": str(credential_key or "").strip(),
+        "method": str(method or "GET").strip().upper() or "GET",
+        "path": str(path or "").strip(),
+        "json_body": json_body,
+        "params": dict(params) if params is not None else None,
+        "data": data,
+        "headers": dict(headers) if headers is not None else None,
+        "signer": signer,
+        "timeout": timeout,
+        "max_attempts": max_attempts,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ts = str(int(time.time()))
+    sig = sign_contract_request(
+        secret,
+        method="POST",
+        path=api_path,
+        body=raw,
+        timestamp=ts,
+    )
+    # Platform still retries vendor HTTP; give headroom for nested call.
+    t_out = float(timeout) if timeout is not None else _DEFAULT_TIMEOUT
+    attempts = max(1, int(max_attempts if max_attempts is not None else _MAX_ATTEMPTS))
+    proxy_timeout = max(t_out * attempts + 5.0, 30.0)
+
+    try:
+        resp = requests.post(
+            url,
+            data=raw,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": "application/json",
+                "X-Service-Id": sid,
+                "X-Contract-Timestamp": ts,
+                "X-Contract-Signature": sig,
+            },
+            timeout=proxy_timeout,
+        )
+    except requests.Timeout as exc:
+        raise ExternalApiError("TIMEOUT", str(exc), transient=True) from exc
+    except requests.RequestException as exc:
+        raise ExternalApiError("CONNECTION", str(exc), transient=True) from exc
+
+    body: Any
+    try:
+        body = resp.json() if resp.text else {}
+    except ValueError:
+        body = {"_raw": resp.text}
+
+    if resp.status_code >= 400:
+        detail = body.get("detail") if isinstance(body, dict) else None
+        if isinstance(detail, dict):
+            code = str(detail.get("error_code") or f"HTTP_{resp.status_code}")
+            msg = str(detail.get("message") or code)
+            transient = bool(detail.get("transient"))
+            vendor = detail.get("vendor_status")
+            raise ExternalApiError(
+                code,
+                msg,
+                status_code=int(vendor) if vendor is not None else resp.status_code,
+                transient=transient,
+            )
+        if isinstance(detail, str):
+            raise ExternalApiError(
+                "PLATFORM_PROXY_ERROR",
+                detail,
+                status_code=resp.status_code,
+                transient=resp.status_code >= 500,
+            )
+        raise ExternalApiError(
+            f"HTTP_{resp.status_code}",
+            (resp.text or "")[:500],
+            status_code=resp.status_code,
+            transient=resp.status_code >= 500,
+        )
+
+    if not isinstance(body, dict):
+        raise ExternalApiError(
+            "PLATFORM_PROXY_BAD_RESPONSE",
+            "external/call response must be an object",
+        )
+    return ApiResponse(
+        status_code=int(body.get("status_code") or 200),
+        headers={str(k): str(v) for k, v in dict(body.get("headers") or {}).items()},
+        text=str(body.get("text") or ""),
+        data=body.get("data"),
+    )
+
+
+def call_api_local(
+    credential_key: str,
+    method: str,
+    path: str,
+    *,
+    json_body: Any = None,
+    params: Optional[Mapping[str, Any]] = None,
+    data: Any = None,
+    headers: Optional[Mapping[str, str]] = None,
+    signer: Optional[str] = None,
+    timeout: Optional[float] = None,
+    max_attempts: Optional[int] = None,
+) -> ApiResponse:
+    """
+    Platform-local outbound HTTP: resolve credential from domain_secrets, then request.
     """
     # гарантируем bound context (иначе SecretsError/RuntimeContextError)
     _ = current_service_id()
