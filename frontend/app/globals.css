@@ -641,9 +641,10 @@ select {
 
 .tile-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 0.85rem;
   margin: 0.5rem 0 1.25rem;
+  align-items: stretch;
 }
 
 .tile {
@@ -651,11 +652,14 @@ select {
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.78);
   border-radius: 14px;
-  padding: 1.1rem 1rem;
+  padding: 1.15rem 1.05rem 1.2rem;
   text-align: left;
   cursor: pointer;
   display: grid;
-  gap: 0.35rem;
+  gap: 0.45rem;
+  align-content: start;
+  min-height: 9.5rem;
+  width: 100%;
   transition: transform 0.15s ease, border-color 0.2s ease, background 0.2s ease;
 }
 
@@ -677,17 +681,121 @@ select {
 }
 
 .tile-sub {
-  font-size: 0.78rem;
+  font-size: 0.8rem;
+  line-height: 1.45;
   color: var(--ink-soft);
 }
 
-.tile-panel {
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 1.25rem;
+  background: rgba(12, 28, 24, 0.45);
+  backdrop-filter: blur(3px);
+  animation: fade-in 0.18s ease both;
+}
+
+.modal {
+  width: min(560px, 100%);
+  max-height: min(86vh, 720px);
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.72);
-  border-radius: 14px;
-  padding: 1.1rem;
-  margin-bottom: 1rem;
-  animation: expand 0.28s ease both;
+  border-radius: 16px;
+  background: #f7faf8;
+  box-shadow: 0 18px 48px rgba(8, 28, 24, 0.22);
+  animation: expand 0.22s ease both;
+  overflow: hidden;
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 1rem 1.15rem;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.86);
+  flex-shrink: 0;
+}
+
+.modal-head h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.2rem;
+  letter-spacing: -0.02em;
+}
+
+.modal-close {
+  width: auto;
+  flex-shrink: 0;
+}
+
+.modal-body {
+  padding: 1.1rem 1.15rem 1.25rem;
+  overflow: auto;
+}
+
+.modal-body .probe-panel {
+  margin-bottom: 0;
+  margin-top: 0.85rem;
+}
+
+.modal-body .tile-form {
+  max-width: none;
+}
+
+.tip-wrap {
+  position: relative;
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+.tip-wrap > .btn:disabled,
+.tip-wrap > button:disabled {
+  pointer-events: none;
+}
+
+.tip-bubble {
+  position: fixed;
+  transform: translateX(-50%);
+  width: min(300px, calc(100vw - 1.5rem));
+  padding: 0.7rem 0.8rem;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #12352e;
+  color: #f3faf7;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  text-align: left;
+  box-shadow: 0 10px 28px rgba(8, 28, 24, 0.35);
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 1;
+}
+
+.tip-bubble::after {
+  content: "";
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-bottom-color: #12352e;
+}
+
+.tip-bubble-above {
+  transform: translateX(-50%) translateY(-100%);
+}
+
+.tip-bubble-above::after {
+  bottom: auto;
+  top: 100%;
+  border-bottom-color: transparent;
+  border-top-color: #12352e;
 }
 
 .tile-form {
