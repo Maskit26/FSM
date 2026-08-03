@@ -12,8 +12,8 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 
 from fsm_platform.core.db_layer import default_db_layer
-from fsm_platform.host.engines import platform_session
-from fsm_platform.host.tenant_auth import (
+from fsm_platform.host.runtime.engines import platform_session
+from fsm_platform.host.security.tenant_auth import (
     TenantAuthError,
     hash_opaque_token,
     hash_password,

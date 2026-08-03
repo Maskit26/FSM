@@ -6,7 +6,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from fsm_platform.host import worker_provisioner as wp
+from fsm_platform.host.workers import worker_provisioner as wp
 
 
 class WorkerProvisionerBackendTests(unittest.TestCase):

@@ -16,21 +16,23 @@ import {
   deleteSecret,
   fetchCatalog,
   graphPublish,
+  inboundHookSecretKey,
   inboundHookUrl,
   isSessionExpiredError,
   listAdminTokens,
+  listEvents,
   listSchedules,
   listSecrets,
   listWebhooks,
   logout,
   pauseSchedule,
+  PlatformEventItem,
   reloadDomain,
   resumeSchedule,
   revokeAdminToken,
   rotateAdminToken,
   telegramLink,
   telegramWebhookUrl,
-  inboundHookSecretKey,
   upsertSecret,
   workerRestart,
   workerStatus,
@@ -217,6 +219,23 @@ export default function CabinetPage() {
     "menu",
   );
 
+  const [domainReady, setDomainReady] = useState<boolean | null>(null);
+  const [domainError, setDomainError] = useState<string | null>(null);
+  const [domainCheckedAt, setDomainCheckedAt] = useState<string | null>(null);
+  const [domainStats, setDomainStats] = useState<Record<string, unknown>>({});
+  const [domainWarnings, setDomainWarnings] = useState<
+    { code?: string; message?: string; where?: string }[]
+  >([]);
+  const [processNames, setProcessNames] = useState<string[]>([]);
+  const [opsCount, setOpsCount] = useState(0);
+  const [hooksCount, setHooksCount] = useState(0);
+  const [workerLive, setWorkerLive] = useState<string | null>(null);
+
+  const [liveEvents, setLiveEvents] = useState<PlatformEventItem[]>([]);
+  const [eventsCursor, setEventsCursor] = useState(0);
+  const [eventsPaused, setEventsPaused] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
+
   useEffect(() => {
     const token = getAccessToken();
     if (!token) {
@@ -240,7 +259,7 @@ export default function CabinetPage() {
   useEffect(() => {
     if (!openTile) return;
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setOpenTile(null);
+      if (e.key === "Escape") closeTile();
     }
     document.addEventListener("keydown", onKey);
     const prev = document.body.style.overflow;
@@ -250,6 +269,115 @@ export default function CabinetPage() {
       document.body.style.overflow = prev;
     };
   }, [openTile]);
+
+  const refreshDomainHealth = useCallback(async () => {
+    if (!serviceId || !adminToken) return;
+    try {
+      const cat = await fetchCatalog(serviceId, adminToken);
+      setDomainReady(!!cat.domain_ready);
+      const boot = cat.domain_bootstrap || {};
+      setDomainError(
+        typeof boot.error === "string" && boot.error ? boot.error : null,
+      );
+      setDomainCheckedAt(
+        typeof boot.checked_at === "string" ? boot.checked_at : null,
+      );
+      setDomainStats(
+        boot.stats && typeof boot.stats === "object"
+          ? (boot.stats as Record<string, unknown>)
+          : {},
+      );
+      setDomainWarnings(Array.isArray(boot.warnings) ? boot.warnings : []);
+      setProcessNames(cat.processes || []);
+      setOpsCount((cat.operations || []).length);
+      setHooksCount((cat.hooks || []).length);
+      setHookChannels(cat.hooks || []);
+    } catch (err) {
+      setDomainReady(false);
+      setDomainError(
+        err instanceof Error ? err.message : "Не удалось загрузить catalog",
+      );
+    }
+    try {
+      const ws = await workerStatus(serviceId, adminToken);
+      setWorkerLive(ws.status || "unknown");
+    } catch {
+      setWorkerLive("unavailable");
+    }
+  }, [serviceId, adminToken]);
+
+  // Один последовательный цикл: не бьём catalog/events/worker параллельно —
+  // platform DB pool маленький (Clever ~5 conn), иначе QueuePool → 500.
+  useEffect(() => {
+    if (!ready || !serviceId || !adminToken) return;
+    let cancelled = false;
+    const cursorRef = { current: eventsCursor };
+    let seeded = liveEvents.length > 0;
+    let tickN = 0;
+
+    async function pullEvents() {
+      if (eventsPaused) return;
+      try {
+        const res = !seeded
+          ? await listEvents(serviceId, adminToken, {
+              newest: true,
+              limit: 40,
+            })
+          : await listEvents(serviceId, adminToken, {
+              after_id: cursorRef.current,
+              limit: 50,
+            });
+        if (cancelled) return;
+        const items = res.items || [];
+        if (!seeded) {
+          setLiveEvents(items.slice().reverse());
+          seeded = true;
+        } else if (items.length) {
+          setLiveEvents((prev) => {
+            const merged = [...items.slice().reverse(), ...prev];
+            return merged.slice(0, 80);
+          });
+        }
+        if (res.next_after_id != null) {
+          cursorRef.current = Number(res.next_after_id) || cursorRef.current;
+          setEventsCursor(cursorRef.current);
+        }
+        setEventsError(null);
+      } catch (err) {
+        if (!cancelled) {
+          setEventsError(
+            err instanceof Error ? err.message : "Ошибка загрузки events",
+          );
+        }
+      }
+    }
+
+    async function cycle() {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        // health ~ каждые 15с при интервале 5с
+        if (tickN % 3 === 0) {
+          await refreshDomainHealth();
+        }
+        tickN += 1;
+        if (!cancelled) await pullEvents();
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    let inFlight = false;
+    void cycle();
+    const t = window.setInterval(() => {
+      void cycle();
+    }, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- seed cursor once per mount/pause
+  }, [ready, serviceId, adminToken, eventsPaused, refreshDomainHealth]);
 
   function redirectToLogin() {
     clearAuthSession();
@@ -297,6 +425,7 @@ export default function CabinetPage() {
   }
 
   function closeTile() {
+    clearMsg();
     setOpenTile(null);
     setInputPanel("menu");
   }
@@ -583,6 +712,7 @@ export default function CabinetPage() {
       const res = await reloadDomain(serviceId, adminToken);
       setDomainResult(JSON.stringify(res, null, 2));
       setInfo("Catalog reload выполнен (процесс domain на :8100 не перезапускается).");
+      await refreshDomainHealth();
     } catch (err) {
       fail(err);
     } finally {
@@ -597,6 +727,7 @@ export default function CabinetPage() {
       const res = await connectDomain(serviceId, adminToken);
       setDomainResult(JSON.stringify(res, null, 2));
       setInfo("Connect выполнен.");
+      await refreshDomainHealth();
     } catch (err) {
       fail(err);
     } finally {
@@ -803,6 +934,128 @@ export default function CabinetPage() {
               next_run_at и поставит instance в очередь.
             </span>
           </button>
+        </div>
+
+        <div className="monitors-row">
+          <section className="monitor-panel domain-monitor" aria-label="Статус домена">
+            <div className="monitor-head">
+              <h2>Статус домена</h2>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                style={{ width: "auto" }}
+                onClick={() => void refreshDomainHealth()}
+              >
+                Обновить
+              </button>
+            </div>
+            <div className="health-grid">
+              <div className={`health-chip${domainReady ? " ok" : domainReady === false ? " bad" : ""}`}>
+                <span className="health-label">Ready</span>
+                <strong>
+                  {domainReady == null ? "…" : domainReady ? "да" : "нет"}
+                </strong>
+              </div>
+              <div className="health-chip">
+                <span className="health-label">Worker</span>
+                <strong>{workerLive || "…"}</strong>
+              </div>
+              <div className="health-chip">
+                <span className="health-label">Processes</span>
+                <strong>{processNames.length}</strong>
+              </div>
+              <div className="health-chip">
+                <span className="health-label">Operations</span>
+                <strong>{opsCount}</strong>
+              </div>
+              <div className="health-chip">
+                <span className="health-label">Hooks</span>
+                <strong>{hooksCount}</strong>
+              </div>
+              <div className="health-chip">
+                <span className="health-label">Transitions</span>
+                <strong>
+                  {domainStats.transitions_scanned != null
+                    ? String(domainStats.transitions_scanned)
+                    : "—"}
+                </strong>
+              </div>
+            </div>
+            {domainCheckedAt ? (
+              <p className="muted monitor-meta">
+                Проверка: {domainCheckedAt}
+                {domainStats.guards != null ? ` · guards ${String(domainStats.guards)}` : ""}
+                {domainStats.effects != null ? ` · effects ${String(domainStats.effects)}` : ""}
+              </p>
+            ) : null}
+            {domainError ? (
+              <div className="msg msg-error" style={{ marginTop: "0.75rem" }}>
+                {domainError}
+              </div>
+            ) : null}
+            {domainWarnings.length > 0 ? (
+              <ul className="warn-list">
+                {domainWarnings.map((w, i) => (
+                  <li key={`${w.code || "w"}-${i}`}>
+                    <code>{w.code || "WARNING"}</code>
+                    <span>{w.message || "—"}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {processNames.length > 0 ? (
+              <p className="muted process-strip">
+                {processNames.join(" · ")}
+              </p>
+            ) : null}
+          </section>
+
+          <section className="monitor-panel events-monitor" aria-label="События домена">
+            <div className="monitor-head">
+              <h2>События</h2>
+              <div className="monitor-actions">
+                <span className="muted monitor-meta">
+                  {eventsPaused ? "пауза" : "live · 5с"}
+                  {liveEvents.length ? ` · ${liveEvents.length}` : ""}
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  style={{ width: "auto" }}
+                  onClick={() => setEventsPaused((p) => !p)}
+                >
+                  {eventsPaused ? "Продолжить" : "Пауза"}
+                </button>
+              </div>
+            </div>
+            {eventsError ? (
+              <div className="msg msg-error" style={{ marginBottom: "0.75rem" }}>
+                {eventsError}
+              </div>
+            ) : null}
+            {liveEvents.length === 0 && !eventsError ? (
+              <p className="muted">Пока нет событий — появятся при работе домена.</p>
+            ) : (
+              <ul className="events-feed">
+                {liveEvents.map((ev) => (
+                  <li key={ev.id} className="event-row">
+                    <span className="event-id">#{ev.id}</span>
+                    <span className="event-type">{ev.event_type || "—"}</span>
+                    <span className="event-meta">
+                      {ev.entity_type || "—"}
+                      {ev.entity_id != null ? `/${ev.entity_id}` : ""}
+                      {ev.instance_id != null ? ` · inst ${ev.instance_id}` : ""}
+                    </span>
+                    <time className="event-time" dateTime={ev.created_at || undefined}>
+                      {ev.created_at
+                        ? new Date(ev.created_at).toLocaleString()
+                        : ""}
+                    </time>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
         </div>
 
         {openTile ? (

@@ -19,7 +19,7 @@ from urllib.parse import urljoin
 import requests
 
 from fsm_platform.core.domain_errors import DomainError
-from fsm_platform.host.retry_policy import backoff_seconds
+from fsm_platform.host.workers.retry_policy import backoff_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def resolve_contract_config(service_id: str) -> ContractConfig:
     if not sid:
         raise ContractError("SERVICE_ID_REQUIRED", "service_id is empty")
 
-    from fsm_platform.host.tenant_config import (
+    from fsm_platform.host.tenant.tenant_config import (
         SECRET_CONTRACT_BASE_URL,
         SECRET_CONTRACT_SHARED_SECRET,
         resolve_tenant_ref,

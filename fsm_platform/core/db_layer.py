@@ -1124,27 +1124,55 @@ class FsmDbLayer:
         service_id: str,
         after_id: int = 0,
         limit: int = 100,
+        newest: bool = False,
     ) -> list[dict[str, Any]]:
-        """События platform_events с id > after_id (для WS/poll fan-out)."""
-        rows = session.execute(
-            text(
-                """
-                SELECT id, service_id, event_type, instance_id,
-                       entity_type, entity_id, payload_json,
-                       correlation_id, client_request_id, created_at
-                FROM platform_events
-                WHERE service_id = :service_id
-                  AND id > :after_id
-                ORDER BY id ASC
-                LIMIT :limit
-                """
-            ),
-            {
-                "service_id": service_id,
-                "after_id": int(after_id),
-                "limit": int(max(1, min(limit, 500))),
-            },
-        ).mappings().all()
+        """
+        События platform_events.
+        newest=False: id > after_id ASC (cursor poll).
+        newest=True: последние N (DESC→ASC) для монитора ЛК.
+        """
+        lim = int(max(1, min(limit, 500)))
+        if newest:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT id, service_id, event_type, instance_id,
+                           entity_type, entity_id, payload_json,
+                           correlation_id, client_request_id, created_at
+                    FROM (
+                        SELECT id, service_id, event_type, instance_id,
+                               entity_type, entity_id, payload_json,
+                               correlation_id, client_request_id, created_at
+                        FROM platform_events
+                        WHERE service_id = :service_id
+                        ORDER BY id DESC
+                        LIMIT :limit
+                    ) AS recent
+                    ORDER BY id ASC
+                    """
+                ),
+                {"service_id": service_id, "limit": lim},
+            ).mappings().all()
+        else:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT id, service_id, event_type, instance_id,
+                           entity_type, entity_id, payload_json,
+                           correlation_id, client_request_id, created_at
+                    FROM platform_events
+                    WHERE service_id = :service_id
+                      AND id > :after_id
+                    ORDER BY id ASC
+                    LIMIT :limit
+                    """
+                ),
+                {
+                    "service_id": service_id,
+                    "after_id": int(after_id),
+                    "limit": lim,
+                },
+            ).mappings().all()
         out: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
@@ -2336,6 +2364,111 @@ class FsmDbLayer:
                 )
             ).mappings().all()
         return [dict(r) for r in rows]
+
+    # --- platform metrics (admin /v1/metrics) ---
+
+    def collect_platform_queue_metrics(self, session: SessionLike) -> dict[str, Any]:
+        """Агрегаты instances / outbox / reconcile / timers для ops-метрик."""
+        instances = {
+            str(r["status"]): int(r["n"])
+            for r in session.execute(
+                text(
+                    """
+                    SELECT status, COUNT(*) AS n
+                    FROM server_fsm_instances
+                    GROUP BY status
+                    """
+                )
+            ).mappings()
+        }
+        oldest_pending = session.execute(
+            text(
+                """
+                SELECT TIMESTAMPDIFF(SECOND, MIN(created_at), UTC_TIMESTAMP()) AS age_s
+                FROM server_fsm_instances
+                WHERE status = 'PENDING'
+                  AND (next_attempt_at IS NULL
+                       OR next_attempt_at <= UTC_TIMESTAMP())
+                """
+            )
+        ).scalar()
+        failed_1h = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM server_fsm_instances
+                WHERE status = 'FAILED'
+                  AND finished_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR)
+                """
+            )
+        ).scalar()
+        outbox = {
+            str(r["status"]): int(r["n"])
+            for r in session.execute(
+                text(
+                    """
+                    SELECT status, COUNT(*) AS n
+                    FROM platform_outbox
+                    GROUP BY status
+                    """
+                )
+            ).mappings()
+        }
+        oldest_outbox = session.execute(
+            text(
+                """
+                SELECT TIMESTAMPDIFF(SECOND, MIN(created_at), UTC_TIMESTAMP()) AS age_s
+                FROM platform_outbox
+                WHERE status = 'PENDING'
+                  AND next_attempt_at <= UTC_TIMESTAMP()
+                """
+            )
+        ).scalar()
+        reconcile = {
+            str(r["status"]): int(r["n"])
+            for r in session.execute(
+                text(
+                    """
+                    SELECT status, COUNT(*) AS n
+                    FROM platform_reconcile_queue
+                    GROUP BY status
+                    """
+                )
+            ).mappings()
+        }
+        timers_due = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM fsm_timers
+                WHERE status = 'SCHEDULED'
+                  AND fire_at <= UTC_TIMESTAMP()
+                """
+            )
+        ).scalar()
+        return {
+            "instances": {
+                "by_status": instances,
+                "pending": int(instances.get("PENDING") or 0),
+                "processing": int(instances.get("PROCESSING") or 0),
+                "failed_1h": int(failed_1h or 0),
+                "oldest_due_pending_age_seconds": int(oldest_pending or 0)
+                if oldest_pending is not None
+                else None,
+            },
+            "outbox": {
+                "by_status": outbox,
+                "pending": int(outbox.get("PENDING") or 0),
+                "dead": int(outbox.get("DEAD") or 0),
+                "oldest_due_pending_age_seconds": int(oldest_outbox or 0)
+                if oldest_outbox is not None
+                else None,
+            },
+            "reconcile": {
+                "by_status": reconcile,
+                "pending": int(reconcile.get("PENDING") or 0),
+                "dead": int(reconcile.get("DEAD") or 0),
+            },
+            "timers": {"due_scheduled": int(timers_due or 0)},
+        }
 
 
 default_db_layer = FsmDbLayer()

@@ -21,11 +21,11 @@ def telegram_setting(key: str) -> str:
     if not k:
         return ""
 
-    from fsm_platform.host.runtime_context import peek_service_id
+    from fsm_platform.host.runtime.runtime_context import peek_service_id
 
     if peek_service_id():
         try:
-            from fsm_platform.host.secrets import get_domain_secret
+            from fsm_platform.host.security.secrets import get_domain_secret
 
             val = get_domain_secret(k)
             if val is not None and str(val).strip():

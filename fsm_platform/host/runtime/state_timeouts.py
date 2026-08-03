@@ -35,7 +35,7 @@ from typing import Any, Optional
 from fsm_platform.core.db_layer import SessionLike, default_db_layer
 from fsm_platform.core.registry import default_process_registry
 from fsm_platform.core.transition_repository import TransitionRepository
-from fsm_platform.host import side_effects
+from fsm_platform.host.runtime import side_effects
 
 logger = logging.getLogger(__name__)
 

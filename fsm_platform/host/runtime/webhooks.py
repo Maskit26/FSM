@@ -6,7 +6,7 @@ import json
 from typing import Any, Optional
 
 from fsm_platform.core.db_layer import SessionLike, default_db_layer
-from fsm_platform.host import side_effects
+from fsm_platform.host.runtime import side_effects
 
 
 def _event_types_match(raw: Any, event_type: str) -> bool:

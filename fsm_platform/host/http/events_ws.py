@@ -30,12 +30,12 @@ from starlette.concurrency import run_in_threadpool
 
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.domain_errors import DomainError
-from fsm_platform.host.auth import AuthError, auth_enabled, resolve_actor
-from fsm_platform.host.engines import platform_session
+from fsm_platform.host.security.auth import AuthError, auth_enabled, resolve_actor
+from fsm_platform.host.runtime.engines import platform_session
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.http.dependencies import authenticate_domain_request
-from fsm_platform.host.operations import default_operation_registry
-from fsm_platform.host.tenant_auth import TenantAuthError
+from fsm_platform.host.tenant.operations import default_operation_registry
+from fsm_platform.host.security.tenant_auth import TenantAuthError
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def _invoke_operation(
 ) -> dict[str, Any]:
     meta = default_operation_registry.get(service_id, operation)
     if meta is None:
-        from fsm_platform.host.boot import boot
+        from fsm_platform.host.tenant.boot import boot
 
         boot()
         meta = default_operation_registry.get(service_id, operation)

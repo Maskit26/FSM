@@ -30,8 +30,8 @@ def resolve_tenant_ref(service_id: str, ref: str) -> Optional[str]:
     if "://" in key:
         return key
 
-    from fsm_platform.host.runtime_context import service_scope
-    from fsm_platform.host.secrets import get_domain_secret
+    from fsm_platform.host.runtime.runtime_context import service_scope
+    from fsm_platform.host.security.secrets import get_domain_secret
 
     try:
         with service_scope(sid):

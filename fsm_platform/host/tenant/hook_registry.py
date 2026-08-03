@@ -69,11 +69,11 @@ def dispatch_inbound_hook(
     raw_body: bytes = b"",
 ) -> dict[str, Any]:
     """Проксирует inbound hook в domain service (Contract API)."""
-    from fsm_platform.host.contract_client import ContractError, get_contract_client
-    from fsm_platform.host.contract_side_effects import apply_declared
-    from fsm_platform.host.domain_bootstrap import is_domain_ready
-    from fsm_platform.host.engines import platform_session
-    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.contract.contract_client import ContractError, get_contract_client
+    from fsm_platform.host.contract.contract_side_effects import apply_declared
+    from fsm_platform.host.tenant.domain_bootstrap import is_domain_ready
+    from fsm_platform.host.runtime.engines import platform_session
+    from fsm_platform.host.runtime.runtime_context import service_scope
 
     ch = str(channel or "").strip().lower()
     if not default_webhook_registry.has(service_id, ch):

@@ -10,7 +10,7 @@ import json
 import logging
 from typing import Any, Optional
 
-from fsm_platform.host import side_effects
+from fsm_platform.host.runtime import side_effects
 
 from domains.courier.core.exceptions import (
     CoreAuthError,

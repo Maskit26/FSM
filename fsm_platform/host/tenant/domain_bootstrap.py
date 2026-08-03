@@ -26,13 +26,13 @@ from fsm_platform.core.remote import (
     remote_on_failed,
     remote_query,
 )
-from fsm_platform.host.domain_validator import (
+from fsm_platform.host.tenant.domain_validator import (
     DomainValidationError,
     default_domain_validator,
 )
-from fsm_platform.host.engines import graph_session, platform_session
-from fsm_platform.host.hook_registry import default_webhook_registry
-from fsm_platform.host.operations import default_operation_registry
+from fsm_platform.host.runtime.engines import graph_session, platform_session
+from fsm_platform.host.tenant.hook_registry import default_webhook_registry
+from fsm_platform.host.tenant.operations import default_operation_registry
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class DomainBootstrapStatus:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     stats: dict[str, Any] = field(default_factory=dict)
+    warnings: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +57,7 @@ class DomainBootstrapStatus:
             "error": self.error,
             "checked_at": self.checked_at,
             "stats": self.stats,
+            "warnings": list(self.warnings),
         }
 
 
@@ -146,12 +148,14 @@ def _record_status(
     ok: bool,
     error: Optional[str] = None,
     stats: Optional[dict[str, Any]] = None,
+    warnings: Optional[list[dict[str, Any]]] = None,
 ) -> DomainBootstrapStatus:
     st = DomainBootstrapStatus(
         service_id=service_id,
         ok=ok,
         error=error,
         stats=dict(stats or {}),
+        warnings=list(warnings or []),
     )
     _bootstrap_status[service_id] = st
     return st
@@ -163,8 +167,8 @@ def bootstrap_domain(service_id: str, *, raise_on_error: bool = False) -> bool:
     Returns True если tenant готов к invoke/FSM.
     По умолчанию не бросает — platform продолжает работать.
     """
-    from fsm_platform.host.contract_client import get_contract_client
-    from fsm_platform.host.domain_validator import ValidationReport
+    from fsm_platform.host.contract.contract_client import get_contract_client
+    from fsm_platform.host.tenant.domain_validator import ValidationReport
 
     sid = str(service_id or "").strip()
     if not sid:
@@ -208,7 +212,13 @@ def bootstrap_domain(service_id: str, *, raise_on_error: bool = False) -> bool:
 
     if not report.ok:
         err = "; ".join(e.code for e in report.errors) or "VALIDATION_FAILED"
-        _record_status(sid, ok=False, error=err)
+        _record_status(
+            sid,
+            ok=False,
+            error=err,
+            stats=report.stats,
+            warnings=[w.to_dict() for w in report.warnings],
+        )
         logger.warning(
             "domain validation failed service_id=%s errors=%s",
             sid,
@@ -218,13 +228,14 @@ def bootstrap_domain(service_id: str, *, raise_on_error: bool = False) -> bool:
             raise DomainValidationError(report)
         return False
 
-    if report.warnings:
+    warn_dicts = [w.to_dict() for w in report.warnings]
+    if warn_dicts:
         logger.warning(
             "domain validation warnings service_id=%s warnings=%s",
             sid,
-            report.to_dict()["warnings"],
+            warn_dicts,
         )
-    _record_status(sid, ok=True, stats=report.stats)
+    _record_status(sid, ok=True, stats=report.stats, warnings=warn_dicts)
     logger.info(
         "domain bootstrap ok service_id=%s stats=%s",
         sid,

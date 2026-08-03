@@ -9,9 +9,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from fsm_platform.core.http_client import ExternalApiError, call_api_local
-from fsm_platform.host.contract_auth import verify_contract_request
-from fsm_platform.host.contract_client import ContractError, resolve_contract_config
-from fsm_platform.host.runtime_context import service_scope
+from fsm_platform.host.contract.contract_auth import verify_contract_request
+from fsm_platform.host.contract.contract_client import ContractError, resolve_contract_config
+from fsm_platform.host.runtime.runtime_context import service_scope
 
 router = APIRouter(prefix="/v1/{service_id}", tags=["Domain Runtime"])
 

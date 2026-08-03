@@ -6,7 +6,7 @@ import os
 
 from fastapi import HTTPException, Request
 
-from fsm_platform.host.contract_auth import verify_contract_request as _verify
+from fsm_platform.host.contract.contract_auth import verify_contract_request as _verify
 
 
 def verify_incoming(request: Request, raw_body: bytes) -> None:

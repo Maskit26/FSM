@@ -29,13 +29,19 @@ function extractErrorCode(body: unknown): string | null {
 }
 
 function apiBase(): string {
-  return (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(
+  // Прямой URL платформы. Same-origin rewrite /platform-api на 127.0.0.1
+  // давал 500 на медленном auth (таймаут Next proxy), хотя uvicorn был жив.
+  return (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(
     /\/$/,
     "",
   );
 }
 
 function errorMessage(body: unknown, fallback: string): string {
+  if (typeof body === "string") {
+    const t = body.trim();
+    return t ? t.slice(0, 280) : fallback;
+  }
   if (!body || typeof body !== "object") return fallback;
   const detail = (body as { detail?: unknown }).detail;
   if (typeof detail === "string") return detail;
@@ -84,11 +90,18 @@ export async function apiFetch<T>(
     headers["X-Admin-Token"] = options.adminToken;
   }
 
-  const res = await fetch(`${apiBase()}${path}`, {
-    method: options.method || "GET",
-    headers,
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-  });
+  const url = `${apiBase()}${path}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: options.method || "GET",
+      headers,
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(`${reason} (${url})`);
+  }
 
   if (res.status === 204) {
     return undefined as T;
@@ -140,11 +153,18 @@ export async function apiFetchStatus(
     headers["X-Admin-Token"] = options.adminToken;
   }
 
-  const res = await fetch(`${apiBase()}${path}`, {
-    method: options.method || "GET",
-    headers,
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-  });
+  const url = `${apiBase()}${path}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: options.method || "GET",
+      headers,
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(`${reason} (${url})`);
+  }
 
   const text = await res.text();
   let parsed: unknown = null;
@@ -317,10 +337,38 @@ export function connectDomain(serviceId: string, domainAdminToken: string) {
 export type CatalogResponse = {
   service_id: string;
   domain_ready: boolean;
-  domain_bootstrap?: Record<string, unknown>;
+  domain_bootstrap?: {
+    service_id?: string;
+    ok?: boolean;
+    error?: string | null;
+    checked_at?: string;
+    stats?: Record<string, unknown>;
+    warnings?: { code?: string; message?: string; where?: string }[];
+  };
   operations: { operation: string; kind: string }[];
   processes: string[];
   hooks: string[];
+};
+
+export type PlatformEventItem = {
+  id: number;
+  service_id?: string;
+  event_type?: string;
+  instance_id?: number | null;
+  entity_type?: string | null;
+  entity_id?: number | null;
+  payload?: Record<string, unknown>;
+  correlation_id?: string | null;
+  client_request_id?: string | null;
+  created_at?: string;
+};
+
+export type EventsResponse = {
+  service_id: string;
+  after_id: number;
+  next_after_id: number;
+  newest?: boolean;
+  items: PlatformEventItem[];
 };
 
 export function fetchCatalog(serviceId: string, domainAdminToken: string) {
@@ -553,13 +601,14 @@ export function entityHistory(
 export function listEvents(
   serviceId: string,
   domainAdminToken: string,
-  opts: { after_id?: number; limit?: number } = {},
+  opts: { after_id?: number; limit?: number; newest?: boolean } = {},
 ) {
   const q = new URLSearchParams();
   if (opts.after_id != null) q.set("after_id", String(opts.after_id));
   if (opts.limit != null) q.set("limit", String(opts.limit));
+  if (opts.newest) q.set("newest", "true");
   const qs = q.toString();
-  return apiFetch<Record<string, unknown>>(
+  return apiFetch<EventsResponse>(
     `/v1/${encodeURIComponent(serviceId)}/events${qs ? `?${qs}` : ""}`,
     { adminToken: domainAdminToken },
   );
@@ -589,7 +638,7 @@ export function telegramLink(serviceId: string, userId: number) {
 }
 
 export function apiBaseUrl(): string {
-  return (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(
+  return (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(
     /\/$/,
     "",
   );

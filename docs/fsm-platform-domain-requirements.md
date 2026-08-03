@@ -92,7 +92,13 @@ Domain service (:8100…) — DOMAIN_DATABASE_URL (business + fsm_* tables)
 ```text
 fsm_platform/
   core/             # FSM runtime; текущий http_client — временное исключение
-  host/             # API, worker, boot, contract client, secrets
+  host/
+    http/           # FastAPI routes
+    contract/       # HMAC client / invoke / side-effects
+    security/       # secrets, auth, log redaction
+    workers/        # FSM / outbox / reconcile / provisioner
+    tenant/         # boot, bootstrap, validator, operations, hooks
+    runtime/        # engines, context, side_effects, webhooks, metrics
   domain_runtime/   # библиотека процесса домена (Contract FastAPI)
 ```
 
@@ -100,6 +106,7 @@ fsm_platform/
 
 ```text
 input/telegram/     # входящий Telegram Update
+input/generic/      # универсальный inbound
 output/telegram/    # исходящая отправка Bot API
 output/webhook/     # исходящий HMAC POST на URL клиента
 main.py             # entry Platform API
@@ -122,7 +129,7 @@ credentials читает только platform process.
 | `transition_repository.py` | SELECT исходящих рёбер из graph DB (`fsm_transitions`) |
 | `transition_executor.py` | UPSERT `entity_fsm_state` + запись `fsm_transition_logs` (platform DB) |
 | `state_store.py` | Чтение/запись текущего FSM-state сущности |
-| `db_layer.py` | Весь SQL **platform** DB (instances, timers, outbox, secrets rows, …) |
+| `db_layer.py` | Весь SQL **platform** DB (instances, timers, outbox, secrets rows, metrics, …) |
 | `registry.py` | Process / Guard / Effect registries; на платформе значения = `RemoteRef` |
 | `remote.py` | `RemoteRef` — дескриптор удалённого handler (имя + kind) |
 | `types.py` | `ProcessDef`, `GuardResult`, `EffectResult`, `FsmResult`, нормализация |
@@ -133,34 +140,38 @@ credentials читает только platform process.
 
 ### 4.2. `host/` — оболочка платформы
 
-| Модуль | Назначение |
-|--------|------------|
-| `http/app.py` | FastAPI: `/v1/{service_id}/…`, admin, telegram routes |
-| `http/request_runtime.py` | Sync invoke: Contract command/query + bootstrap/enqueue + `apply_declared`; poll instance |
+| Пакет / модуль | Назначение |
+|----------------|------------|
+| `http/app.py` | FastAPI: `/v1/{service_id}/…`, admin, input routes |
+| `http/request_runtime.py` | Sync invoke + bootstrap/enqueue + `apply_declared`; poll instance |
 | `http/events_ws.py` | WebSocket поток `platform_events` |
-| `worker.py` | `process_one` / `run_loop`: timers → claim instance → `run_instance` → outbox → reconcile |
-| `outbox_worker.py` | Claim `platform_outbox` → `output/*` или Contract `/outbox/deliver` |
-| `reconcile_worker.py` | Докат platform-части после dual-commit сбоя |
-| `boot.py` | Старт: list `domain_services` → resolve graph URLs → engines → bootstrap catalog |
-| `domain_bootstrap.py` | `GET /catalog` → заполнить RemoteRef registries + Validator |
-| `domain_validator.py` | Accept / hot-reload: catalog ↔ graph SQL |
-| `contract_client.py` | HMAC HTTP-клиент; `resolve_contract_config` из secrets |
-| `contract_invoke.py` | Обёртки: context / guard / effect / command / on_failed |
-| `contract_side_effects.py` | `apply_declared` — §5.4 |
-| `contract_auth.py` | Построение/проверка HMAC (общая с domain middleware) |
-| `tenant_config.py` | `resolve_tenant_ref` / стандартные ключи secret names |
-| `secrets.py` | Fernet CRUD `domain_secrets`; `require_admin` |
-| `runtime_context.py` | `service_scope(service_id)` / `current_service_id()` — контекст арендатора в потоке |
-| `engines.py` | Session makers: platform + per-tenant graph read/write |
-| `operations.py` | OperationRegistry на платформе (`RemoteRef` после catalog) |
-| `webhooks.py` | Подписки клиентов: fan-out события → outbox `channel=webhook` |
-| `side_effects.py` | `notify`, `emit_event`, `schedule_timer`, `call_api`, `start_saga` |
-| `graph_version.py` | Текущая версия графа для instance |
-| `retry_policy.py` | Backoff / retry instance и Contract |
-| `state_timeouts.py` | Политики таймаутов состояний (если включены) |
-| `auth.py` | Dev/Bearer для Public API (actor tokens) |
-| `metrics.py` | Метрики процесса |
-| `hook_registry.py` | Inbound hooks из catalog (если домен их объявил) |
+| `workers/worker.py` | `process_one` / `run_loop`: timers → claim → `run_instance` → outbox → reconcile |
+| `workers/outbox_worker.py` | Claim `platform_outbox` → `output/*` или Contract `/outbox/deliver` |
+| `workers/reconcile_worker.py` | Докат platform-части после dual-commit сбоя |
+| `workers/worker_provisioner.py` | Lifecycle dedicated worker |
+| `workers/retry_policy.py` | Backoff / retry instance и Contract |
+| `tenant/boot.py` | Старт: `domain_services` → graph engines → bootstrap catalog |
+| `tenant/domain_bootstrap.py` | `GET /catalog` → RemoteRef registries + Validator |
+| `tenant/domain_validator.py` | Accept / hot-reload: catalog ↔ graph SQL |
+| `tenant/operations.py` | OperationRegistry (`RemoteRef` после catalog) |
+| `tenant/hook_registry.py` | Inbound generic channels из catalog |
+| `tenant/tenant_config.py` | `resolve_tenant_ref` / стандартные ключи secret names |
+| `contract/contract_client.py` | HMAC HTTP-клиент; `resolve_contract_config` |
+| `contract/contract_invoke.py` | Обёртки: context / guard / effect / command / on_failed |
+| `contract/contract_side_effects.py` | `apply_declared` — §5.4 |
+| `contract/contract_auth.py` | Построение/проверка HMAC |
+| `security/secrets.py` | CRUD `domain_secrets`; `require_admin` |
+| `security/secret_broker.py` | Scoped Fernet / HKDF per `service_id` |
+| `security/log_redaction.py` | Маскирование секретов в логах |
+| `security/auth.py` | Dev/Bearer для Public API (actor tokens) |
+| `security/tenant_auth.py` | Tenant account / DOMAIN_ADMIN_TOKEN |
+| `runtime/runtime_context.py` | `service_scope` / `current_service_id` |
+| `runtime/engines.py` | Session makers: platform + per-tenant graph |
+| `runtime/side_effects.py` | `notify`, `emit_event`, `schedule_timer`, `call_api`, `start_saga` |
+| `runtime/webhooks.py` | Fan-out подписок → outbox `channel=webhook` |
+| `runtime/graph_version.py` | Версия графа для instance |
+| `runtime/state_timeouts.py` | Политики таймаутов состояний |
+| `runtime/metrics.py` | Снимок очередей для `GET /v1/metrics` (SQL только через `db_layer`) |
 
 ### 4.3. `domain_runtime/` — процесс домена
 

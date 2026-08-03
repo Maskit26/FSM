@@ -3,35 +3,37 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
-
+import logging
 import os
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from fsm_platform.host.auth import AuthError, resolve_actor
+from fsm_platform.host.security.auth import AuthError, resolve_actor
 from fsm_platform.host.http.auth_routes import router as auth_router
 from fsm_platform.host.http.dependencies import (
     require_domain_service_access,
     require_platform_admin,
 )
 from fsm_platform.host.http.external_routes import router as external_router
-from fsm_platform.host.domain_bootstrap import get_bootstrap_status, is_domain_ready
+from fsm_platform.host.tenant.domain_bootstrap import get_bootstrap_status, is_domain_ready
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.http.events_ws import router as events_ws_router
 from fsm_platform.host.http.tenant_routes import router as tenant_router
-from fsm_platform.host.hook_registry import (
+from fsm_platform.host.tenant.hook_registry import (
     HookError,
     default_webhook_registry,
 )
-from fsm_platform.host.operations import default_operation_registry
+from fsm_platform.host.tenant.operations import default_operation_registry
 from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.registry import default_process_registry
-from fsm_platform.host.engines import graph_write_session, platform_session
-from fsm_platform.host.graph_version import publish_graph_version
+from fsm_platform.host.runtime.engines import graph_write_session, platform_session
+from fsm_platform.host.runtime.graph_version import publish_graph_version
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="FSM Platform",
@@ -51,7 +53,10 @@ app = FastAPI(
 
 _cors_origins = [
     o.strip()
-    for o in str(os.environ.get("CORS_ORIGINS") or "http://localhost:3000").split(",")
+    for o in str(
+        os.environ.get("CORS_ORIGINS")
+        or "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
     if o.strip()
 ]
 app.add_middleware(
@@ -61,6 +66,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/debug/ok")
+def debug_ok() -> dict[str, str]:
+    """Локальная проверка, что процесс отвечает без DB."""
+    return {"status": "ok", "v": "2"}
+
+
+@app.get("/debug/pool")
+def debug_pool() -> dict[str, Any]:
+    """Снимок SQLAlchemy pool platform DB (без секретов)."""
+    from fsm_platform.host.runtime.engines import get_platform_engine
+    from sqlalchemy import text
+
+    engine = get_platform_engine()
+    pool = engine.pool
+    info: dict[str, Any] = {
+        "pool_class": type(pool).__name__,
+        "status": pool.status() if hasattr(pool, "status") else None,
+    }
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        info["select1"] = "ok"
+    except Exception as exc:
+        info["select1"] = f"{type(exc).__name__}: {exc}"[:300]
+    return info
+
+
 platform_router = APIRouter(
     tags=["Platform Admin"], dependencies=[Depends(require_platform_admin)]
 )
@@ -118,7 +152,7 @@ def _http_actor(
 @app.on_event("startup")
 def _startup() -> None:
     """Engines + best-effort domain bootstrap (не блокирует API при offline domain)."""
-    from fsm_platform.host.boot import boot
+    from fsm_platform.host.tenant.boot import boot
 
     boot()
 
@@ -135,7 +169,7 @@ def metrics() -> dict[str, Any]:
     Снимок очередей platform: instances / outbox / reconcile / timers.
     Для алертов: pending lag, failed_1h, outbox.dead, reconcile.dead.
     """
-    from fsm_platform.host.metrics import collect_platform_metrics
+    from fsm_platform.host.runtime.metrics import collect_platform_metrics
 
     try:
         return {"status": "ok", **collect_platform_metrics()}
@@ -318,10 +352,11 @@ def list_events(
     service_id: str,
     after_id: int = 0,
     limit: int = 100,
+    newest: bool = False,
 ) -> dict[str, Any]:
-    """Cursor-poll platform_events (id > after_id)."""
+    """Cursor-poll platform_events (id > after_id) или последние N при newest=true."""
     return request_runtime.list_platform_events(
-        service_id, after_id=after_id, limit=limit
+        service_id, after_id=after_id, limit=limit, newest=newest
     )
 
 
@@ -567,10 +602,10 @@ def graph_publish(service_id: str) -> dict[str, Any]:
 @domain_router.post("/connect")
 def connect_domain(service_id: str) -> dict[str, Any]:
     """Validate/bootstrap the configured domain and start its dedicated worker."""
-    from fsm_platform.host.boot import configure_graph_engines
-    from fsm_platform.host.domain_bootstrap import reload_domain
-    from fsm_platform.host.domain_validator import DomainValidationError
-    from fsm_platform.host.worker_provisioner import provision_worker
+    from fsm_platform.host.tenant.boot import configure_graph_engines
+    from fsm_platform.host.tenant.domain_bootstrap import reload_domain
+    from fsm_platform.host.tenant.domain_validator import DomainValidationError
+    from fsm_platform.host.workers.worker_provisioner import provision_worker
 
     try:
         configure_graph_engines(service_id)
@@ -647,8 +682,8 @@ def connect_domain(service_id: str) -> dict[str, Any]:
 @domain_router.post("/reload")
 def reload_tenant_domain(service_id: str) -> dict[str, Any]:
     """Reload catalog and validator state for one owned domain."""
-    from fsm_platform.host.domain_bootstrap import reload_domain
-    from fsm_platform.host.domain_validator import DomainValidationError
+    from fsm_platform.host.tenant.domain_bootstrap import reload_domain
+    from fsm_platform.host.tenant.domain_validator import DomainValidationError
 
     try:
         return reload_domain(service_id)
@@ -666,14 +701,14 @@ def reload_tenant_domain(service_id: str) -> dict[str, Any]:
 
 @domain_router.get("/worker/status")
 def tenant_worker_status(service_id: str) -> dict[str, Any]:
-    from fsm_platform.host.worker_provisioner import worker_status
+    from fsm_platform.host.workers.worker_provisioner import worker_status
 
     return worker_status(service_id)
 
 
 @domain_router.post("/worker/restart")
 def tenant_worker_restart(service_id: str) -> dict[str, Any]:
-    from fsm_platform.host.worker_provisioner import restart_worker
+    from fsm_platform.host.workers.worker_provisioner import restart_worker
 
     try:
         return restart_worker(service_id)
@@ -686,7 +721,7 @@ def tenant_worker_restart(service_id: str) -> dict[str, Any]:
 
 @domain_router.post("/worker/stop")
 def tenant_worker_stop(service_id: str) -> dict[str, Any]:
-    from fsm_platform.host.worker_provisioner import stop_worker
+    from fsm_platform.host.workers.worker_provisioner import stop_worker
 
     return stop_worker(service_id)
 
@@ -718,8 +753,8 @@ def upsert_secret(
     Admin: upsert per-tenant secret (value хранится зашифрованным).
     Header: X-Admin-Token: <DOMAIN_ADMIN_TOKEN>
     """
-    from fsm_platform.host.runtime_context import service_scope
-    from fsm_platform.host.secrets import SecretsError, set_domain_secret
+    from fsm_platform.host.runtime.runtime_context import service_scope
+    from fsm_platform.host.security.secrets import SecretsError, set_domain_secret
 
     try:
         with service_scope(service_id):
@@ -734,8 +769,8 @@ def upsert_secret(
 @domain_router.get("/secrets")
 def list_secrets(service_id: str) -> dict[str, Any]:
     """Admin: список имён ключей (значения не отдаём)."""
-    from fsm_platform.host.runtime_context import service_scope
-    from fsm_platform.host.secrets import SecretsError, list_domain_secret_keys
+    from fsm_platform.host.runtime.runtime_context import service_scope
+    from fsm_platform.host.security.secrets import SecretsError, list_domain_secret_keys
 
     try:
         with service_scope(service_id):
@@ -753,8 +788,8 @@ def delete_secret(
     key: str,
 ) -> dict[str, Any]:
     """Admin: удалить секрет по имени ключа."""
-    from fsm_platform.host.runtime_context import service_scope
-    from fsm_platform.host.secrets import SecretsError, delete_domain_secret
+    from fsm_platform.host.runtime.runtime_context import service_scope
+    from fsm_platform.host.security.secrets import SecretsError, delete_domain_secret
 
     try:
         with service_scope(service_id):
@@ -774,8 +809,8 @@ def admin_reload_domain(service_id: str) -> dict[str, Any]:
     Admin: повторный bootstrap catalog domain service без рестарта platform.
     Header: X-Admin-Token: <PLATFORM_ADMIN_TOKEN>
     """
-    from fsm_platform.host.domain_bootstrap import get_bootstrap_status, reload_domain
-    from fsm_platform.host.domain_validator import DomainValidationError
+    from fsm_platform.host.tenant.domain_bootstrap import get_bootstrap_status, reload_domain
+    from fsm_platform.host.tenant.domain_validator import DomainValidationError
 
     try:
         return reload_domain(service_id)
@@ -811,7 +846,7 @@ def telegram_link_tenant(service_id: str, user_id: int) -> dict[str, Any]:
     Deep-link для фронта арендатора.
     Нужны TELEGRAM_BOT_USERNAME + TOKEN/LINK_SECRET в domain_secrets или env.
     """
-    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.runtime.runtime_context import service_scope
     from input.telegram.webhook import build_bot_start_url, make_start_payload
 
     try:

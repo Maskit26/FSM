@@ -21,7 +21,7 @@ from fsm_platform.core.registry import (
 from fsm_platform.core.transition_repository import TransitionRepository
 from fsm_platform.core.types import ProcessDef
 from fsm_platform.core.remote import RemoteRef
-from fsm_platform.host.operations import OperationRegistry, default_operation_registry
+from fsm_platform.host.tenant.operations import OperationRegistry, default_operation_registry
 
 logger = logging.getLogger(__name__)
 

@@ -8,7 +8,7 @@ import os
 from typing import Any, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
-from fsm_platform.host.engines import platform_session
+from fsm_platform.host.runtime.engines import platform_session
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def _backoff_seconds(attempts: int) -> int:
 
 def deliver_one(row: dict[str, Any]) -> None:
     """Синхронная доставка одной строки. Raises → retry."""
-    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.runtime.runtime_context import service_scope
 
     channel = str(row.get("channel") or "").strip().lower()
     destination = str(row.get("destination") or "").strip()
@@ -97,7 +97,7 @@ def deliver_one(row: dict[str, Any]) -> None:
 
         if channel in ("core", "http_external"):
             # Vendor-логика в domain service; platform только роутит outbox.
-            from fsm_platform.host.contract_client import get_contract_client
+            from fsm_platform.host.contract.contract_client import get_contract_client
 
             if not service_id:
                 raise RuntimeError("SERVICE_ID_REQUIRED_FOR_CORE_OUTBOX")

@@ -228,6 +228,7 @@ def authenticate_domain_token(
     session: SessionLike,
     *,
     raw_token: Optional[str],
+    touch: bool = True,
 ) -> TenantPrincipal:
     token = str(raw_token or "").strip()
     if not token.startswith("dadmin_"):
@@ -243,7 +244,8 @@ def authenticate_domain_token(
     expires_at = row.get("expires_at")
     if expires_at is not None and expires_at <= utcnow():
         raise TenantAuthError("DOMAIN_TOKEN_EXPIRED", status_code=401)
-    db.touch_domain_admin_token(session, token_id=int(row["id"]))
+    if touch:
+        db.touch_domain_admin_token(session, token_id=int(row["id"]))
     return TenantPrincipal(
         tenant_account_id=int(row["tenant_account_id"]),
         token_id=int(row["id"]),

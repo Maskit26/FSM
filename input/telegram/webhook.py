@@ -91,8 +91,8 @@ def handle_telegram_update(
     Арендатор не пишет webhook/hooks.py.
     """
     from fsm_platform.core.domain_errors import DomainError
-    from fsm_platform.host.contract_client import get_contract_client
-    from fsm_platform.host.runtime_context import peek_service_id, service_scope
+    from fsm_platform.host.contract.contract_client import get_contract_client
+    from fsm_platform.host.runtime.runtime_context import peek_service_id, service_scope
 
     sid = str(service_id or "").strip()
     if not sid:

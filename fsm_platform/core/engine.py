@@ -76,7 +76,7 @@ def run_instance(
         transition_executor=transition_executor or TransitionExecutor(),
     )
 
-    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.runtime.runtime_context import service_scope
 
     with service_scope(str(service_id)):
         result = runner.run(

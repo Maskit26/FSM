@@ -15,10 +15,10 @@ from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.registry import default_process_registry
 from fsm_platform.core.sagas import on_child_terminal
 from fsm_platform.core.types import FsmResult
-from fsm_platform.host.engines import graph_session, platform_session
-from fsm_platform.host.graph_version import resolve_graph_version
-from fsm_platform.host.retry_policy import backoff_seconds, should_retry
-from fsm_platform.host.webhooks import emit_event_with_webhooks
+from fsm_platform.host.runtime.engines import graph_session, platform_session
+from fsm_platform.host.runtime.graph_version import resolve_graph_version
+from fsm_platform.host.workers.retry_policy import backoff_seconds, should_retry
+from fsm_platform.host.runtime.webhooks import emit_event_with_webhooks
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +154,8 @@ def _fire_due_schedules(*, limit: int = 20, service_id: Optional[str] = None) ->
 
 def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
     """ProcessDef.on_failed — domain recovery; platform применяет side-effects из ответа."""
-    from fsm_platform.host.contract_side_effects import apply_declared
-    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.contract.contract_side_effects import apply_declared
+    from fsm_platform.host.runtime.runtime_context import service_scope
 
     service_id = str(instance["service_id"])
     process_name = str(instance.get("process_name") or "")
@@ -165,7 +165,7 @@ def _call_on_failed(instance: dict[str, Any], last_error: str) -> None:
 
     sp = platform_session()
     try:
-        from fsm_platform.host.contract_invoke import call_on_failed
+        from fsm_platform.host.contract.contract_invoke import call_on_failed
 
         with service_scope(service_id):
             declared = call_on_failed(
@@ -336,7 +336,7 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
         )
 
         if result.new_state == "COMPLETED":
-            from fsm_platform.host.contract_side_effects import apply_declared
+            from fsm_platform.host.contract.contract_side_effects import apply_declared
 
             apply_declared(
                 sp,
@@ -405,13 +405,13 @@ def run_loop(
         outbox_worked = False
         reconcile_worked = False
         try:
-            from fsm_platform.host.outbox_worker import process_one as process_outbox
+            from fsm_platform.host.workers.outbox_worker import process_one as process_outbox
 
             outbox_worked = process_outbox(service_id=service_id)
         except Exception:
             logger.exception("outbox process_one failed")
         try:
-            from fsm_platform.host.reconcile_worker import (
+            from fsm_platform.host.workers.reconcile_worker import (
                 process_one as process_reconcile,
             )
 

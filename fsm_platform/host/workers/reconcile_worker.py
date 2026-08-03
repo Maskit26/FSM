@@ -8,8 +8,8 @@ from typing import Any, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.sagas import on_child_terminal
-from fsm_platform.host.engines import graph_session, platform_session
-from fsm_platform.host.webhooks import emit_event_with_webhooks
+from fsm_platform.host.runtime.engines import graph_session, platform_session
+from fsm_platform.host.runtime.webhooks import emit_event_with_webhooks
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ def dock_invoke_command(row: dict[str, Any]) -> None:
       - command с entity_type → bootstrap (+ enqueue) + apply_declared;
       - только notify / cancel_instances / entity_states → apply_declared.
     """
-    from fsm_platform.host.contract_side_effects import apply_declared, extract_declared
+    from fsm_platform.host.contract.contract_side_effects import apply_declared, extract_declared
     from fsm_platform.host.http.request_runtime import _bootstrap_and_maybe_enqueue
 
     service_id = str(row["service_id"])
@@ -158,7 +158,7 @@ def dock_platform(row: dict[str, Any]) -> None:
             correlation_id=f"reconcile:{instance_id}:{transition_id}",
         )
 
-        from fsm_platform.host.contract_side_effects import apply_declared
+        from fsm_platform.host.contract.contract_side_effects import apply_declared
 
         # Повтор notify/cancel/entity_states из FsmResult (идемпотентно по keys)
         apply_declared(sp, service_id=service_id, data=payload)

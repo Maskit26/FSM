@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 
-from fsm_platform.host.secret_broker import (
+from fsm_platform.host.security.secret_broker import (
     SecretBrokerError,
     unwrap,
     wrap,

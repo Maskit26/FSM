@@ -14,7 +14,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-from fsm_platform.host.log_redaction import install_log_redaction  # noqa: E402
+from fsm_platform.host.security.log_redaction import install_log_redaction  # noqa: E402
 
 install_log_redaction()
 
@@ -37,8 +37,8 @@ def resolve_worker_service_id() -> str:
 
 
 def main() -> None:
-    from fsm_platform.host.boot import boot
-    from fsm_platform.host.worker import run_loop
+    from fsm_platform.host.tenant.boot import boot
+    from fsm_platform.host.workers.worker import run_loop
 
     service_id = resolve_worker_service_id()
     boot(service_id=service_id)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fsm_platform.host.runtime_context import current_service_id
+from fsm_platform.host.runtime.runtime_context import current_service_id
 
 
 def core_notify(

@@ -51,7 +51,7 @@ def call_context_builder(
 ) -> dict[str, Any]:
     if ref is None:
         return {}
-    from fsm_platform.host.contract_client import get_contract_client
+    from fsm_platform.host.contract.contract_client import get_contract_client
 
     return get_contract_client(ref.service_id).call_context(
         ref.name,
@@ -67,7 +67,7 @@ def call_guard(
     guard_params: dict[str, Any],
     instance: InstanceDict,
 ) -> dict[str, Any]:
-    from fsm_platform.host.contract_client import get_contract_client
+    from fsm_platform.host.contract.contract_client import get_contract_client
 
     return get_contract_client(ref.service_id).call_guard(
         ref.name,
@@ -84,7 +84,7 @@ def call_effect(
     effect_params: dict[str, Any],
     instance: InstanceDict,
 ) -> dict[str, Any]:
-    from fsm_platform.host.contract_client import get_contract_client
+    from fsm_platform.host.contract.contract_client import get_contract_client
 
     return get_contract_client(ref.service_id).call_effect(
         ref.name,
@@ -101,7 +101,7 @@ def call_operation(
     params: dict[str, Any],
     actor: dict[str, Any],
 ) -> dict[str, Any]:
-    from fsm_platform.host.contract_client import get_contract_client
+    from fsm_platform.host.contract.contract_client import get_contract_client
 
     client = get_contract_client(ref.service_id)
     actor_body = dict(actor or {})
@@ -118,7 +118,7 @@ def call_on_failed(
     last_error: str,
     process_name: str,
 ) -> dict[str, Any]:
-    from fsm_platform.host.contract_client import get_contract_client
+    from fsm_platform.host.contract.contract_client import get_contract_client
 
     data = get_contract_client(ref.service_id).call_on_failed(
         process_name,

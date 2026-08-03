@@ -8,6 +8,7 @@ from typing import Optional
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 _graph_read_engine_by_service_id: dict[str, Engine] = {}
 _graph_read_sessionmaker_by_service_id: dict[str, sessionmaker] = {}
@@ -21,11 +22,34 @@ _platform_sessionmaker: Optional[sessionmaker] = None
 
 
 def _default_engine_kwargs() -> dict[str, object]:
+    # Graph engines: tiny QueuePool (separate Clever user from platform).
     return {
         "pool_pre_ping": True,
         "pool_size": 1,
         "max_overflow": 0,
-        "hide_parameters": True,
+        "pool_timeout": 15,
+    }
+
+
+def _platform_engine_kwargs() -> dict[str, object]:
+    """
+    Platform DB на Clever (~5 conn/user). NullPool = connect per session,
+    без залипания checked-out соединений (иначе LK monitors ловят plain 500).
+    Override: PLATFORM_DB_POOL=queue
+    """
+    mode = (os.environ.get("PLATFORM_DB_POOL") or "null").strip().lower()
+    if mode in {"queue", "queued", "pool"}:
+        pool_size = max(1, int(os.environ.get("PLATFORM_DB_POOL_SIZE", "2")))
+        max_overflow = max(0, int(os.environ.get("PLATFORM_DB_MAX_OVERFLOW", "1")))
+        return {
+            "pool_pre_ping": True,
+            "pool_size": pool_size,
+            "max_overflow": max_overflow,
+            "pool_timeout": 15,
+        }
+    return {
+        "poolclass": NullPool,
+        "pool_pre_ping": True,
     }
 
 
@@ -61,7 +85,7 @@ def get_platform_engine() -> Engine:
         url = os.environ.get("PLATFORM_DATABASE_URL") or os.environ.get("DATABASE_URL")
         if not url:
             raise RuntimeError("PLATFORM_DATABASE_URL (or DATABASE_URL) is not set")
-        kwargs = _default_engine_kwargs()
+        kwargs = _platform_engine_kwargs()
         _platform_engine = create_engine(url, **kwargs)  # type: ignore[arg-type]
         _platform_sessionmaker = sessionmaker(bind=_platform_engine, autoflush=False)
     return _platform_engine

@@ -79,7 +79,7 @@ class TransitionRunner:
 
         # 1. CONTEXT (один раз на process-step; companions делят тот же context)
         try:
-            from fsm_platform.host.contract_invoke import call_context_builder
+            from fsm_platform.host.contract.contract_invoke import call_context_builder
 
             domain_context = call_context_builder(
                 process_def.context_builder,
@@ -367,7 +367,7 @@ class TransitionRunner:
                 return {
                     "error": f"{FsmErrorCodes.UNKNOWN_GUARD}: {guard_name}"
                 }
-            from fsm_platform.host.contract_invoke import call_guard
+            from fsm_platform.host.contract.contract_invoke import call_guard
 
             result = normalize_guard_result(
                 call_guard(
@@ -416,7 +416,7 @@ class TransitionRunner:
 
         # Декларативный timeout нового state (граф fsm_states.timeout_*).
         try:
-            from fsm_platform.host.state_timeouts import reschedule_after_transition
+            from fsm_platform.host.runtime.state_timeouts import reschedule_after_transition
 
             reschedule_after_transition(
                 session_platform,
@@ -458,7 +458,7 @@ class TransitionRunner:
                     )
                 }
             try:
-                from fsm_platform.host.contract_invoke import call_effect
+                from fsm_platform.host.contract.contract_invoke import call_effect
 
                 effect_result = normalize_effect_result(
                     call_effect(

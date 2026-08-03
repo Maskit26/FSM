@@ -8,7 +8,7 @@ import time
 
 from fastapi import HTTPException, Request
 
-from fsm_platform.host.contract_client import sign_contract_request
+from fsm_platform.host.contract.contract_client import sign_contract_request
 
 _MAX_SKEW_SECONDS = int(os.environ.get("CONTRACT_TIMESTAMP_MAX_SKEW", "300"))
 

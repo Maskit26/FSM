@@ -25,12 +25,12 @@ def resolve_hook_secret(channel: str) -> str:
     Секрет канала: INPUT_HOOK_SECRET_<CHANNEL> → fallback INPUT_HOOK_SECRET.
     Читает domain_secrets при service_scope, иначе env.
     """
-    from fsm_platform.host.runtime_context import peek_service_id
+    from fsm_platform.host.runtime.runtime_context import peek_service_id
 
     keys = [hook_secret_key(channel), "INPUT_HOOK_SECRET"]
     if peek_service_id():
         try:
-            from fsm_platform.host.secrets import get_domain_secret
+            from fsm_platform.host.security.secrets import get_domain_secret
 
             for k in keys:
                 val = get_domain_secret(k)
@@ -108,8 +108,8 @@ def handle_generic_inbound(
     """
     Auth → registry channel → Contract hook → apply_declared (via dispatch).
     """
-    from fsm_platform.host.hook_registry import HookError, dispatch_inbound_hook
-    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.tenant.hook_registry import HookError, dispatch_inbound_hook
+    from fsm_platform.host.runtime.runtime_context import service_scope
 
     sid = str(service_id or "").strip()
     ch = str(channel or "").strip().lower()

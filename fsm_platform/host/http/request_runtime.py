@@ -9,8 +9,8 @@ import logging
 from typing import Any, Callable, Optional
 
 from fsm_platform.core.db_layer import default_db_layer
-from fsm_platform.host.engines import graph_session, platform_session
-from fsm_platform.host.graph_version import (
+from fsm_platform.host.runtime.engines import graph_session, platform_session
+from fsm_platform.host.runtime.graph_version import (
     current_graph_version,
     resolve_graph_version,
 )
@@ -42,8 +42,8 @@ def run_operation(
     При dual-commit сбое (domain ok / platform fail) — очередь reconcile.
     """
     from fsm_platform.core.remote import RemoteRef
-    from fsm_platform.host.contract_invoke import call_operation
-    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.contract.contract_invoke import call_operation
+    from fsm_platform.host.runtime.runtime_context import service_scope
 
     if not isinstance(handler, RemoteRef):
         raise TypeError("operation handler must be RemoteRef")
@@ -69,7 +69,7 @@ def run_operation(
                     sp, sg, service_id, result, actor=actor
                 )
             if kind == "command" and isinstance(result, dict):
-                from fsm_platform.host.contract_side_effects import apply_declared
+                from fsm_platform.host.contract.contract_side_effects import apply_declared
 
                 apply_declared(sp, service_id=service_id, data=result)
         sp.commit()
@@ -105,7 +105,7 @@ def _invoke_needs_reconcile(result: dict[str, Any]) -> bool:
         return True
     if result.get("timers") or result.get("cancel_timers"):
         return True
-    from fsm_platform.host.contract_side_effects import extract_declared
+    from fsm_platform.host.contract.contract_side_effects import extract_declared
 
     declared = extract_declared(result)
     if (
@@ -123,7 +123,7 @@ def _invoke_reconcile_transition_id(
     """Стабильный ключ для UNIQUE (instance_id, transition_id) invoke-reconcile."""
     import zlib
 
-    from fsm_platform.host.contract_side_effects import extract_declared
+    from fsm_platform.host.contract.contract_side_effects import extract_declared
 
     entity_type = str(result.get("entity_type") or "")
     entity_id = int(result.get("entity_id") or 0)
@@ -323,7 +323,7 @@ def _apply_timers(sp, service_id: str, result: dict[str, Any]) -> None:
     """cancel_timers[] / timers[] из ответа command → fsm_timers."""
     from datetime import datetime
 
-    from fsm_platform.host import side_effects
+    from fsm_platform.host.runtime import side_effects
 
     for item in result.get("cancel_timers") or []:
         if not isinstance(item, dict):
@@ -378,7 +378,7 @@ def _apply_saga(
     graph_version: Optional[int] = None,
 ) -> None:
     """result['saga'] → fsm_sagas + child instances."""
-    from fsm_platform.host import side_effects
+    from fsm_platform.host.runtime import side_effects
 
     raw = result.get("saga")
     if not isinstance(raw, dict):
@@ -532,19 +532,28 @@ def list_entity_history(
 
 
 def list_platform_events(
-    service_id: str, *, after_id: int = 0, limit: int = 100
+    service_id: str,
+    *,
+    after_id: int = 0,
+    limit: int = 100,
+    newest: bool = False,
 ) -> dict[str, Any]:
-    """Cursor-poll platform_events (id > after_id)."""
+    """Cursor-poll platform_events (id > after_id) или хвост newest=True."""
     sp = platform_session()
     try:
         items = default_db_layer.list_events_after(
-            sp, service_id=service_id, after_id=after_id, limit=limit
+            sp,
+            service_id=service_id,
+            after_id=after_id,
+            limit=limit,
+            newest=newest,
         )
         next_after = int(items[-1]["id"]) if items else int(after_id)
         return {
             "service_id": service_id,
             "after_id": int(after_id),
             "next_after_id": next_after,
+            "newest": bool(newest),
             "items": items,
         }
     finally:
@@ -581,7 +590,7 @@ def list_available_actions(
         merged_payload.setdefault("courier_user_id", actor_id)
         merged_payload.setdefault("driver_user_id", actor_id)
 
-    from fsm_platform.host.runtime_context import service_scope
+    from fsm_platform.host.runtime.runtime_context import service_scope
 
     repo = TransitionRepository()
     sp = platform_session()
@@ -629,7 +638,7 @@ def list_available_actions(
                 context_error: Optional[str] = None
                 if context_builder is not None:
                     try:
-                        from fsm_platform.host.contract_invoke import (
+                        from fsm_platform.host.contract.contract_invoke import (
                             call_context_builder,
                         )
 
@@ -658,7 +667,7 @@ def list_available_actions(
                         reason = f"UNKNOWN_GUARD:{edge.guard_name}"
                     else:
                         try:
-                            from fsm_platform.host.contract_invoke import call_guard
+                            from fsm_platform.host.contract.contract_invoke import call_guard
 
                             gr = normalize_guard_result(
                                 call_guard(

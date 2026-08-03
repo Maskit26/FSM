@@ -451,7 +451,7 @@ Generic inbound delivery. Используется только если дом�
 | hook | 10s | network / 503 |
 | outbox deliver | 30s (`CONTRACT_TIMEOUT_OUTBOX`) | network / 503 |
 
-Backoff — из `fsm_platform.host.retry_policy`.
+Backoff — из `fsm_platform.host.workers.retry_policy`.
 
 ## Версионирование API
 

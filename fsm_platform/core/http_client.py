@@ -40,7 +40,7 @@ from urllib.parse import urljoin
 
 import requests
 
-from fsm_platform.host.runtime_context import current_service_id
+from fsm_platform.host.runtime.runtime_context import current_service_id
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +150,7 @@ def _load_signer(path: str) -> SignerFn:
 
 
 def _parse_credential(credential_key: str) -> dict[str, Any]:
-    from fsm_platform.host.secrets import get_domain_secret
+    from fsm_platform.host.security.secrets import get_domain_secret
 
     raw = get_domain_secret(credential_key)
     if raw is None:
@@ -330,7 +330,7 @@ def call_api_via_platform(
     max_attempts: Optional[int] = None,
 ) -> ApiResponse:
     """Domain → platform HMAC proxy; secrets never leave the platform process."""
-    from fsm_platform.host.contract_client import sign_contract_request
+    from fsm_platform.host.contract.contract_client import sign_contract_request
 
     sid = current_service_id()
     base = _platform_proxy_base()

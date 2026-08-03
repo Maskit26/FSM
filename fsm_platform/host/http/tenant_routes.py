@@ -11,12 +11,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from fsm_platform.core.db_layer import default_db_layer
-from fsm_platform.host.engines import platform_session
+from fsm_platform.host.runtime.engines import platform_session
 from fsm_platform.host.http.dependencies import (
     require_domain_token,
     require_tenant_access,
 )
-from fsm_platform.host.tenant_auth import (
+from fsm_platform.host.security.tenant_auth import (
     TenantAuthError,
     TenantPrincipal,
     issue_domain_token,

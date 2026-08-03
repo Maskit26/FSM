@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from fsm_platform.host.log_redaction import (
+from fsm_platform.host.security.log_redaction import (
     RedactingFilter,
     install_log_redaction,
     redact_text,
@@ -79,7 +79,7 @@ class LogRedactionTests(unittest.TestCase):
         self.assertNotIn("filter-secret-value-xyz", buf[0])
 
     def test_engine_kwargs_include_hide_parameters(self) -> None:
-        from fsm_platform.host.engines import _default_engine_kwargs
+        from fsm_platform.host.runtime.engines import _default_engine_kwargs
 
         self.assertTrue(_default_engine_kwargs().get("hide_parameters"))
 

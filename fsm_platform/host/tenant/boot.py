@@ -5,13 +5,13 @@ from __future__ import annotations
 import logging
 
 from fsm_platform.core.db_layer import default_db_layer
-from fsm_platform.host.domain_bootstrap import bootstrap_active_domains
-from fsm_platform.host.engines import (
+from fsm_platform.host.tenant.domain_bootstrap import bootstrap_active_domains
+from fsm_platform.host.runtime.engines import (
     platform_session,
     register_graph_read_engine,
     register_graph_write_engine,
 )
-from fsm_platform.host.tenant_config import resolve_tenant_ref
+from fsm_platform.host.tenant.tenant_config import resolve_tenant_ref
 
 logger = logging.getLogger(__name__)
 

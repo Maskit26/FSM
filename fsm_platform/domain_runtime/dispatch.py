@@ -11,7 +11,7 @@ from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.core.types import normalize_effect_result, normalize_guard_result
 from fsm_platform.domain_runtime import registry
 from fsm_platform.domain_runtime.session import domain_session, make_db
-from fsm_platform.host.runtime_context import service_scope
+from fsm_platform.host.runtime.runtime_context import service_scope
 
 logger = logging.getLogger(__name__)
 
