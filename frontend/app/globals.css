@@ -75,7 +75,7 @@ select {
   padding: clamp(2rem, 5vw, 4.5rem);
   display: flex;
   flex-direction: column;
-  justify-content: flex-end;
+  justify-content: center;
   animation: rise 0.8s ease both;
 }
 
@@ -1458,7 +1458,7 @@ select {
 
   .hero-visual {
     min-height: 42vh;
-    justify-content: flex-end;
+    justify-content: center;
   }
 
   .token-row {

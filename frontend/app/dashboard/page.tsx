@@ -1003,11 +1003,6 @@ export default function CabinetPage() {
                 ))}
               </ul>
             ) : null}
-            {processNames.length > 0 ? (
-              <p className="muted process-strip">
-                {processNames.join(" · ")}
-              </p>
-            ) : null}
           </section>
 
           <section className="monitor-panel events-monitor" aria-label="События домена">
