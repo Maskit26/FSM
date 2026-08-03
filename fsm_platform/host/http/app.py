@@ -25,7 +25,6 @@ from fsm_platform.host.http.tenant_routes import router as tenant_router
 from fsm_platform.host.hook_registry import (
     HookError,
     default_webhook_registry,
-    dispatch_inbound_hook,
 )
 from fsm_platform.host.operations import default_operation_registry
 from fsm_platform.core.domain_errors import DomainError
@@ -692,57 +691,6 @@ def tenant_worker_stop(service_id: str) -> dict[str, Any]:
     return stop_worker(service_id)
 
 
-@domain_router.post("/hooks/{channel}")
-async def inbound_hook(
-    service_id: str,
-    channel: str,
-    request: Request,
-) -> dict[str, Any]:
-    """
-    Inbound webhook от стороннего API → Domain Contract API (hooks/{channel}).
-    Платформа не открывает domain business DB.
-    """
-    import json
-
-    raw = await request.body()
-    headers = {k.lower(): v for k, v in request.headers.items()}
-    query = {k: v for k, v in request.query_params.multi_items()}
-    body: Any
-    if not raw:
-        body = None
-    else:
-        try:
-            body = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            body = raw
-
-    try:
-        return dispatch_inbound_hook(
-            service_id,
-            channel,
-            body=body,
-            headers=headers,
-            query=query,
-            raw_body=raw,
-        )
-    except HookError as exc:
-        raise HTTPException(
-            exc.status_code,
-            detail={"error_code": exc.code, "message": str(exc)},
-        ) from exc
-    except DomainError as exc:
-        raise HTTPException(
-            409,
-            detail={"error_code": exc.code, "message": exc.message},
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(400, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(404, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(500, detail=str(exc)) from exc
-
-
 class SecretBody(BaseModel):
     """Admin upsert: value — строка или JSON-объект (объект сериализуется в строку)."""
 
@@ -877,6 +825,63 @@ def telegram_link_tenant(service_id: str, user_id: int) -> dict[str, Any]:
             "payload": payload,
         }
     except RuntimeError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+
+
+@input_router.post("/input/generic/{service_id}/{channel}")
+async def generic_inbound_webhook(
+    service_id: str,
+    channel: str,
+    request: Request,
+) -> dict[str, Any]:
+    """
+    Универсальный inbound (YooKassa / SMS / custom).
+
+    Auth (один из вариантов):
+    - Header ``X-Input-Secret`` = domain_secrets ``INPUT_HOOK_SECRET_<CHANNEL>``
+      или fallback ``INPUT_HOOK_SECRET``;
+    - HMAC: ``X-Input-Timestamp`` + ``X-Input-Signature``
+      (hex hmac-sha256(secret, ``{ts}.{raw_body}``)).
+
+    Канал должен быть объявлен в catalog (``hooks.register`` в домене).
+    URL: ``POST /input/generic/{service_id}/{channel}``.
+    """
+    import json
+
+    from input.generic.webhook import handle_generic_inbound
+
+    raw = await request.body()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    query = {k: v for k, v in request.query_params.multi_items()}
+    body: Any
+    if not raw:
+        body = None
+    else:
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            body = raw
+
+    try:
+        return handle_generic_inbound(
+            service_id=service_id,
+            channel=channel,
+            body=body,
+            headers=headers,
+            query=query,
+            raw_body=raw,
+        )
+    except HookError as exc:
+        raise HTTPException(
+            exc.status_code,
+            detail={"error_code": exc.code, "message": str(exc)},
+        ) from exc
+    except DomainError as exc:
+        raise HTTPException(
+            409,
+            detail={"error_code": exc.code, "message": exc.message},
+        ) from exc
+    except ValueError as exc:
         raise HTTPException(400, detail=str(exc)) from exc
 
 

@@ -798,6 +798,57 @@ select {
   border-top-color: #12352e;
 }
 
+.input-channel-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: 1fr;
+}
+
+.input-channel-card {
+  appearance: none;
+  text-align: left;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.88);
+  padding: 0.95rem 1rem;
+  display: grid;
+  gap: 0.35rem;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.input-channel-card:hover {
+  border-color: rgba(15, 122, 102, 0.45);
+  transform: translateY(-1px);
+}
+
+.input-channel-card strong {
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+}
+
+.input-channel-card span {
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+
+.wizard-steps {
+  margin: 0 0 1rem;
+  padding-left: 1.2rem;
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.wizard-steps li {
+  margin-bottom: 0.45rem;
+}
+
+.wizard-steps code {
+  font-size: 0.78rem;
+}
+
 .tile-form {
   display: grid;
   gap: 0.5rem;

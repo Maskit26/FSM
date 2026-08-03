@@ -596,7 +596,12 @@ export function apiBaseUrl(): string {
 }
 
 export function inboundHookUrl(serviceId: string, channel: string): string {
-  return `${apiBaseUrl()}/v1/${encodeURIComponent(serviceId)}/hooks/${encodeURIComponent(channel)}`;
+  return `${apiBaseUrl()}/input/generic/${encodeURIComponent(serviceId)}/${encodeURIComponent(channel)}`;
+}
+
+export function inboundHookSecretKey(channel: string): string {
+  const ch = channel.trim().toUpperCase().replace(/-/g, "_");
+  return ch ? `INPUT_HOOK_SECRET_${ch}` : "INPUT_HOOK_SECRET";
 }
 
 export function telegramWebhookUrl(serviceId: string): string {

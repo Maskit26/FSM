@@ -915,6 +915,7 @@ X-Admin-Token: <DOMAIN_ADMIN_TOKEN>
 | `TELEGRAM_BOT_TOKEN` | `output/telegram/settings` | Bot API |
 | `TELEGRAM_BOT_USERNAME` | deep-link | `t.me/<bot>?start=` |
 | `TELEGRAM_LINK_SECRET` | `input/telegram/webhook` | Подпись `/start` |
+| `INPUT_HOOK_SECRET_<CHANNEL>` / `INPUT_HOOK_SECRET` | `input/generic/webhook` | Auth партнёра на generic inbound |
 
 Отдельно — **credentials** сторонних API (произвольные имена ключей, JSON value): см. §10.
 
@@ -1037,8 +1038,38 @@ Sync-путь (сразу в command/effect) и async-путь (outbox) испо
 |------|------|------|
 | `POST /input/telegram/{service_id}/webhook` | `input/telegram/webhook.py` | Update, deep-link, Contract `bind_telegram`, reply |
 | `GET /input/telegram/{service_id}/link?user_id=` | то же + `app.py` | Выдать `t.me/…?start=` |
+| `POST /input/generic/{service_id}/{channel}` | `input/generic/webhook.py` | Универсальный inbound → Contract `hooks/{channel}` |
 
 Онбординг бота: `setWebhook` → URL платформы с `{service_id}`. Секреты бота — в `domain_secrets`. Условия команды `bind_telegram` — §8.4.
+
+### 11.1. Generic inbound (`input/generic`)
+
+Базовый канал для YooKassa, SMS-gateway, произвольного партнёра. Платформа
+не знает протокол провайдера: проверяет доступ, проксирует body/headers/query
+в domain Contract `POST /hooks/{channel}`, применяет `apply_declared`.
+
+**Регистрация канала (домен):**
+
+```python
+from fsm_platform.domain_runtime import hooks
+
+hooks.register(service_id, "payment", on_payment_webhook)
+```
+
+После `connect` / reload catalog канал виден в `GET …/catalog` → `hooks`.
+
+**Секрет** в `domain_secrets` (fail-closed):
+
+| Ключ | Смысл |
+|------|--------|
+| `INPUT_HOOK_SECRET_<CHANNEL>` | Секрет конкретного канала (`payment` → `INPUT_HOOK_SECRET_PAYMENT`) |
+| `INPUT_HOOK_SECRET` | Fallback на все каналы tenant |
+
+**Auth партнёра** (один из вариантов):
+
+1. Header `X-Input-Secret: <secret>`
+2. HMAC: `X-Input-Timestamp` + `X-Input-Signature` =
+   `hex(hmac_sha256(secret, "{timestamp}." + raw_body))` (skew ≤ 300s)
 
 ---
 
@@ -1249,7 +1280,7 @@ Warnings (не блокируют): orphan guard/effect в registry без сс�
 | `POST /queries/{operation}` | sync query |
 | `POST /processes/{name}/on-failed` | recovery |
 | `POST /outbox/deliver` | async delivery для `channel=http_external` |
-| `POST /hooks/{channel}` | generic inbound hook, если handler зарегистрирован доменом |
+| `POST /hooks/{channel}` | domain-side handler; вызывается платформой из `/input/generic` |
 
 Pipeline шага: `context → guard → transition → effect` (+ companions, + state-timeout reschedule).
 
@@ -1374,11 +1405,11 @@ E2E — приёмочный контур «стек живой»; рядом с
 | `POST …/webhooks/{id}/deactivate` | Отключить subscription |
 | `POST/GET …/schedules` (+ pause/resume) | периодические процессы |
 | `POST …/graph/publish` | Публикация новой версии графа |
-| `POST …/hooks/{channel}` | Generic inbound → Contract hook |
 | `PUT/GET/DELETE …/secrets` | `DOMAIN_ADMIN_TOKEN` |
 | `POST …/connect|reload` | Tenant lifecycle по `DOMAIN_ADMIN_TOKEN` |
 | Platform Admin routes | Только `PLATFORM_ADMIN_TOKEN` |
 | `POST /input/telegram/{service_id}/webhook` | Telegram Update |
+| `POST /input/generic/{service_id}/{channel}` | Generic inbound (секрет / HMAC) |
 | `GET /input/telegram/{service_id}/link` | deep-link |
 
 Основные статусы: domain business error → HTTP 409; tenant не ready → 503 `DOMAIN_NOT_READY`; reload bootstrap failure → 502 `DOMAIN_BOOTSTRAP_FAILED`.

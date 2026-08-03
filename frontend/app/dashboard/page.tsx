@@ -30,6 +30,7 @@ import {
   rotateAdminToken,
   telegramLink,
   telegramWebhookUrl,
+  inboundHookSecretKey,
   upsertSecret,
   workerRestart,
   workerStatus,
@@ -212,6 +213,9 @@ export default function CabinetPage() {
   const [hookChannels, setHookChannels] = useState<string[]>([]);
   const [telegramUserId, setTelegramUserId] = useState("");
   const [telegramLinkUrl, setTelegramLinkUrl] = useState("");
+  const [inputPanel, setInputPanel] = useState<"menu" | "telegram" | "generic">(
+    "menu",
+  );
 
   useEffect(() => {
     const token = getAccessToken();
@@ -294,6 +298,7 @@ export default function CabinetPage() {
 
   function closeTile() {
     setOpenTile(null);
+    setInputPanel("menu");
   }
 
   const loadTokens = useCallback(async () => {
@@ -618,9 +623,11 @@ export default function CabinetPage() {
     clearMsg();
     if (openTile === "input") {
       setOpenTile(null);
+      setInputPanel("menu");
       return;
     }
     setOpenTile("input");
+    setInputPanel("menu");
     try {
       const cat = await fetchCatalog(serviceId, adminToken);
       setHookChannels(cat.hooks || []);
@@ -768,9 +775,8 @@ export default function CabinetPage() {
           >
             <span className="tile-title">Input</span>
             <span className="tile-sub">
-              Входящие каналы: привязка Telegram и inbound hooks. Через эту
-              плитку получаете deep-link для пользователя и настраиваете, как
-              внешние события попадают в домен.
+              Входящие каналы снаружи: Telegram и универсальный Generic webhook
+              для любых партнёров. Guided setup и свой channel в каталоге домена.
             </span>
           </button>
           <button
@@ -998,53 +1004,158 @@ export default function CabinetPage() {
 
                 {openTile === "input" ? (
                   <>
-                    <p className="muted" style={{ marginTop: 0 }}>
-                      Внешние системы бьют в эти URL. Здесь — ссылки и deep-link.
-                    </p>
-                    <div className="field">
-                      <label>Telegram webhook URL</label>
-                      <div className="token-box">{telegramWebhookUrl(serviceId)}</div>
-                    </div>
-                    <form className="tile-form" onSubmit={onTelegramLink} autoComplete="off">
-                      <div className="field">
-                        <label htmlFor="tg-uid">user_id → deep-link</label>
-                        <input
-                          id="tg-uid"
-                          name="fsm_telegram_user_id"
-                          value={telegramUserId}
-                          onChange={(e) => setTelegramUserId(e.target.value)}
-                          autoComplete="off"
-                          required
-                        />
-                      </div>
-                      <Tip text={BTN_TIPS.getTelegramLink}>
-                        <button type="submit" className="btn btn-primary" style={{ width: "auto" }} disabled={busy}>
-                          Get link
-                        </button>
-                      </Tip>
-                    </form>
-                    {telegramLinkUrl ? (
-                      <div className="token-box" style={{ marginTop: "0.75rem" }}>
-                        {telegramLinkUrl}
-                      </div>
-                    ) : null}
-                    <h3 style={{ margin: "1.25rem 0 0.5rem", fontSize: "1rem" }}>
-                      Inbound hooks
-                    </h3>
-                    {hookChannels.length === 0 ? (
-                      <p className="muted">Каналов в catalog нет (или catalog не загружен).</p>
-                    ) : (
-                      <ul className="plain-list">
-                        {hookChannels.map((ch) => (
-                          <li key={ch}>
-                            <code>{ch}</code>
-                            <span className="meta" style={{ fontFamily: "var(--font-mono)", fontSize: "0.75rem" }}>
-                              {inboundHookUrl(serviceId, ch)}
+                    {inputPanel === "menu" ? (
+                      <>
+                        <p className="muted" style={{ marginTop: 0 }}>
+                          Выберите входящий канал: Telegram или универсальный
+                          Generic webhook.
+                        </p>
+                        <div className="input-channel-grid">
+                          <button
+                            type="button"
+                            className="input-channel-card"
+                            onClick={() => setInputPanel("telegram")}
+                          >
+                            <strong>Telegram</strong>
+                            <span>
+                              Webhook Update и deep-link привязки аккаунта.
+                              Платформа сама разбирает протокол бота.
                             </span>
+                          </button>
+                          <button
+                            type="button"
+                            className="input-channel-card"
+                            onClick={() => setInputPanel("generic")}
+                          >
+                            <strong>Generic webhook</strong>
+                            <span>
+                              Универсальный вход для внешних партнёров. Домен
+                              регистрирует channel, партнёр бьёт в URL с секретом.
+                            </span>
+                          </button>
+                        </div>
+                      </>
+                    ) : null}
+
+                    {inputPanel === "telegram" ? (
+                      <>
+                        <div className="toolbar" style={{ justifyContent: "flex-start" }}>
+                          <button
+                            type="button"
+                            className="btn btn-ghost"
+                            onClick={() => setInputPanel("menu")}
+                          >
+                            ← Каналы
+                          </button>
+                        </div>
+                        <ol className="wizard-steps">
+                          <li>
+                            Положите в Secret ключи{" "}
+                            <code>TELEGRAM_BOT_TOKEN</code>,{" "}
+                            <code>TELEGRAM_BOT_USERNAME</code>, опц.{" "}
+                            <code>TELEGRAM_LINK_SECRET</code>.
                           </li>
-                        ))}
-                      </ul>
-                    )}
+                          <li>
+                            В BotFather / setWebhook укажите URL ниже.
+                          </li>
+                          <li>
+                            В домене зарегистрируйте command{" "}
+                            <code>bind_telegram</code>.
+                          </li>
+                          <li>Проверьте deep-link для user_id.</li>
+                        </ol>
+                        <div className="field">
+                          <label>Telegram webhook URL</label>
+                          <div className="token-box">{telegramWebhookUrl(serviceId)}</div>
+                        </div>
+                        <form className="tile-form" onSubmit={onTelegramLink} autoComplete="off">
+                          <div className="field">
+                            <label htmlFor="tg-uid">user_id → deep-link</label>
+                            <input
+                              id="tg-uid"
+                              name="fsm_telegram_user_id"
+                              value={telegramUserId}
+                              onChange={(e) => setTelegramUserId(e.target.value)}
+                              autoComplete="off"
+                              required
+                            />
+                          </div>
+                          <Tip text={BTN_TIPS.getTelegramLink}>
+                            <button type="submit" className="btn btn-primary" style={{ width: "auto" }} disabled={busy}>
+                              Get link
+                            </button>
+                          </Tip>
+                        </form>
+                        {telegramLinkUrl ? (
+                          <div className="token-box" style={{ marginTop: "0.75rem" }}>
+                            {telegramLinkUrl}
+                          </div>
+                        ) : null}
+                      </>
+                    ) : null}
+
+                    {inputPanel === "generic" ? (
+                      <>
+                        <div className="toolbar" style={{ justifyContent: "flex-start" }}>
+                          <button
+                            type="button"
+                            className="btn btn-ghost"
+                            onClick={() => setInputPanel("menu")}
+                          >
+                            ← Каналы
+                          </button>
+                        </div>
+                        <ol className="wizard-steps">
+                          <li>
+                            В домене:{" "}
+                            <code>hooks.register(service_id, &quot;payment&quot;, handler)</code>{" "}
+                            и перезапуск domain + Reload catalog.
+                          </li>
+                          <li>
+                            В Secret сохраните{" "}
+                            <code>INPUT_HOOK_SECRET_PAYMENT</code> (или общий{" "}
+                            <code>INPUT_HOOK_SECRET</code>).
+                          </li>
+                          <li>
+                            Партнёру отдайте URL канала и заголовок{" "}
+                            <code>X-Input-Secret</code> (либо HMAC{" "}
+                            <code>X-Input-Timestamp</code> +{" "}
+                            <code>X-Input-Signature</code>).
+                          </li>
+                          <li>
+                            В handler разберите payload провайдера и верните
+                            enqueue / notify при необходимости.
+                          </li>
+                        </ol>
+                        <h3 style={{ margin: "1rem 0 0.5rem", fontSize: "1rem" }}>
+                          Каналы из catalog
+                        </h3>
+                        {hookChannels.length === 0 ? (
+                          <p className="muted">
+                            Пока пусто: зарегистрируйте hook в домене и сделайте
+                            Reload catalog.
+                          </p>
+                        ) : (
+                          <ul className="plain-list">
+                            {hookChannels.map((ch) => (
+                              <li key={ch} style={{ flexDirection: "column", alignItems: "stretch", gap: "0.35rem" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", gap: "0.5rem", flexWrap: "wrap" }}>
+                                  <code>{ch}</code>
+                                  <span className="meta">секрет: {inboundHookSecretKey(ch)}</span>
+                                </div>
+                                <span className="meta" style={{ fontFamily: "var(--font-mono)", fontSize: "0.75rem", wordBreak: "break-all" }}>
+                                  {inboundHookUrl(serviceId, ch)}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        <p className="muted" style={{ marginBottom: 0, fontSize: "0.82rem" }}>
+                          Шаблон:{" "}
+                          <code>{inboundHookUrl(serviceId, "{channel}")}</code>
+                        </p>
+                      </>
+                    ) : null}
                   </>
                 ) : null}
 
