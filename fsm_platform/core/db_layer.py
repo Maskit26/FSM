@@ -2367,6 +2367,46 @@ class FsmDbLayer:
 
     # --- platform metrics (admin /v1/metrics) ---
 
+    def collect_tenant_instance_queue_metrics(
+        self, session: SessionLike, service_id: str
+    ) -> dict[str, Any]:
+        """Очередь instances одного tenant — для worker health в ЛК."""
+        sid = str(service_id or "").strip()
+        by_status = {
+            str(r["status"]): int(r["n"])
+            for r in session.execute(
+                text(
+                    """
+                    SELECT status, COUNT(*) AS n
+                    FROM server_fsm_instances
+                    WHERE service_id = :service_id
+                    GROUP BY status
+                    """
+                ),
+                {"service_id": sid},
+            ).mappings()
+        }
+        oldest_pending = session.execute(
+            text(
+                """
+                SELECT TIMESTAMPDIFF(SECOND, MIN(created_at), UTC_TIMESTAMP()) AS age_s
+                FROM server_fsm_instances
+                WHERE service_id = :service_id
+                  AND status = 'PENDING'
+                  AND (next_attempt_at IS NULL
+                       OR next_attempt_at <= UTC_TIMESTAMP())
+                """
+            ),
+            {"service_id": sid},
+        ).scalar()
+        return {
+            "pending": int(by_status.get("PENDING") or 0),
+            "processing": int(by_status.get("PROCESSING") or 0),
+            "oldest_due_pending_age_seconds": int(oldest_pending)
+            if oldest_pending is not None
+            else None,
+        }
+
     def collect_platform_queue_metrics(self, session: SessionLike) -> dict[str, Any]:
         """Агрегаты instances / outbox / reconcile / timers для ops-метрик."""
         instances = {

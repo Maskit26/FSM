@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -35,7 +36,51 @@ def _backend_name() -> str:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    # host/workers/this.py → parents[3] = repository root (…/FSM_Platform)
+    return Path(__file__).resolve().parents[3]
+
+
+def _pid_dir() -> Path:
+    return _repo_root() / ".worker-pids"
+
+
+def _pid_path(service_id: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in service_id)
+    return _pid_dir() / f"{safe}.pid"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _write_pid(service_id: str, pid: int) -> None:
+    path = _pid_path(service_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(int(pid)), encoding="utf-8")
+
+
+def _read_pid(service_id: str) -> int | None:
+    path = _pid_path(service_id)
+    if not path.is_file():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _clear_pid(service_id: str) -> None:
+    path = _pid_path(service_id)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _worker_command() -> list[str]:
@@ -53,7 +98,7 @@ def _worker_env(service_id: str) -> dict[str, str]:
 
 
 class LocalSubprocessBackend:
-    """Dev default: child process of the Platform API (in-memory pid map)."""
+    """Dev default: child process of the Platform API (+ pid-file across reloads)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -64,45 +109,88 @@ class LocalSubprocessBackend:
         with self._lock:
             current = self._processes.get(sid)
             if current is not None and current.poll() is None:
+                _write_pid(sid, int(current.pid))
                 return {"service_id": sid, "status": "running", "pid": current.pid}
+            file_pid = _read_pid(sid)
+            if file_pid is not None and _pid_alive(file_pid):
+                return {"service_id": sid, "status": "running", "pid": file_pid}
+            cmd = _worker_command()
+            worker_script = Path(cmd[1]) if len(cmd) > 1 else None
+            if worker_script is not None and not worker_script.is_file():
+                raise FileNotFoundError(f"worker entry not found: {worker_script}")
             process = subprocess.Popen(
-                _worker_command(),
+                cmd,
                 cwd=str(_repo_root()),
                 env=_worker_env(sid),
                 stdin=subprocess.DEVNULL,
             )
             self._processes[sid] = process
+            _write_pid(sid, int(process.pid))
             return {"service_id": sid, "status": "started", "pid": process.pid}
 
     def status(self, service_id: str) -> dict[str, Any]:
         sid = str(service_id or "").strip()
         with self._lock:
             process = self._processes.get(sid)
-            if process is None:
-                return {"service_id": sid, "status": "not_started", "pid": None}
-            code = process.poll()
-            return {
-                "service_id": sid,
-                "status": "running" if code is None else "exited",
-                "pid": process.pid,
-                "exit_code": code,
-            }
+            if process is not None:
+                code = process.poll()
+                if code is None:
+                    _write_pid(sid, int(process.pid))
+                    return {
+                        "service_id": sid,
+                        "status": "running",
+                        "pid": process.pid,
+                    }
+                self._processes.pop(sid, None)
+                _clear_pid(sid)
+                return {
+                    "service_id": sid,
+                    "status": "exited",
+                    "pid": process.pid,
+                    "exit_code": code,
+                }
+            file_pid = _read_pid(sid)
+            if file_pid is not None and _pid_alive(file_pid):
+                return {"service_id": sid, "status": "running", "pid": file_pid}
+            if file_pid is not None:
+                _clear_pid(sid)
+            return {"service_id": sid, "status": "not_started", "pid": None}
 
     def stop(self, service_id: str, *, timeout: float = 10.0) -> dict[str, Any]:
         sid = str(service_id or "").strip()
         with self._lock:
             process = self._processes.get(sid)
-            if process is None or process.poll() is not None:
+            pid: int | None = None
+            if process is not None and process.poll() is None:
+                pid = int(process.pid)
+                process.terminate()
+                try:
+                    process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
                 self._processes.pop(sid, None)
-                return {"service_id": sid, "status": "stopped", "pid": None}
-            process.terminate()
-            try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-            self._processes.pop(sid, None)
-            return {"service_id": sid, "status": "stopped", "pid": process.pid}
+            else:
+                self._processes.pop(sid, None)
+                file_pid = _read_pid(sid)
+                if file_pid is not None and _pid_alive(file_pid):
+                    pid = file_pid
+                    try:
+                        os.kill(file_pid, signal.SIGTERM)
+                    except OSError:
+                        if os.name == "nt":
+                            subprocess.run(
+                                ["taskkill", "/PID", str(file_pid), "/F", "/T"],
+                                check=False,
+                                capture_output=True,
+                            )
+                        else:
+                            try:
+                                os.kill(file_pid, signal.SIGKILL)
+                            except OSError:
+                                pass
+            _clear_pid(sid)
+            return {"service_id": sid, "status": "stopped", "pid": pid}
 
 
 class SystemdBackend:

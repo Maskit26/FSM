@@ -41,3 +41,6 @@ database/migrations/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local worker pid files (dev provisioner)
+.worker-pids/

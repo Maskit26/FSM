@@ -88,7 +88,7 @@ const BTN_TIPS = {
   graphPublish:
     "Публикует новую версию FSM-графа в domain DB (graph write). Старые instance могут остаться на прежней graph_version до завершения. Подтверждение обязательно — ошибка в графе ломает переходы. Делайте после осмысленного изменения transitions/states.",
   workerStatus:
-    "Показывает текущий статус dedicated worker для вашего service_id. Видно, жив ли процесс, который claim’ит instances, timers и outbox. Если status пустой или ошибка — сначала проверьте connect. Ответ выводится JSON-ом ниже кнопок.",
+    "Показывает статус dedicated worker: running или failed. failed = процесс не поднят provisioner’ом, либо due PENDING в очереди зависли (воркер не claim’ит). В мониторе «Статус домена» тот же сигнал. При failed — Connect или Worker Restart.",
   workerRestart:
     "Перезапускает worker через provisioner (local/systemd/docker/k8s). Нужен, если воркер завис, упал или после смены secrets/конфига. Кратковременно обработка очереди остановится. Не путайте с рестартом domain service.",
   workerStop:
@@ -230,6 +230,10 @@ export default function CabinetPage() {
   const [opsCount, setOpsCount] = useState(0);
   const [hooksCount, setHooksCount] = useState(0);
   const [workerLive, setWorkerLive] = useState<string | null>(null);
+  const [workerOk, setWorkerOk] = useState<boolean | null>(null);
+  const [workerReason, setWorkerReason] = useState<string | null>(null);
+  const [catalogLive, setCatalogLive] = useState<string | null>(null);
+  const [catalogOk, setCatalogOk] = useState<boolean | null>(null);
 
   const [liveEvents, setLiveEvents] = useState<PlatformEventItem[]>([]);
   const [eventsCursor, setEventsCursor] = useState(0);
@@ -274,11 +278,12 @@ export default function CabinetPage() {
     if (!serviceId || !adminToken) return;
     try {
       const cat = await fetchCatalog(serviceId, adminToken);
-      setDomainReady(!!cat.domain_ready);
+      const ready = !!cat.domain_ready;
+      setDomainReady(ready);
       const boot = cat.domain_bootstrap || {};
-      setDomainError(
-        typeof boot.error === "string" && boot.error ? boot.error : null,
-      );
+      const bootErr =
+        typeof boot.error === "string" && boot.error ? boot.error : null;
+      setDomainError(bootErr);
       setDomainCheckedAt(
         typeof boot.checked_at === "string" ? boot.checked_at : null,
       );
@@ -292,17 +297,40 @@ export default function CabinetPage() {
       setOpsCount((cat.operations || []).length);
       setHooksCount((cat.hooks || []).length);
       setHookChannels(cat.hooks || []);
+      if (ready && boot.ok !== false) {
+        setCatalogLive("ok");
+        setCatalogOk(true);
+      } else {
+        setCatalogLive("reload");
+        setCatalogOk(false);
+      }
     } catch (err) {
       setDomainReady(false);
       setDomainError(
         err instanceof Error ? err.message : "Не удалось загрузить catalog",
       );
+      setCatalogLive("reload");
+      setCatalogOk(false);
     }
     try {
       const ws = await workerStatus(serviceId, adminToken);
-      setWorkerLive(ws.status || "unknown");
+      const display =
+        ws.display_status ||
+        (ws.ok === false || ws.health === "failed" ? "failed" : ws.status) ||
+        "unknown";
+      setWorkerLive(display);
+      setWorkerOk(
+        typeof ws.ok === "boolean"
+          ? ws.ok
+          : display === "running" || ws.health === "ok",
+      );
+      setWorkerReason(
+        typeof ws.reason === "string" && ws.reason ? ws.reason : null,
+      );
     } catch {
-      setWorkerLive("unavailable");
+      setWorkerLive("failed");
+      setWorkerOk(false);
+      setWorkerReason("unavailable");
     }
   }, [serviceId, adminToken]);
 
@@ -528,8 +556,10 @@ export default function CabinetPage() {
       const res = await workerRestart(serviceId, adminToken);
       setWorkerInfo(JSON.stringify(res, null, 2));
       setInfo("Worker restart выполнен.");
+      await refreshDomainHealth();
     } catch (err) {
       fail(err);
+      await refreshDomainHealth();
     } finally {
       setBusy(false);
     }
@@ -542,8 +572,10 @@ export default function CabinetPage() {
       const res = await workerStop(serviceId, adminToken);
       setWorkerInfo(JSON.stringify(res, null, 2));
       setInfo("Worker остановлен.");
+      await refreshDomainHealth();
     } catch (err) {
       fail(err);
+      await refreshDomainHealth();
     } finally {
       setBusy(false);
     }
@@ -950,13 +982,19 @@ export default function CabinetPage() {
               </button>
             </div>
             <div className="health-grid">
-              <div className={`health-chip${domainReady ? " ok" : domainReady === false ? " bad" : ""}`}>
-                <span className="health-label">Ready</span>
-                <strong>
-                  {domainReady == null ? "…" : domainReady ? "да" : "нет"}
-                </strong>
+              <div
+                className={`health-chip${
+                  catalogOk === true ? " ok" : catalogOk === false ? " bad" : ""
+                }`}
+              >
+                <span className="health-label">Catalog</span>
+                <strong>{catalogLive || "…"}</strong>
               </div>
-              <div className="health-chip">
+              <div
+                className={`health-chip${
+                  workerOk === true ? " ok" : workerOk === false ? " bad" : ""
+                }`}
+              >
                 <span className="health-label">Worker</span>
                 <strong>{workerLive || "…"}</strong>
               </div>
@@ -987,6 +1025,26 @@ export default function CabinetPage() {
                 {domainStats.guards != null ? ` · guards ${String(domainStats.guards)}` : ""}
                 {domainStats.effects != null ? ` · effects ${String(domainStats.effects)}` : ""}
               </p>
+            ) : null}
+            {catalogOk === false ? (
+              <div className="msg msg-error" style={{ marginTop: "0.75rem" }}>
+                Catalog: reload — каталог не загружен или устарел. Откройте Domain
+                и нажмите Reload catalog.
+              </div>
+            ) : null}
+            {workerOk === false ? (
+              <div className="msg msg-error" style={{ marginTop: "0.75rem" }}>
+                Worker: failed
+                {workerReason === "not_running"
+                  ? " — процесс не запущен (Connect / Worker Restart)."
+                  : workerReason === "queue_stale"
+                    ? " — очередь PENDING не обрабатывается (Worker Restart)."
+                    : workerReason === "unavailable"
+                      ? " — статус недоступен."
+                      : workerReason
+                        ? ` — ${workerReason}.`
+                        : "."}
+              </div>
             ) : null}
             {domainError ? (
               <div className="msg msg-error" style={{ marginTop: "0.75rem" }}>

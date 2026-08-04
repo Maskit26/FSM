@@ -436,8 +436,17 @@ export function workerStatus(serviceId: string, domainAdminToken: string) {
   return apiFetch<{
     service_id: string;
     status: string;
+    display_status?: string;
+    health?: "ok" | "failed" | string;
+    ok?: boolean;
+    reason?: string | null;
     pid?: number | null;
     exit_code?: number | null;
+    queue?: {
+      pending?: number;
+      processing?: number;
+      oldest_due_pending_age_seconds?: number | null;
+    };
   }>(`/v1/${encodeURIComponent(serviceId)}/worker/status`, {
     adminToken: domainAdminToken,
   });

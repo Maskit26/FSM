@@ -701,9 +701,10 @@ def reload_tenant_domain(service_id: str) -> dict[str, Any]:
 
 @domain_router.get("/worker/status")
 def tenant_worker_status(service_id: str) -> dict[str, Any]:
+    from fsm_platform.host.runtime.metrics import enrich_worker_status
     from fsm_platform.host.workers.worker_provisioner import worker_status
 
-    return worker_status(service_id)
+    return enrich_worker_status(service_id, worker_status(service_id))
 
 
 @domain_router.post("/worker/restart")
