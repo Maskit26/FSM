@@ -12,12 +12,14 @@ from __future__ import annotations
 from fsm_platform.domain_runtime.app import create_app
 from fsm_platform.domain_runtime.registry import (
     DomainProcessDef,
+    access_policies,
     effects,
     guards,
     hooks,
     operations,
     processes,
     set_outbox_handler,
+    snapshots,
 )
 
 __all__ = [
@@ -28,5 +30,7 @@ __all__ = [
     "effects",
     "processes",
     "hooks",
+    "access_policies",
+    "snapshots",
     "set_outbox_handler",
 ]

@@ -1125,17 +1125,30 @@ class FsmDbLayer:
         after_id: int = 0,
         limit: int = 100,
         newest: bool = False,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         """
         События platform_events.
         newest=False: id > after_id ASC (cursor poll).
         newest=True: последние N (DESC→ASC) для монитора ЛК.
+        Опционально фильтр entity_type / entity_id (entity WS).
         """
         lim = int(max(1, min(limit, 500)))
+        et = str(entity_type or "").strip() or None
+        eid = int(entity_id) if entity_id is not None else None
+        entity_sql = ""
+        params: dict[str, Any] = {"service_id": service_id, "limit": lim}
+        if et is not None:
+            entity_sql += " AND entity_type = :entity_type"
+            params["entity_type"] = et
+        if eid is not None:
+            entity_sql += " AND entity_id = :entity_id"
+            params["entity_id"] = eid
         if newest:
             rows = session.execute(
                 text(
-                    """
+                    f"""
                     SELECT id, service_id, event_type, instance_id,
                            entity_type, entity_id, payload_json,
                            correlation_id, client_request_id, created_at
@@ -1145,33 +1158,32 @@ class FsmDbLayer:
                                correlation_id, client_request_id, created_at
                         FROM platform_events
                         WHERE service_id = :service_id
+                          {entity_sql}
                         ORDER BY id DESC
                         LIMIT :limit
                     ) AS recent
                     ORDER BY id ASC
                     """
                 ),
-                {"service_id": service_id, "limit": lim},
+                params,
             ).mappings().all()
         else:
+            params["after_id"] = int(after_id)
             rows = session.execute(
                 text(
-                    """
+                    f"""
                     SELECT id, service_id, event_type, instance_id,
                            entity_type, entity_id, payload_json,
                            correlation_id, client_request_id, created_at
                     FROM platform_events
                     WHERE service_id = :service_id
                       AND id > :after_id
+                      {entity_sql}
                     ORDER BY id ASC
                     LIMIT :limit
                     """
                 ),
-                {
-                    "service_id": service_id,
-                    "after_id": int(after_id),
-                    "limit": lim,
-                },
+                params,
             ).mappings().all()
         out: list[dict[str, Any]] = []
         for row in rows:

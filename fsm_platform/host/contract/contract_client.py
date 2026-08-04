@@ -394,6 +394,54 @@ class ContractClient:
             raise ContractError("OUTBOX_DELIVER_INVALID", "expected object")
         return data
 
+    def call_access(
+        self,
+        entity_type: str,
+        *,
+        entity_id: int,
+        principal: dict[str, Any],
+        params: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        et = str(entity_type or "").strip()
+        body = {
+            "entity_id": int(entity_id),
+            "principal": dict(principal or {}),
+            "params": dict(params or {}),
+        }
+        data = self._request(
+            "POST",
+            f"{CONTRACT_PREFIX}/access/{et}",
+            json_body=body,
+            timeout=_DEFAULT_GUARD_EFFECT_TIMEOUT,
+        )
+        if not isinstance(data, dict):
+            raise ContractError("ACCESS_INVALID", f"{et}: expected object")
+        return data
+
+    def call_snapshot(
+        self,
+        entity_type: str,
+        *,
+        entity_id: int,
+        principal: dict[str, Any],
+        params: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        et = str(entity_type or "").strip()
+        body = {
+            "entity_id": int(entity_id),
+            "principal": dict(principal or {}),
+            "params": dict(params or {}),
+        }
+        data = self._request(
+            "POST",
+            f"{CONTRACT_PREFIX}/snapshots/{et}",
+            json_body=body,
+            timeout=_DEFAULT_COMMAND_QUERY_TIMEOUT,
+        )
+        if not isinstance(data, dict):
+            raise ContractError("SNAPSHOT_INVALID", f"{et}: expected object")
+        return data
+
     def _request(
         self,
         method: str,

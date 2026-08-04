@@ -10,7 +10,7 @@
 
 ## 1. End-user read / privacy / realtime
 
-### 1.1. Principal + access policy (жёсткий стандарт) — `planned`
+### 1.1. Principal + access policy (жёсткий стандарт) — `done`
 
 - **Дверь перед операцией:** кто ты → можно ли → только потом выполнение.
 - Платформа только вызывает callback домена; правил бизнеса не пишет.
@@ -34,7 +34,7 @@
 - End-user **не должен знать** про FSM Platform как продукт; он видит только
   приложение домена арендатора.
 
-### 1.2. Entity Snapshot (мягкий / опциональный стандарт) — `planned`
+### 1.2. Entity Snapshot (мягкий / опциональный стандарт) — `done`
 
 - Отдельный read карточки **одной** сущности, отдельно от write
   (`invoke` / `enqueue`).
@@ -49,7 +49,7 @@
 - По сути Snapshot ≈ стандартизированный query «карточка сущности»; ценность —
   единый контракт для reconnect/WS и обязательная policy-дверь, а не «новый SQL».
 
-### 1.3. WS: подписка на entity Snapshot — `planned`
+### 1.3. WS: подписка на entity Snapshot — `done`
 
 - Текущий `WS …/ws/events` **сохраняется**:
   - лента `platform_events` (cursor / `after_id`);

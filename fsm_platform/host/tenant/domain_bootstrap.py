@@ -14,17 +14,21 @@ from typing import Any, Optional
 
 from fsm_platform import ProcessDef
 from fsm_platform.core.registry import (
+    default_access_registry,
     default_effect_registry,
     default_guard_registry,
     default_process_registry,
+    default_snapshot_registry,
 )
 from fsm_platform.core.remote import (
+    remote_access,
     remote_command,
     remote_context,
     remote_effect,
     remote_guard,
     remote_on_failed,
     remote_query,
+    remote_snapshot,
 )
 from fsm_platform.host.tenant.domain_validator import (
     DomainValidationError,
@@ -84,6 +88,8 @@ def _unregister_service(service_id: str) -> None:
     default_process_registry.unregister(service_id)
     default_operation_registry.unregister(service_id)
     default_webhook_registry.unregister(service_id)
+    default_access_registry.unregister(service_id)
+    default_snapshot_registry.unregister(service_id)
 
 
 def register_catalog(service_id: str, catalog: dict[str, Any]) -> None:
@@ -140,6 +146,16 @@ def register_catalog(service_id: str, catalog: dict[str, Any]) -> None:
         ch = str(channel or "").strip().lower()
         if ch:
             default_webhook_registry.register_channel(sid, ch)
+
+    for et in catalog.get("access_policies") or []:
+        name = str(et or "").strip()
+        if name:
+            default_access_registry.register(sid, name, remote_access(sid, name))
+
+    for et in catalog.get("snapshots") or []:
+        name = str(et or "").strip()
+        if name:
+            default_snapshot_registry.register(sid, name, remote_snapshot(sid, name))
 
 
 def _record_status(

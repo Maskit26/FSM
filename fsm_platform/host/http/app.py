@@ -329,6 +329,59 @@ def entity_actions(
         raise HTTPException(500, detail=str(exc)) from exc
 
 
+class SnapshotBody(BaseModel):
+    """Тело POST .../entities/.../snapshot: actor (+ опц. params)."""
+
+    actor: Optional[Actor] = None
+    params: dict[str, Any] = Field(default_factory=dict)
+    include_actions: bool = True
+
+
+@domain_router.post("/entities/{entity_type}/{entity_id}/snapshot")
+def entity_snapshot(
+    service_id: str,
+    entity_type: str,
+    entity_id: int,
+    body: SnapshotBody,
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    """
+    Entity Snapshot для фронта домена: Principal → access policy → snapshot.
+    Admin-токен открывает Domain API; end-user identity — actor / Bearer.
+    """
+    from fsm_platform.host.security.auth import AuthError
+
+    try:
+        actor = _http_actor(authorization, body.actor)
+    except AuthError as exc:
+        raise HTTPException(401, detail={"error_code": exc.code, "message": str(exc)}) from exc
+    try:
+        return request_runtime.get_entity_snapshot(
+            service_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            actor=actor,
+            params=body.params,
+            include_actions=bool(body.include_actions),
+        )
+    except request_runtime.EntityAccessDenied as exc:
+        raise HTTPException(
+            403,
+            detail={"error_code": "FORBIDDEN", "message": exc.reason},
+        ) from exc
+    except request_runtime.EntityCapabilityMissing as exc:
+        raise HTTPException(
+            501,
+            detail={"error_code": exc.code, "message": exc.message},
+        ) from exc
+    except AuthError as exc:
+        raise HTTPException(401, detail={"error_code": exc.code, "message": str(exc)}) from exc
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, detail=str(exc)) from exc
+
+
 @domain_router.get("/entities/{entity_type}/{entity_id}/history")
 def entity_history(
     service_id: str,

@@ -170,12 +170,44 @@ class LocalHookRegistry:
         self._channels.clear()
 
 
+class LocalEntityCallbackRegistry:
+    """Access / snapshot callbacks keyed by (service_id, entity_type)."""
+
+    def __init__(self) -> None:
+        self._fns: dict[tuple[str, str], Callable[..., Any]] = {}
+
+    def register(
+        self, service_id: str, entity_type: str, fn: Callable[..., Any]
+    ) -> None:
+        sid = str(service_id or "").strip()
+        et = str(entity_type or "").strip()
+        if not sid or not et:
+            raise ValueError("service_id and entity_type required")
+        if not callable(fn):
+            raise TypeError("handler must be callable")
+        self._fns[(sid, et)] = fn
+
+    def get(self, service_id: str, entity_type: str) -> Optional[Callable[..., Any]]:
+        return self._fns.get(
+            (str(service_id).strip(), str(entity_type or "").strip())
+        )
+
+    def list_entity_types(self, service_id: str) -> list[str]:
+        sid = str(service_id).strip()
+        return sorted(et for (s, et) in self._fns if s == sid)
+
+    def clear(self) -> None:
+        self._fns.clear()
+
+
 # Process-wide defaults for one domain service process
 operations = LocalOperationRegistry()
 guards = LocalGuardRegistry()
 effects = LocalEffectRegistry()
 processes = LocalProcessRegistry()
 hooks = LocalHookRegistry()
+access_policies = LocalEntityCallbackRegistry()
+snapshots = LocalEntityCallbackRegistry()
 _outbox_handler: Optional[Callable[..., Any]] = None
 
 
@@ -197,4 +229,6 @@ def clear_all() -> None:
     effects.clear()
     processes.clear()
     hooks.clear()
+    access_policies.clear()
+    snapshots.clear()
     _outbox_handler = None

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from fsm_platform.domain_runtime import (
     DomainProcessDef,
+    access_policies as access_registry,
     effects as effect_registry,
     guards as guard_registry,
     operations as operation_registry,
     processes as process_registry,
     set_outbox_handler,
+    snapshots as snapshot_registry,
 )
 
 from domains.courier.commands import (
@@ -71,6 +73,7 @@ from domains.courier.guards import (
     can_start_order_transit,
     can_start_trip,
 )
+from domains.courier.entity_ui import can_access_order, snapshot_order
 from domains.courier.queries import (
     list_client_orders,
     list_courier_exchange,
@@ -362,6 +365,9 @@ def register_all(service_id: str) -> None:
         "confirm_courier2_delivery_effect",
         confirm_courier2_delivery_effect,
     )
+
+    access_registry.register(service_id, "order", can_access_order)
+    snapshot_registry.register(service_id, "order", snapshot_order)
 
     from domains.courier.core.deliver import handle_core_outbox
 

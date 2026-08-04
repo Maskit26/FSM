@@ -706,3 +706,98 @@ def list_available_actions(
     finally:
         sp.close()
         sg.close()
+
+
+class EntityAccessDenied(Exception):
+    def __init__(self, reason: str = "FORBIDDEN") -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class EntityCapabilityMissing(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+def get_entity_snapshot(
+    service_id: str,
+    *,
+    entity_type: str,
+    entity_id: int,
+    actor: dict[str, Any],
+    params: Optional[dict[str, Any]] = None,
+    include_actions: bool = True,
+) -> dict[str, Any]:
+    """
+    End-user entity Snapshot: Principal → access policy → domain snapshot.
+    Optional platform availableActions (graph+guards).
+    """
+    from fsm_platform.core.registry import (
+        default_access_registry,
+        default_snapshot_registry,
+    )
+    from fsm_platform.host.contract.contract_invoke import call_access, call_snapshot
+    from fsm_platform.host.security.principal import principal_from_actor
+
+    et = str(entity_type or "").strip()
+    eid = int(entity_id)
+    principal = principal_from_actor(actor)
+    principal_dict = principal.to_dict()
+    merged_params = dict(params or {})
+
+    access_ref = default_access_registry.get(service_id, et)
+    snap_ref = default_snapshot_registry.get(service_id, et)
+    if access_ref is None:
+        raise EntityCapabilityMissing(
+            "ACCESS_POLICY_NOT_REGISTERED",
+            f"no access policy for entity_type={et!r}",
+        )
+    if snap_ref is None:
+        raise EntityCapabilityMissing(
+            "SNAPSHOT_NOT_REGISTERED",
+            f"no snapshot builder for entity_type={et!r}",
+        )
+
+    gate = call_access(
+        access_ref,
+        entity_id=eid,
+        principal=principal_dict,
+        params=merged_params,
+    )
+    if not bool(gate.get("allowed")):
+        raise EntityAccessDenied(str(gate.get("reason") or "FORBIDDEN"))
+
+    data = call_snapshot(
+        snap_ref,
+        entity_id=eid,
+        principal=principal_dict,
+        params=merged_params,
+    )
+    out: dict[str, Any] = {
+        "entity_type": et,
+        "entity_id": eid,
+        "principal": {
+            "userId": principal.user_id,
+            "roles": list(principal.roles),
+            "actor_type": principal.actor_type,
+        },
+        "snapshot": data,
+    }
+    if include_actions:
+        try:
+            actions = list_available_actions(
+                service_id,
+                entity_type=et,
+                entity_id=eid,
+                actor=principal.as_actor(),
+                payload=merged_params,
+            )
+            out["available_actions"] = actions.get("actions") or []
+            out["current_state"] = actions.get("current_state")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("snapshot available_actions failed: %s", exc)
+            out["available_actions"] = []
+            out["available_actions_error"] = str(exc)
+    return out

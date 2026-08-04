@@ -286,3 +286,100 @@ def run_outbox_deliver(service_id: str, payload: dict[str, Any]) -> dict[str, An
     with service_scope(service_id):
         fn(body)
     return {"ok": True, "op": body.get("op")}
+
+
+def _run_entity_callback(
+    reg: Any,
+    service_id: str,
+    entity_type: str,
+    *,
+    entity_id: int,
+    principal: dict[str, Any],
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    et = str(entity_type or "").strip()
+    fn = reg.get(service_id, et)
+    if fn is None:
+        raise KeyError(et)
+
+    sd = domain_session()
+    db = make_db(sd)
+    try:
+        with service_scope(service_id):
+            sig = inspect.signature(fn)
+            available = {
+                "domain_session": sd,
+                "session_domain": sd,
+                "session": sd,
+                "db": db,
+                "entity_type": et,
+                "entity_id": int(entity_id),
+                "principal": dict(principal or {}),
+                "params": dict(params or {}),
+                "service_id": service_id,
+            }
+            kwargs = {
+                name: available[name]
+                for name in sig.parameters
+                if name in available
+            }
+            out = fn(**kwargs) if kwargs else fn(
+                sd, int(entity_id), dict(principal or {})
+            )
+        sd.commit()
+        if out is None:
+            return {}
+        if not isinstance(out, dict):
+            raise TypeError(f"{et} callback must return dict")
+        return json.loads(json.dumps(out, default=str))
+    except DomainError:
+        sd.rollback()
+        raise
+    except Exception:
+        sd.rollback()
+        logger.exception("entity callback %s failed", et)
+        raise
+    finally:
+        sd.close()
+
+
+def run_access(
+    service_id: str,
+    entity_type: str,
+    *,
+    entity_id: int,
+    principal: dict[str, Any],
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    raw = _run_entity_callback(
+        registry.access_policies,
+        service_id,
+        entity_type,
+        entity_id=entity_id,
+        principal=principal,
+        params=params,
+    )
+    allowed = bool(raw.get("allowed")) if "allowed" in raw else bool(raw.get("ok"))
+    return {
+        "allowed": allowed,
+        "reason": raw.get("reason"),
+        "payload": raw.get("payload") if isinstance(raw.get("payload"), dict) else {},
+    }
+
+
+def run_snapshot(
+    service_id: str,
+    entity_type: str,
+    *,
+    entity_id: int,
+    principal: dict[str, Any],
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    return _run_entity_callback(
+        registry.snapshots,
+        service_id,
+        entity_type,
+        entity_id=entity_id,
+        principal=principal,
+        params=params,
+    )

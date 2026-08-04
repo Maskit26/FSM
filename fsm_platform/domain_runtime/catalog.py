@@ -101,4 +101,6 @@ def build_catalog(service_id: str, *, entry: Optional[str] = None) -> dict[str, 
         "effects": registry.effects.list_names(sid),
         "context_builders": context_builders,
         "hooks": registry.hooks.list_channels(sid),
+        "access_policies": registry.access_policies.list_entity_types(sid),
+        "snapshots": registry.snapshots.list_entity_types(sid),
     }

@@ -94,6 +94,40 @@ def call_effect(
     )
 
 
+def call_access(
+    ref: RemoteRef,
+    *,
+    entity_id: int,
+    principal: dict[str, Any],
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    from fsm_platform.host.contract.contract_client import get_contract_client
+
+    return get_contract_client(ref.service_id).call_access(
+        ref.name,
+        entity_id=int(entity_id),
+        principal=dict(principal or {}),
+        params=dict(params or {}),
+    )
+
+
+def call_snapshot(
+    ref: RemoteRef,
+    *,
+    entity_id: int,
+    principal: dict[str, Any],
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    from fsm_platform.host.contract.contract_client import get_contract_client
+
+    return get_contract_client(ref.service_id).call_snapshot(
+        ref.name,
+        entity_id=int(entity_id),
+        principal=dict(principal or {}),
+        params=dict(params or {}),
+    )
+
+
 def call_operation(
     ref: RemoteRef,
     *,

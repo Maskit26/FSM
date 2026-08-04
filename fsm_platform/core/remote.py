@@ -5,7 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-RemoteKind = Literal["guard", "effect", "context", "command", "query", "on_failed"]
+RemoteKind = Literal[
+    "guard",
+    "effect",
+    "context",
+    "command",
+    "query",
+    "on_failed",
+    "access",
+    "snapshot",
+]
 
 
 @dataclass(frozen=True)
@@ -39,3 +48,11 @@ def remote_query(service_id: str, operation: str) -> RemoteRef:
 
 def remote_on_failed(service_id: str, process_name: str) -> RemoteRef:
     return RemoteRef(service_id=service_id, name=process_name, kind="on_failed")
+
+
+def remote_access(service_id: str, entity_type: str) -> RemoteRef:
+    return RemoteRef(service_id=service_id, name=entity_type, kind="access")
+
+
+def remote_snapshot(service_id: str, entity_type: str) -> RemoteRef:
+    return RemoteRef(service_id=service_id, name=entity_type, kind="snapshot")

@@ -2,18 +2,22 @@
 Универсальный WS платформы.
 
 1) Стрим platform_events (FSM COMPLETED/FAILED …).
-2) Опциональная подписка на domain operation (query/command read):
+2) Подписка на domain operation (query/command read):
    клиент говорит operation + actor + params — платформа не знает «биржу».
-   На новое событие (или refresh) — invoke и snapshot наружу.
+3) Подписка на entity Snapshot (entity_type + entity_id):
+   access policy → Snapshot; events фильтруются по сущности.
 
-Пример для фронта (биржа курьера — domain query):
+Пример operation (биржа):
   WS /v1/svc_courier_01/ws/events?after_id=0
   → {"op":"subscribe","operation":"list_courier_exchange",
      "actor":{"actor_type":"user","actor_id":"2","channel":"websocket"},
      "params":{}}
   ← {"type":"snapshot","operation":"list_courier_exchange","data":{...}}
-  ← {"type":"event","item":{...}}  # FSM events
-  # при новом event — снова snapshot подписанной operation
+
+Пример entity:
+  → {"op":"subscribe","entity_type":"order","entity_id":42,"actor":{...}}
+  ← {"type":"snapshot","entity_type":"order","entity_id":42,"data":{...}}
+  ← {"type":"event","item":{...}}  # только events этой сущности
 """
 
 from __future__ import annotations
@@ -50,12 +54,22 @@ def _fingerprint(payload: Any) -> str:
 
 
 def _fetch_events(
-    service_id: str, after_id: int, limit: int = 100
+    service_id: str,
+    after_id: int,
+    limit: int = 100,
+    *,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     sp = platform_session()
     try:
         return default_db_layer.list_events_after(
-            sp, service_id=service_id, after_id=after_id, limit=limit
+            sp,
+            service_id=service_id,
+            after_id=after_id,
+            limit=limit,
+            entity_type=entity_type,
+            entity_id=entity_id,
         )
     finally:
         sp.close()
@@ -96,6 +110,50 @@ def _invoke_operation(
     return {"operation": operation, "data": data}
 
 
+def _invoke_entity_snapshot(
+    *,
+    service_id: str,
+    entity_type: str,
+    entity_id: int,
+    params: dict[str, Any],
+    actor: dict[str, Any],
+    include_actions: bool = True,
+) -> dict[str, Any]:
+    return request_runtime.get_entity_snapshot(
+        service_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        actor=actor,
+        params=params,
+        include_actions=include_actions,
+    )
+
+
+def _resolve_ws_actor(
+    websocket: WebSocket, msg: dict[str, Any]
+) -> dict[str, Any]:
+    actor = msg.get("actor") if isinstance(msg.get("actor"), dict) else None
+    auth_header = websocket.headers.get("authorization") or msg.get("authorization")
+    if auth_enabled():
+        resolved = resolve_actor(
+            authorization=auth_header,
+            body_actor=actor,
+        )
+    else:
+        if not actor or not actor.get("actor_id"):
+            raise AuthError("ACTOR_REQUIRED", "actor.actor_id required")
+        resolved = {
+            "actor_type": str(actor.get("actor_type") or "user"),
+            "actor_id": str(actor["actor_id"]),
+            "channel": str(actor.get("channel") or "websocket"),
+        }
+        roles = actor.get("roles")
+        if isinstance(roles, (list, tuple)):
+            resolved["roles"] = [str(r) for r in roles if str(r).strip()]
+    resolved["channel"] = "websocket"
+    return resolved
+
+
 @router.websocket("/v1/{service_id}/ws/events")
 async def events_ws(
     websocket: WebSocket,
@@ -109,8 +167,8 @@ async def events_ws(
       interval — тик опроса курсора, default 1s
 
     Client → server:
-      {"op":"subscribe","operation":"list_courier_exchange",
-       "actor":{...},"params":{}}
+      {"op":"subscribe","operation":"…","actor":{...},"params":{}}
+      {"op":"subscribe","entity_type":"order","entity_id":42,"actor":{...}}
       {"op":"unsubscribe"}
       {"op":"refresh"} | {"op":"ping"} | {"op":"close"}
       {"op":"seek","after_id":N}
@@ -118,6 +176,7 @@ async def events_ws(
     Server → client:
       {"type":"event","item":{...}}
       {"type":"snapshot","operation":"...","data":{...},"fp":"..."}
+      {"type":"snapshot","entity_type":"...","entity_id":N,"data":{...},"fp":"..."}
       {"type":"pong"} | {"type":"error","detail":"..."}
     """
     try:
@@ -149,11 +208,13 @@ async def events_ws(
         cursor = int(after_id)
 
     sub_operation: Optional[str] = None
+    sub_entity_type: Optional[str] = None
+    sub_entity_id: Optional[int] = None
     sub_params: dict[str, Any] = {}
     sub_actor: dict[str, Any] = {}
     last_fp: Optional[str] = None
 
-    async def push_snapshot(*, force: bool = False) -> None:
+    async def push_operation_snapshot(*, force: bool = False) -> None:
         nonlocal last_fp
         if not sub_operation:
             return
@@ -174,7 +235,7 @@ async def events_ws(
             await websocket.send_json({"type": "error", "detail": str(exc)})
             return
         except Exception as exc:
-            logger.exception("events_ws snapshot failed")
+            logger.exception("events_ws operation snapshot failed")
             await websocket.send_json({"type": "error", "detail": str(exc)})
             return
 
@@ -190,11 +251,85 @@ async def events_ws(
                 }
             )
 
+    async def push_entity_snapshot(*, force: bool = False) -> None:
+        nonlocal last_fp
+        if not sub_entity_type or sub_entity_id is None:
+            return
+        try:
+            bundle = await run_in_threadpool(
+                _invoke_entity_snapshot,
+                service_id=service_id,
+                entity_type=sub_entity_type,
+                entity_id=int(sub_entity_id),
+                params=sub_params,
+                actor=sub_actor,
+            )
+        except request_runtime.EntityAccessDenied as exc:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "error_code": "FORBIDDEN",
+                    "detail": exc.reason,
+                }
+            )
+            return
+        except request_runtime.EntityCapabilityMissing as exc:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "error_code": exc.code,
+                    "detail": exc.message,
+                }
+            )
+            return
+        except DomainError as exc:
+            await websocket.send_json(
+                {"type": "error", "error_code": exc.code, "detail": exc.message}
+            )
+            return
+        except (ValueError, LookupError) as exc:
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+            return
+        except Exception as exc:
+            logger.exception("events_ws entity snapshot failed")
+            await websocket.send_json({"type": "error", "detail": str(exc)})
+            return
+
+        data = {
+            "snapshot": bundle.get("snapshot"),
+            "available_actions": bundle.get("available_actions"),
+            "current_state": bundle.get("current_state"),
+            "principal": bundle.get("principal"),
+        }
+        fp = _fingerprint(data)
+        if force or fp != last_fp:
+            last_fp = fp
+            await websocket.send_json(
+                {
+                    "type": "snapshot",
+                    "entity_type": sub_entity_type,
+                    "entity_id": int(sub_entity_id),
+                    "data": data,
+                    "fp": fp,
+                }
+            )
+
+    async def push_snapshot(*, force: bool = False) -> None:
+        if sub_entity_type and sub_entity_id is not None:
+            await push_entity_snapshot(force=force)
+        elif sub_operation:
+            await push_operation_snapshot(force=force)
+
     try:
         while True:
             try:
                 items = await run_in_threadpool(
-                    _fetch_events, service_id, cursor, 100
+                    _fetch_events,
+                    service_id,
+                    cursor,
+                    100,
+                    entity_type=sub_entity_type,
+                    entity_id=sub_entity_id,
                 )
             except Exception as exc:
                 logger.exception("events_ws fetch failed")
@@ -207,7 +342,7 @@ async def events_ws(
                 cursor = int(item["id"])
                 await websocket.send_json({"type": "event", "item": item})
 
-            if had_events and sub_operation:
+            if had_events and (sub_operation or sub_entity_type):
                 await push_snapshot(force=False)
 
             try:
@@ -236,40 +371,19 @@ async def events_ws(
                 cursor = int(msg["after_id"])
             elif op == "unsubscribe":
                 sub_operation = None
+                sub_entity_type = None
+                sub_entity_id = None
                 sub_params = {}
                 sub_actor = {}
                 last_fp = None
                 await websocket.send_json({"type": "unsubscribed"})
             elif op == "subscribe":
+                entity_type = str(msg.get("entity_type") or "").strip()
+                entity_id_raw = msg.get("entity_id")
                 operation = str(msg.get("operation") or "").strip()
-                if not operation:
-                    await websocket.send_json(
-                        {"type": "error", "detail": "operation required"}
-                    )
-                    continue
-                actor = msg.get("actor") if isinstance(msg.get("actor"), dict) else None
-                auth_header = (
-                    websocket.headers.get("authorization")
-                    or msg.get("authorization")
-                )
+
                 try:
-                    if auth_enabled():
-                        resolved = resolve_actor(
-                            authorization=auth_header,
-                            body_actor=actor,
-                        )
-                    else:
-                        if not actor or not actor.get("actor_id"):
-                            raise AuthError(
-                                "ACTOR_REQUIRED", "actor.actor_id required"
-                            )
-                        resolved = {
-                            "actor_type": str(actor.get("actor_type") or "user"),
-                            "actor_id": str(actor["actor_id"]),
-                            "channel": str(
-                                actor.get("channel") or "websocket"
-                            ),
-                        }
+                    resolved = _resolve_ws_actor(websocket, msg)
                 except AuthError as exc:
                     await websocket.send_json(
                         {
@@ -279,13 +393,38 @@ async def events_ws(
                         }
                     )
                     continue
-                resolved["channel"] = "websocket"
-                params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-                sub_operation = operation
+
+                params = (
+                    msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                )
+                last_fp = None
                 sub_params = params
                 sub_actor = resolved
-                last_fp = None
-                await push_snapshot(force=True)
+
+                if entity_type and entity_id_raw is not None:
+                    try:
+                        eid = int(entity_id_raw)
+                    except (TypeError, ValueError):
+                        await websocket.send_json(
+                            {"type": "error", "detail": "entity_id must be int"}
+                        )
+                        continue
+                    sub_entity_type = entity_type
+                    sub_entity_id = eid
+                    sub_operation = None
+                    await push_entity_snapshot(force=True)
+                elif operation:
+                    sub_operation = operation
+                    sub_entity_type = None
+                    sub_entity_id = None
+                    await push_operation_snapshot(force=True)
+                else:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "detail": "operation or entity_type+entity_id required",
+                        }
+                    )
             elif op in ("", "refresh"):
                 await push_snapshot(force=True)
             else:

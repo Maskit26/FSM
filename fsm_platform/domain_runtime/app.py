@@ -53,6 +53,18 @@ class OutboxDeliverBody(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class EntityAccessBody(BaseModel):
+    entity_id: int
+    principal: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class EntitySnapshotBody(BaseModel):
+    entity_id: int
+    principal: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 def _domain_http(exc: DomainError) -> HTTPException:
     return HTTPException(
         409,
@@ -239,6 +251,44 @@ def create_app(
             return dispatch.run_outbox_deliver(sid, body.payload)
         except DomainError as exc:
             raise _domain_http(exc) from exc
+        except Exception as exc:
+            raise HTTPException(500, detail=str(exc)) from exc
+
+    @app.post("/contract/v1/access/{entity_type}")
+    def post_access(entity_type: str, body: EntityAccessBody) -> dict[str, Any]:
+        try:
+            return dispatch.run_access(
+                sid,
+                entity_type,
+                entity_id=int(body.entity_id),
+                principal=body.principal,
+                params=body.params,
+            )
+        except DomainError as exc:
+            raise _domain_http(exc) from exc
+        except KeyError:
+            raise HTTPException(
+                404, detail=f"UNKNOWN_ACCESS_POLICY:{entity_type}"
+            ) from None
+        except Exception as exc:
+            raise HTTPException(500, detail=str(exc)) from exc
+
+    @app.post("/contract/v1/snapshots/{entity_type}")
+    def post_snapshot(entity_type: str, body: EntitySnapshotBody) -> dict[str, Any]:
+        try:
+            return dispatch.run_snapshot(
+                sid,
+                entity_type,
+                entity_id=int(body.entity_id),
+                principal=body.principal,
+                params=body.params,
+            )
+        except DomainError as exc:
+            raise _domain_http(exc) from exc
+        except KeyError:
+            raise HTTPException(
+                404, detail=f"UNKNOWN_SNAPSHOT:{entity_type}"
+            ) from None
         except Exception as exc:
             raise HTTPException(500, detail=str(exc)) from exc
 
