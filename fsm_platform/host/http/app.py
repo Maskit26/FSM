@@ -136,7 +136,13 @@ class EnqueueBody(BaseModel):
 def _http_actor(
     authorization: Optional[str],
     body_actor: Optional[Actor],
+    request: Optional[Request] = None,
 ) -> dict[str, Any]:
+    forced = getattr(request.state, "end_user_actor", None) if request is not None else None
+    if isinstance(forced, dict) and forced.get("actor_id"):
+        out = dict(forced)
+        out.setdefault("channel", "api")
+        return out
     try:
         return resolve_actor(
             authorization=authorization,
@@ -198,13 +204,14 @@ def catalog(service_id: str) -> dict[str, Any]:
 def invoke(
     service_id: str,
     body: InvokeBody,
+    request: Request,
     authorization: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """
     Синхронный вызов Command/Query домена.
     Ошибки домена отдаёт как 409 с error_code.
     """
-    actor = _http_actor(authorization, body.actor)
+    actor = _http_actor(authorization, body.actor, request)
     meta = default_operation_registry.get(service_id, body.operation)
     if meta is None:
         raise HTTPException(
@@ -260,6 +267,7 @@ def invoke(
 def enqueue(
     service_id: str,
     body: EnqueueBody,
+    request: Request,
     authorization: Optional[str] = Header(default=None),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
@@ -267,7 +275,7 @@ def enqueue(
     Ставит FSM-процесс в очередь для существующей сущности.
     Worker потом заберёт PENDING-инстанс и прогонит переход.
     """
-    actor = _http_actor(authorization, body.actor)
+    actor = _http_actor(authorization, body.actor, request)
     if not default_process_registry.has(service_id, body.process_name):
         raise HTTPException(400, detail=f"UNKNOWN_PROCESS: {body.process_name}")
     try:
@@ -310,13 +318,14 @@ def entity_actions(
     entity_type: str,
     entity_id: int,
     body: ActionsBody,
+    request: Request,
     authorization: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """
     Available actions: исходящие переходы + read-only прогон guards.
     Фронт рисует кнопки по allowed/reason, без дублирования правил.
     """
-    actor = _http_actor(authorization, body.actor)
+    actor = _http_actor(authorization, body.actor, request)
     try:
         return request_runtime.list_available_actions(
             service_id,
@@ -343,6 +352,7 @@ def entity_snapshot(
     entity_type: str,
     entity_id: int,
     body: SnapshotBody,
+    request: Request,
     authorization: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """
@@ -352,7 +362,7 @@ def entity_snapshot(
     from fsm_platform.host.security.auth import AuthError
 
     try:
-        actor = _http_actor(authorization, body.actor)
+        actor = _http_actor(authorization, body.actor, request)
     except AuthError as exc:
         raise HTTPException(401, detail={"error_code": exc.code, "message": str(exc)}) from exc
     try:
@@ -380,6 +390,53 @@ def entity_snapshot(
         raise HTTPException(400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(500, detail=str(exc)) from exc
+
+
+class EndUserTokenBody(BaseModel):
+    """Выпуск end-user Bearer для приложения домена (только с DOMAIN_ADMIN_TOKEN)."""
+
+    actor_type: str = "user"
+    actor_id: str
+    roles: list[str] = Field(default_factory=list)
+    ttl_seconds: int = 86400
+
+
+@domain_router.post("/end-user-tokens")
+def issue_end_user_token_route(
+    service_id: str,
+    body: EndUserTokenBody,
+    request: Request,
+) -> dict[str, Any]:
+    """
+    Бэкенд арендатора выпускает токен для приложения end-user.
+    Требует X-Admin-Token. Приложение хранит только полученный Bearer.
+    """
+    if getattr(request.state, "auth_mode", None) != "admin":
+        raise HTTPException(
+            403,
+            detail={
+                "error_code": "ADMIN_TOKEN_REQUIRED",
+                "message": "issue end-user tokens with DOMAIN_ADMIN_TOKEN only",
+            },
+        )
+    from fsm_platform.host.security.end_user_tokens import (
+        EndUserTokenError,
+        issue_end_user_token,
+    )
+
+    try:
+        return issue_end_user_token(
+            service_id=service_id,
+            actor_type=body.actor_type,
+            actor_id=body.actor_id,
+            roles=body.roles,
+            ttl_seconds=int(body.ttl_seconds),
+        )
+    except EndUserTokenError as exc:
+        raise HTTPException(
+            exc.status_code,
+            detail={"error_code": exc.code, "message": str(exc)},
+        ) from exc
 
 
 @domain_router.get("/entities/{entity_type}/{entity_id}/history")

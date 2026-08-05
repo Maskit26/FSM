@@ -35,6 +35,11 @@ from starlette.concurrency import run_in_threadpool
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.core.domain_errors import DomainError
 from fsm_platform.host.security.auth import AuthError, auth_enabled, resolve_actor
+from fsm_platform.host.security.end_user_tokens import (
+    EndUserTokenError,
+    looks_like_end_user_token,
+    verify_end_user_token,
+)
 from fsm_platform.host.runtime.engines import platform_session
 from fsm_platform.host.http import request_runtime
 from fsm_platform.host.http.dependencies import authenticate_domain_request
@@ -130,10 +135,23 @@ def _invoke_entity_snapshot(
 
 
 def _resolve_ws_actor(
-    websocket: WebSocket, msg: dict[str, Any]
+    websocket: WebSocket,
+    msg: dict[str, Any],
+    *,
+    forced_actor: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    if isinstance(forced_actor, dict) and forced_actor.get("actor_id"):
+        out = dict(forced_actor)
+        out["channel"] = "websocket"
+        return out
     actor = msg.get("actor") if isinstance(msg.get("actor"), dict) else None
     auth_header = websocket.headers.get("authorization") or msg.get("authorization")
+    # End-user Bearer already consumed at connect; don't re-parse as actor HMAC.
+    bearer = str(auth_header or "").strip()
+    if bearer.lower().startswith("bearer ") and looks_like_end_user_token(
+        bearer[7:].strip()
+    ):
+        auth_header = None
     if auth_enabled():
         resolved = resolve_actor(
             authorization=auth_header,
@@ -166,6 +184,8 @@ async def events_ws(
       after_id — курсор platform_events (0 = с текущего хвоста при connect)
       interval — тик опроса курсора, default 1s
 
+    Auth: X-Admin-Token или Authorization: Bearer eut1.… (end-user).
+
     Client → server:
       {"op":"subscribe","operation":"…","actor":{...},"params":{}}
       {"op":"subscribe","entity_type":"order","entity_id":42,"actor":{...}}
@@ -179,14 +199,39 @@ async def events_ws(
       {"type":"snapshot","entity_type":"...","entity_id":N,"data":{...},"fp":"..."}
       {"type":"pong"} | {"type":"error","detail":"..."}
     """
+    end_user_actor: Optional[dict[str, Any]] = None
+    admin_token = websocket.headers.get("x-admin-token")
+    auth_header = websocket.headers.get("authorization")
     try:
-        await run_in_threadpool(
-            authenticate_domain_request,
-            raw_token=websocket.headers.get("x-admin-token"),
-            service_id=service_id,
-            source_ip=websocket.client.host if websocket.client else None,
-            user_agent=websocket.headers.get("user-agent"),
-        )
+        if admin_token:
+            await run_in_threadpool(
+                authenticate_domain_request,
+                raw_token=admin_token,
+                service_id=service_id,
+                source_ip=websocket.client.host if websocket.client else None,
+                user_agent=websocket.headers.get("user-agent"),
+            )
+        else:
+            bearer = ""
+            if auth_header and auth_header.lower().startswith("bearer "):
+                bearer = auth_header[7:].strip()
+            if not bearer or not looks_like_end_user_token(bearer):
+                await websocket.close(code=4401, reason="DOMAIN_AUTH_REQUIRED")
+                return
+            try:
+                verified = verify_end_user_token(bearer, service_id=service_id)
+            except EndUserTokenError as exc:
+                await websocket.close(
+                    code=4403 if exc.status_code == 403 else 4401,
+                    reason=exc.code,
+                )
+                return
+            end_user_actor = {
+                "actor_type": verified["actor_type"],
+                "actor_id": verified["actor_id"],
+                "channel": "websocket",
+                "roles": list(verified.get("roles") or []),
+            }
     except TenantAuthError as exc:
         await websocket.close(
             code=4404 if exc.status_code == 404 else 4401,
@@ -383,7 +428,9 @@ async def events_ws(
                 operation = str(msg.get("operation") or "").strip()
 
                 try:
-                    resolved = _resolve_ws_actor(websocket, msg)
+                    resolved = _resolve_ws_actor(
+                        websocket, msg, forced_actor=end_user_actor
+                    )
                 except AuthError as exc:
                     await websocket.send_json(
                         {

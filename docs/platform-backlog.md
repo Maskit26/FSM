@@ -64,7 +64,7 @@
 - Автор может собрать аналог сам через subscribe на свою operation —
   платформа даёт entity-режим из коробки.
 
-### 1.4. Reconnect / realtime семантика — `planned`
+### 1.4. Reconnect / realtime семантика — `done`
 
 - **Карточка сущности:** после обрыва → Snapshot ± replay по eventId → снова WS.
 - **Биржа / списки:** после обрыва → снова тот же query /
@@ -76,13 +76,13 @@
 - Гонка двух курьеров на один заказ: UI обновляет список после факта;
   победителя решает command/guard на бэке (второй — отказ).
 
-Зафиксировать коротко в доке для авторов приложений домена (E4).
+Документ для авторов приложений домена: `docs/domain-app-realtime.md`.
 
 ### 1.5. Универсальный entity screen в ЛК — `out`
 
 Не делаем. Snapshot — формат данных; UI каждого домена свой.
 
-### 1.6. End-user токены вместо сырого `DOMAIN_ADMIN_TOKEN` в приложениях — `planned`
+### 1.6. End-user токены вместо сырого `DOMAIN_ADMIN_TOKEN` в приложениях — `done`
 
 - Приложение курьера / клиента / водителя **не держит** сырой `DOMAIN_ADMIN_TOKEN`.
 - End-user ходит с **end-user токеном** (Bearer / session), из которого платформа
@@ -91,6 +91,13 @@
 - Следствие: утечка приложения ≠ полный контроль Domain API тенанта
   (secrets, connect, worker, чужие операции).
 
+Реализация:
+- `POST /v1/{service_id}/end-user-tokens` (только admin) → `eut1.…`
+- Domain API / WS: `Authorization: Bearer eut1.…` **без** admin-токена
+- Admin-пути (secrets/connect/worker/…) end-user токеном закрыты
+- Секрет подписи: `domain_secrets.end_user_token_secret` на `service_id`
+  (не platform `.env`; при первом issue создаётся сам)
+- См. также `docs/domain-app-realtime.md`
 ---
 
 ## 2. Ops-пакет — `planned` (целиком)
@@ -220,12 +227,12 @@ outbox `http_external` (не новый framework).
 
 | ID | Тема | Статус |
 |----|------|--------|
-| E1 | Principal + policy (end-user ops; admin ЛК без Principal) | planned |
-| E2 | Entity Snapshot endpoint (optional) | planned |
-| E3 | WS entity subscribe + reconnect semantics | planned |
-| E4 | Docs: reconnect для entity vs list/exchange | planned |
+| E1 | Principal + policy (end-user ops; admin ЛК без Principal) | done |
+| E2 | Entity Snapshot endpoint (optional) | done |
+| E3 | WS entity subscribe + reconnect semantics | done |
+| E4 | Docs: reconnect для entity vs list/exchange | done |
 | E5 | Universal LK entity screen | out |
-| E6 | End-user token; no raw DOMAIN_ADMIN_TOKEN in domain apps | planned |
+| E6 | End-user token; no raw DOMAIN_ADMIN_TOKEN in domain apps | done |
 | O1 | Reliability Matrix + DR runbook | planned |
 | O2 | Autotest: kill worker → queue drains | planned |
 | O3 | `/ready` vs `/health` | planned |

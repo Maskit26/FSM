@@ -12,12 +12,29 @@ from fastapi import Header, HTTPException, Request
 
 from fsm_platform.core.db_layer import default_db_layer
 from fsm_platform.host.runtime.engines import platform_session
+from fsm_platform.host.security.end_user_tokens import (
+    EndUserTokenError,
+    looks_like_end_user_token,
+    verify_end_user_token,
+)
 from fsm_platform.host.security.secrets import SecretsError, require_admin
 from fsm_platform.host.security.tenant_auth import (
     TenantAuthError,
     TenantPrincipal,
     authenticate_domain_token,
     verify_access_token,
+)
+
+# Paths under /v1/{service_id}/… that end-user tokens must NOT reach.
+_ADMIN_ONLY_SUFFIXES = (
+    "/secrets",
+    "/connect",
+    "/reload",
+    "/worker",
+    "/graph/publish",
+    "/webhooks",
+    "/schedules",
+    "/end-user-tokens",
 )
 
 logger = logging.getLogger(__name__)
@@ -229,18 +246,99 @@ def require_domain_token(
         )
 
 
-def require_domain_service_access(
+def _path_is_admin_only(path: str, service_id: str) -> bool:
+    prefix = f"/v1/{service_id}"
+    rest = path[len(prefix) :] if path.startswith(prefix) else path
+    if not rest.startswith("/"):
+        rest = "/" + rest
+    for suffix in _ADMIN_ONLY_SUFFIXES:
+        if rest == suffix or rest.startswith(suffix + "/"):
+            return True
+    return False
+
+
+def _bearer_raw(authorization: Optional[str]) -> Optional[str]:
+    value = str(authorization or "").strip()
+    if not value.lower().startswith("bearer "):
+        return None
+    token = value[7:].strip()
+    return token or None
+
+
+def authenticate_domain_or_end_user(
+    *,
     service_id: str,
     request: Request,
-    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
-) -> TenantPrincipal:
-    try:
-        return authenticate_domain_request(
-            raw_token=x_admin_token,
+    raw_admin_token: Optional[str],
+    authorization: Optional[str],
+) -> Optional[TenantPrincipal]:
+    """
+    Domain API gate:
+      - X-Admin-Token → full tenant admin (DOMAIN_ADMIN_TOKEN)
+      - Authorization: Bearer eut1.… → end-user (Principal fixed; admin paths forbidden)
+    """
+    request.state.auth_mode = None
+    request.state.end_user_actor = None
+
+    admin = str(raw_admin_token or "").strip()
+    if admin:
+        principal = authenticate_domain_request(
+            raw_token=admin,
             service_id=service_id,
             source_ip=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             **_domain_auth_kwargs(request),
+        )
+        request.state.auth_mode = "admin"
+        return principal
+
+    bearer = _bearer_raw(authorization)
+    if bearer and looks_like_end_user_token(bearer):
+        try:
+            actor = verify_end_user_token(bearer, service_id=service_id)
+        except EndUserTokenError as exc:
+            raise HTTPException(
+                exc.status_code,
+                detail={"error_code": exc.code, "message": str(exc)},
+            ) from exc
+        if _path_is_admin_only(request.url.path, service_id):
+            raise HTTPException(
+                403,
+                detail={
+                    "error_code": "ADMIN_TOKEN_REQUIRED",
+                    "message": "end-user token cannot access admin domain routes",
+                },
+            )
+        request.state.auth_mode = "end_user"
+        request.state.end_user_actor = {
+            "actor_type": actor["actor_type"],
+            "actor_id": actor["actor_id"],
+            "channel": "api",
+            "roles": list(actor.get("roles") or []),
+        }
+        return None
+
+    raise HTTPException(
+        401,
+        detail={
+            "error_code": "DOMAIN_AUTH_REQUIRED",
+            "message": "X-Admin-Token or Authorization: Bearer end-user token required",
+        },
+    )
+
+
+def require_domain_service_access(
+    service_id: str,
+    request: Request,
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> Optional[TenantPrincipal]:
+    try:
+        return authenticate_domain_or_end_user(
+            service_id=service_id,
+            request=request,
+            raw_admin_token=x_admin_token,
+            authorization=authorization,
         )
     except HTTPException:
         raise
