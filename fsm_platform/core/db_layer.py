@@ -643,6 +643,55 @@ class FsmDbLayer:
             },
         )
 
+    def reclaim_stale_processing_instances(
+        self,
+        session: SessionLike,
+        *,
+        older_than_seconds: int = 300,
+        service_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> int:
+        """
+        PROCESSING без прогресса (убитый worker) → снова PENDING.
+        started_at старше порога; если started_at NULL — смотрим updated_at/created_at.
+        """
+        age = int(max(30, older_than_seconds))
+        lim = int(max(1, min(limit, 500)))
+        svc_sql = "AND service_id = :service_id" if service_id else ""
+        params: dict[str, Any] = {"age": age, "limit": lim}
+        if service_id:
+            params["service_id"] = str(service_id).strip()
+        result = session.execute(
+            text(
+                f"""
+                UPDATE server_fsm_instances
+                SET status = 'PENDING',
+                    next_attempt_at = UTC_TIMESTAMP(),
+                    last_error = COALESCE(
+                        NULLIF(last_error, ''),
+                        'STALE_PROCESSING_RECLAIMED'
+                    ),
+                    started_at = NULL,
+                    finished_at = NULL,
+                    updated_at = UTC_TIMESTAMP()
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id
+                        FROM server_fsm_instances
+                        WHERE status = 'PROCESSING'
+                          AND COALESCE(started_at, updated_at, created_at)
+                              <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL :age SECOND)
+                          {svc_sql}
+                        ORDER BY id ASC
+                        LIMIT :limit
+                    ) AS stale
+                )
+                """
+            ),
+            params,
+        )
+        return int(result.rowcount or 0)
+
     def list_pending_instances(
         self,
         session: SessionLike,

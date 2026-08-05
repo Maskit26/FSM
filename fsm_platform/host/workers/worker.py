@@ -7,6 +7,7 @@ SQL нет — записи в platform идут через fsm_platform.core.db
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Optional
 
@@ -21,6 +22,49 @@ from fsm_platform.host.workers.retry_policy import backoff_seconds, should_retry
 from fsm_platform.host.runtime.webhooks import emit_event_with_webhooks
 
 logger = logging.getLogger(__name__)
+
+_last_stale_reclaim_at = 0.0
+
+
+def _stale_processing_seconds() -> int:
+    raw = (os.environ.get("WORKER_STALE_PROCESSING_SECONDS") or "300").strip()
+    try:
+        return max(30, int(raw))
+    except ValueError:
+        return 300
+
+
+def _reclaim_stale_processing(*, service_id: Optional[str] = None) -> int:
+    """Раз в ~30s: PROCESSING от убитого worker → PENDING."""
+    global _last_stale_reclaim_at
+
+    now = time.monotonic()
+    if now - _last_stale_reclaim_at < 30.0:
+        return 0
+    _last_stale_reclaim_at = now
+    sp = platform_session()
+    try:
+        n = default_db_layer.reclaim_stale_processing_instances(
+            sp,
+            older_than_seconds=_stale_processing_seconds(),
+            service_id=service_id,
+        )
+        if n:
+            sp.commit()
+            logger.warning(
+                "reclaimed stale PROCESSING instances count=%s service_id=%s",
+                n,
+                service_id or "*",
+            )
+        else:
+            sp.rollback()
+        return n
+    except Exception:
+        sp.rollback()
+        logger.exception("stale PROCESSING reclaim failed")
+        return 0
+    finally:
+        sp.close()
 
 
 def _fire_due_timers(*, limit: int = 20, service_id: Optional[str] = None) -> bool:
@@ -300,6 +344,7 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
     Возвращает True, если была работа; False, если очередь пуста.
     service_id — опциональный фильтр тенанта (воркер на одного арендатора).
     """
+    _reclaim_stale_processing(service_id=service_id)
     if _fire_due_timers(service_id=service_id):
         return True
     if _fire_due_schedules(service_id=service_id):

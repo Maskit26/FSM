@@ -165,8 +165,26 @@ def _startup() -> None:
 
 @platform_router.get("/v1/health")
 def health() -> dict[str, Any]:
-    """Живость platform API. Domain service может быть offline — это не ошибка health."""
-    return {"status": "ok", "domains": get_bootstrap_status()}
+    """
+    Liveness: процесс Platform API жив.
+    Не проверяет DB / worker / backlog — для этого GET /v1/ready.
+    """
+    return {"status": "ok"}
+
+
+@platform_router.get("/v1/ready")
+def ready() -> dict[str, Any]:
+    """
+    Readiness: пускать ли трафик на API.
+    200 = ready, 503 = not ready (platform DB / критический backlog).
+    """
+    from fsm_platform.host.runtime.readiness import check_platform_ready
+    from fastapi.responses import JSONResponse
+
+    body = check_platform_ready()
+    if body.get("ok"):
+        return body
+    return JSONResponse(status_code=503, content=body)
 
 
 @platform_router.get("/v1/metrics")
@@ -181,6 +199,21 @@ def metrics() -> dict[str, Any]:
         return {"status": "ok", **collect_platform_metrics()}
     except Exception as exc:
         raise HTTPException(503, detail=f"METRICS_UNAVAILABLE: {exc}") from exc
+
+
+@domain_router.get("/ready")
+def tenant_ready(service_id: str) -> dict[str, Any]:
+    """
+    Tenant readiness: domain catalog + worker + platform DB.
+    200 = ready, 503 = not ready.
+    """
+    from fsm_platform.host.runtime.readiness import check_tenant_ready
+    from fastapi.responses import JSONResponse
+
+    body = check_tenant_ready(service_id)
+    if body.get("ok"):
+        return body
+    return JSONResponse(status_code=503, content=body)
 
 
 @domain_router.get("/catalog")

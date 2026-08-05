@@ -100,44 +100,29 @@
 - См. также `docs/domain-app-realtime.md`
 ---
 
-## 2. Ops-пакет — `planned` (целиком)
+## 2. Ops-пакет
 
-### 2.1. Reliability Matrix + DR runbook + автотест
+### 2.1. Reliability Matrix + DR runbook + автотест — `done`
 
-**Reliability Matrix (документ)** — таблица по сбоям вашей модели
-(dual-commit domain → platform + reconcile, dedicated worker, outbox):
+Документ: `docs/ops-reliability.md` (matrix + DR + ориентиры RPO/RTO Clever).
 
-| Сбой (примеры строк) | Что теряется | Автовосстановление | Нужен человек |
-|----------------------|--------------|--------------------|---------------|
-| Рестарт Platform API | in-flight HTTP | да (клиент retry + idempotency) | обычно нет |
-| Убит / упал dedicated worker | незавершённый PROCESSING → stale/retry | да после restart/provision | если не поднят worker |
-| Dual-commit: domain ok, platform fail | рассинхрон до доката | reconcile | если DEAD / исчерпаны попытки |
-| Рестарт outbox worker | intent в outbox остаётся | retry / повтор HTTP | если внешний API не идемпотентен |
-| Падение / недоступность platform DB | запись/чтение platform | после восстановления DB | да при потере данных |
-| Потеря сайта / нужен restore из backup | зависит от backup | по DR runbook | да |
+Reclaim: убитый worker оставляет PROCESSING → worker loop возвращает в PENDING
+(`WORKER_STALE_PROCESSING_SECONDS`, default 300).
 
-В каждой строке при реализации дока: ориентиры RPO/RTO под ваш хостинг
-(Clever и т.п.), без выдуманных SLA.
+Автотест: `tests/test_worker_kill_recovery.py`
+(`python -m unittest tests.test_worker_kill_recovery`).
 
-**DR runbook (документ)** — пошагово: порядок подъёма (DB → platform API →
-worker provision → domain service), проверки backlog PENDING, outbox dead,
-reconcile, контрольный invoke/enqueue.
+### 2.2. Readiness ≠ liveness — `done`
 
-**Автотест (O2):** убить worker → убедиться, что PENDING/зависшие instances
-догоняются после restart/provision (failure-injection).
+- `GET /v1/health` — liveness (процесс жив).
+- `GET /v1/ready` — platform DB + опционально backlog (пороги env);
+  200 / 503.
+- `GET /v1/{service_id}/ready` — domain + worker + DB (tenant probe).
 
-### 2.2. Readiness ≠ liveness
+Env: `READY_MAX_PENDING_AGE_SECONDS` (default 300, `0` = off),
+`READY_MAX_OUTBOX_DEAD` / `READY_MAX_RECONCILE_DEAD` (если заданы).
 
-- `GET /v1/health` (liveness) — процесс API отвечает (как сейчас / уточнить).
-- `GET /v1/ready` (или эквивалент) — **не** пускать трафик, если критично плохо:
-  - platform DB недоступна;
-  - (для tenant-ready, если probe scoped) catalog/domain not ready;
-  - worker для тенанта not running / failed (где применимо к probe);
-  - критический backlog: due PENDING старше порога / outbox DEAD выше порога
-    (пороги — при реализации, согласовать с монитором ЛК).
-- 200 = ready, 503 = not ready.
-
-### 2.3. Метрики per `service_id`
+### 2.3. Метрики per `service_id` — `planned`
 
 - Сейчас есть глобальный `GET /v1/metrics` и кусок queue в worker/status.
 - Нужен tenant-scoped снимок + отображение в ЛК.
@@ -233,9 +218,9 @@ outbox `http_external` (не новый framework).
 | E4 | Docs: reconnect для entity vs list/exchange | done |
 | E5 | Universal LK entity screen | out |
 | E6 | End-user token; no raw DOMAIN_ADMIN_TOKEN in domain apps | done |
-| O1 | Reliability Matrix + DR runbook | planned |
-| O2 | Autotest: kill worker → queue drains | planned |
-| O3 | `/ready` vs `/health` | planned |
+| O1 | Reliability Matrix + DR runbook | done |
+| O2 | Autotest: kill worker → queue drains | done |
+| O3 | `/ready` vs `/health` | done |
 | O4 | Metrics per `service_id` | planned |
 | O5 | Full correlation envelope | planned |
 | A1 | Adapter checklist + light call_api/outbox requirements | planned |
