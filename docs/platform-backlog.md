@@ -181,9 +181,13 @@ Runtime:
 
 ---
 
-## 4. Вне этого плана (пока не фиксировали)
+## 4. Domain author playbook — `done`
 
-- Domain author playbook (чеклист подключения картриджа) — отдельно, когда дойдём.
+Документ: `docs/domain-author-playbook.md`.
+
+Чеклист подключения картриджа: каркас `domains/<name>/`, Domain DB + graph,
+env domain service, онбординг (domains → secrets → connect), end-user surface,
+адаптеры, конфликты, ops перед «готово к тенанту». Референс: `domains/courier/`.
 
 ---
 
@@ -205,3 +209,4 @@ Runtime:
 | A1 | Adapter checklist + light call_api/outbox requirements | done |
 | C1 | Conflict semantics docs for clients (dual-commit) | done |
 | C2 | Autotest: parallel take race → one win / one conflict | done |
+| P4 | Domain author playbook (чеклист картриджа) | done |
