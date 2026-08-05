@@ -159,42 +159,25 @@ reconcile в JSON metrics.
 
 Ответ invoke/enqueue содержит блок `correlation`.
 
-### 3. Интеграции и конфликты — `planned`
+### 3. Интеграции и конфликты
 
-### 3.1. Adapter checklist (лёгкие требования) — `planned`
+### 3.1. Adapter checklist (лёгкие требования) — `done`
 
-Дисциплина внешних вызовов через уже существующие `call_api` /
-outbox `http_external` (не новый framework).
+Документ: `docs/adapter-checklist.md`.
 
-**Документ-чеклист для каждой интеграции:**
+Runtime:
+- `call_api(..., timeout=, idempotency_key=, max_attempts=)` —
+  timeout > 0; `Idempotency-Key` + correlation headers из envelope §2.4;
+- outbox `http_external` / webhook прокидывают `correlation` (+ idempotency_key).
 
-- timeout;
-- retry / backoff;
-- idempotency (ключ и семантика повтора);
-- mapping ошибок внешней системы → домен/платформа;
-- authentication (credential из `domain_secrets`);
-- correlation (`correlationId` и др. из §2.4);
-- поведение при недоступности внешней системы (fail / отложить в outbox).
+### 3.2. Семантика конфликтов для клиентов (dual-commit) — `done`
 
-**Лёгкие требования к runtime:** `call_api` и доставка outbox `http_external`
-должны явно задавать/прокидывать минимум: timeout, idempotency key
-(где применимо), correlation; без обхода этих полей «голым» HTTP в обход
-контракта (детали валидации — на реализации).
+Документ: `docs/client-conflict-semantics.md`.
 
-### 3.2. Семантика конфликтов для клиентов (dual-commit) — `planned`
+Код гонки FSM: `STATE_MISMATCH`. Доменный take: `ALREADY_TAKEN`.
 
-Клиентский контракт (дока) для авторов приложений домена и E2E:
-
-| Класс | Пример | Что делать клиенту |
-|-------|--------|-------------------|
-| Conflict / гонка | `STATE_MISMATCH`, доменный «уже занято» | перечитать карточку/биржу; не долбить то же вслепую |
-| Business reject | DomainError / guard reject | показать reason; обычно без auto-retry |
-| Transient | 5xx, сеть, worker down | retry с Idempotency-Key / тем же correlation |
-| Dual-commit в полёте | domain ок, platform догоняет | не создавать сущность второй раз; поллить instance / дождаться события |
-
-- Код гонки по FSM state — существующий `STATE_MISMATCH`; не переименовываем.
-- **Автотест гонки (C2):** два параллельных take (или аналог) на одну сущность →
-  один успех, второй conflict — в этой же задаче.
+Автотест: `tests/test_parallel_take_race.py`
+(`python -m unittest tests.test_parallel_take_race`).
 
 ---
 
@@ -219,6 +202,6 @@ outbox `http_external` (не новый framework).
 | O3 | `/ready` vs `/health` | done |
 | O4 | Metrics per `service_id` | done |
 | O5 | Full correlation envelope | done |
-| A1 | Adapter checklist + light call_api/outbox requirements | planned |
-| C1 | Conflict semantics docs for clients (dual-commit) | planned |
-| C2 | Autotest: parallel take race → one win / one conflict | planned |
+| A1 | Adapter checklist + light call_api/outbox requirements | done |
+| C1 | Conflict semantics docs for clients (dual-commit) | done |
+| C2 | Autotest: parallel take race → one win / one conflict | done |

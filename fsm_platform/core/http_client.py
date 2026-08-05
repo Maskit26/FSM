@@ -259,6 +259,56 @@ def _sleep_backoff(attempt: int) -> None:
     time.sleep(delay)
 
 
+def _resolve_timeout(timeout: Optional[float]) -> float:
+    if timeout is None:
+        return _DEFAULT_TIMEOUT
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ExternalApiError(
+            "TIMEOUT_INVALID", "timeout must be a number > 0"
+        ) from exc
+    if value <= 0:
+        raise ExternalApiError("TIMEOUT_INVALID", "timeout must be > 0")
+    return value
+
+
+def _merge_trace_headers(
+    headers: Optional[Mapping[str, str]],
+    *,
+    idempotency_key: Optional[str] = None,
+) -> dict[str, str]:
+    """
+    Correlation (§2.4) + Idempotency-Key.
+    Не затирает уже выставленные клиентом одноимённые headers.
+    """
+    out: dict[str, str] = {str(k): str(v) for k, v in dict(headers or {}).items()}
+    lower = {k.lower(): k for k in out}
+
+    def _set_default(name: str, value: Optional[str]) -> None:
+        if not value:
+            return
+        if name.lower() in lower:
+            return
+        out[name] = str(value).strip()[:256]
+
+    try:
+        from fsm_platform.host.runtime.correlation import current_envelope
+
+        env = current_envelope()
+    except Exception:  # noqa: BLE001
+        env = None
+    if env is not None:
+        _set_default("X-Correlation-Id", env.correlation_id)
+        _set_default("X-Command-Id", env.command_id)
+        _set_default("X-Causation-Id", env.causation_id)
+
+    idem = str(idempotency_key or "").strip()
+    if idem:
+        _set_default("Idempotency-Key", idem)
+    return out
+
+
 def call_api(
     credential_key: str,
     method: str,
@@ -271,17 +321,22 @@ def call_api(
     signer: Optional[str] = None,
     timeout: Optional[float] = None,
     max_attempts: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
 ) -> ApiResponse:
     """
     Исходящий HTTP от имени текущего арендатора.
 
     credential_key — имя секрета (JSON credential).
     path — относительный путь к base_url (или абсолютный URL).
-    signer — optional override; иначе берётся из credential.type=custom → credential.signer.
+    timeout — сек; None → EXTERNAL_API_TIMEOUT. Должен быть > 0.
+    idempotency_key — прокидывается как Idempotency-Key (если ещё нет в headers).
+    Correlation headers — из текущего envelope (§2.4), если есть.
 
     Domain process (PLATFORM_API_BASE_URL): HMAC proxy на platform /external/call.
     Platform process: читает domain_secrets локально и ходит во внешний API.
     """
+    headers = _merge_trace_headers(headers, idempotency_key=idempotency_key)
+    timeout = _resolve_timeout(timeout)
     if _use_platform_proxy():
         return call_api_via_platform(
             credential_key,
@@ -294,6 +349,7 @@ def call_api(
             signer=signer,
             timeout=timeout,
             max_attempts=max_attempts,
+            idempotency_key=idempotency_key,
         )
     if _is_domain_cartridge_process():
         raise ExternalApiError(
@@ -313,6 +369,7 @@ def call_api(
         signer=signer,
         timeout=timeout,
         max_attempts=max_attempts,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -328,6 +385,7 @@ def call_api_via_platform(
     signer: Optional[str] = None,
     timeout: Optional[float] = None,
     max_attempts: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
 ) -> ApiResponse:
     """Domain → platform HMAC proxy; secrets never leave the platform process."""
     from fsm_platform.host.contract.contract_client import sign_contract_request
@@ -353,6 +411,9 @@ def call_api_via_platform(
         "signer": signer,
         "timeout": timeout,
         "max_attempts": max_attempts,
+        "idempotency_key": (
+            str(idempotency_key).strip() if idempotency_key else None
+        ),
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ts = str(int(time.time()))
@@ -364,7 +425,7 @@ def call_api_via_platform(
         timestamp=ts,
     )
     # Platform still retries vendor HTTP; give headroom for nested call.
-    t_out = float(timeout) if timeout is not None else _DEFAULT_TIMEOUT
+    t_out = _resolve_timeout(timeout)
     attempts = max(1, int(max_attempts if max_attempts is not None else _MAX_ATTEMPTS))
     proxy_timeout = max(t_out * attempts + 5.0, 30.0)
 
@@ -444,6 +505,7 @@ def call_api_local(
     signer: Optional[str] = None,
     timeout: Optional[float] = None,
     max_attempts: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
 ) -> ApiResponse:
     """
     Platform-local outbound HTTP: resolve credential from domain_secrets, then request.
@@ -459,7 +521,9 @@ def call_api_local(
     else:
         url = urljoin(cred["base_url"], rel.lstrip("/"))
 
-    req_headers: dict[str, str] = dict(headers or {})
+    req_headers: dict[str, str] = _merge_trace_headers(
+        headers, idempotency_key=idempotency_key
+    )
     req_headers, basic = _apply_auth(cred, req_headers)
 
     body_json = json_body
@@ -517,7 +581,7 @@ def call_api_local(
     ):
         req_headers["Content-Type"] = "application/json"
 
-    t_out = float(timeout) if timeout is not None else _DEFAULT_TIMEOUT
+    t_out = _resolve_timeout(timeout)
     attempts = max(1, int(max_attempts if max_attempts is not None else _MAX_ATTEMPTS))
 
     last_err: Optional[ExternalApiError] = None

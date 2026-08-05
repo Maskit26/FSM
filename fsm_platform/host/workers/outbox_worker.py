@@ -87,6 +87,8 @@ def deliver_one(row: dict[str, Any]) -> None:
                 "entity_id": payload.get("entity_id"),
                 "payload": payload.get("payload") or {},
             }
+            if isinstance(payload.get("correlation"), dict):
+                body["correlation"] = payload["correlation"]
             deliver_webhook(
                 url=destination,
                 secret=secret,
@@ -105,6 +107,15 @@ def deliver_one(row: dict[str, Any]) -> None:
             if destination and not body.get("credential_key"):
                 body["credential_key"] = destination
             body.setdefault("service_id", service_id)
+            # correlation из notify/emit (§2.4) должен дойти до domain deliver
+            if "correlation" not in body and isinstance(
+                payload.get("correlation"), dict
+            ):
+                body["correlation"] = payload["correlation"]
+            body.setdefault(
+                "idempotency_key",
+                row.get("idempotency_key") or body.get("idempotency_key"),
+            )
             get_contract_client(service_id).call_outbox_deliver(body)
             return
 

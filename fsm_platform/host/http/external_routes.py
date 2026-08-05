@@ -27,6 +27,7 @@ class ExternalCallBody(BaseModel):
     signer: Optional[str] = None
     timeout: Optional[float] = None
     max_attempts: Optional[int] = None
+    idempotency_key: Optional[str] = None
 
 
 @router.post("/external/call")
@@ -88,6 +89,7 @@ async def external_call(service_id: str, request: Request) -> Any:
                 signer=payload.signer,
                 timeout=payload.timeout,
                 max_attempts=payload.max_attempts,
+                idempotency_key=payload.idempotency_key,
             )
     except ExternalApiError as exc:
         return JSONResponse(
