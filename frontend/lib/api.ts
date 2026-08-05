@@ -446,10 +446,46 @@ export function workerStatus(serviceId: string, domainAdminToken: string) {
       pending?: number;
       processing?: number;
       oldest_due_pending_age_seconds?: number | null;
+      failed_1h?: number;
     };
+    metrics?: TenantMetrics;
   }>(`/v1/${encodeURIComponent(serviceId)}/worker/status`, {
     adminToken: domainAdminToken,
   });
+}
+
+export type TenantMetrics = {
+  service_id?: string;
+  instances?: {
+    pending?: number;
+    processing?: number;
+    failed_1h?: number;
+    oldest_due_pending_age_seconds?: number | null;
+  };
+  outbox?: {
+    pending?: number;
+    retry?: number;
+    dead?: number;
+    processing?: number;
+  };
+  timers?: {
+    due?: number;
+    overdue?: number;
+  };
+  reconcile?: {
+    pending?: number;
+    dead?: number;
+  };
+};
+
+export function fetchTenantMetrics(
+  serviceId: string,
+  domainAdminToken: string,
+) {
+  return apiFetch<{ status: string } & TenantMetrics>(
+    `/v1/${encodeURIComponent(serviceId)}/metrics`,
+    { adminToken: domainAdminToken },
+  );
 }
 
 export function workerRestart(serviceId: string, domainAdminToken: string) {

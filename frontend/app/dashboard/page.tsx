@@ -33,6 +33,7 @@ import {
   rotateAdminToken,
   telegramLink,
   telegramWebhookUrl,
+  TenantMetrics,
   upsertSecret,
   workerRestart,
   workerStatus,
@@ -232,6 +233,7 @@ export default function CabinetPage() {
   const [workerLive, setWorkerLive] = useState<string | null>(null);
   const [workerOk, setWorkerOk] = useState<boolean | null>(null);
   const [workerReason, setWorkerReason] = useState<string | null>(null);
+  const [tenantMetrics, setTenantMetrics] = useState<TenantMetrics | null>(null);
   const [catalogLive, setCatalogLive] = useState<string | null>(null);
   const [catalogOk, setCatalogOk] = useState<boolean | null>(null);
 
@@ -327,6 +329,19 @@ export default function CabinetPage() {
       setWorkerReason(
         typeof ws.reason === "string" && ws.reason ? ws.reason : null,
       );
+      if (ws.metrics && typeof ws.metrics === "object") {
+        setTenantMetrics(ws.metrics);
+      } else if (ws.queue) {
+        setTenantMetrics({
+          instances: {
+            pending: ws.queue.pending,
+            processing: ws.queue.processing,
+            failed_1h: ws.queue.failed_1h,
+            oldest_due_pending_age_seconds:
+              ws.queue.oldest_due_pending_age_seconds,
+          },
+        });
+      }
     } catch {
       setWorkerLive("failed");
       setWorkerOk(false);
@@ -1019,6 +1034,68 @@ export default function CabinetPage() {
                 </strong>
               </div>
             </div>
+            {tenantMetrics ? (
+              <div className="health-grid metrics-grid">
+                <div
+                  className={`health-chip${
+                    (tenantMetrics.instances?.pending || 0) > 0 &&
+                    (tenantMetrics.instances?.oldest_due_pending_age_seconds ||
+                      0) >= 20
+                      ? " bad"
+                      : ""
+                  }`}
+                >
+                  <span className="health-label">Pending</span>
+                  <strong>{tenantMetrics.instances?.pending ?? "—"}</strong>
+                </div>
+                <div className="health-chip">
+                  <span className="health-label">Processing</span>
+                  <strong>{tenantMetrics.instances?.processing ?? "—"}</strong>
+                </div>
+                <div
+                  className={`health-chip${
+                    (tenantMetrics.instances?.failed_1h || 0) > 0 ? " bad" : ""
+                  }`}
+                >
+                  <span className="health-label">Failed 1h</span>
+                  <strong>{tenantMetrics.instances?.failed_1h ?? "—"}</strong>
+                </div>
+                <div className="health-chip">
+                  <span className="health-label">Pending age</span>
+                  <strong>
+                    {tenantMetrics.instances?.oldest_due_pending_age_seconds !=
+                    null
+                      ? `${tenantMetrics.instances.oldest_due_pending_age_seconds}s`
+                      : "—"}
+                  </strong>
+                </div>
+                <div className="health-chip">
+                  <span className="health-label">Outbox</span>
+                  <strong>
+                    {tenantMetrics.outbox
+                      ? `${tenantMetrics.outbox.pending ?? 0}/${tenantMetrics.outbox.retry ?? 0}/${tenantMetrics.outbox.dead ?? 0}`
+                      : "—"}
+                  </strong>
+                </div>
+                <div
+                  className={`health-chip${
+                    (tenantMetrics.timers?.overdue || 0) > 0 ? " bad" : ""
+                  }`}
+                >
+                  <span className="health-label">Timers</span>
+                  <strong>
+                    {tenantMetrics.timers
+                      ? `${tenantMetrics.timers.due ?? 0}/${tenantMetrics.timers.overdue ?? 0}`
+                      : "—"}
+                  </strong>
+                </div>
+              </div>
+            ) : null}
+            {tenantMetrics?.outbox ? (
+              <p className="muted monitor-meta">
+                Outbox: pending / retry / dead · Timers: due / overdue (&gt;60s)
+              </p>
+            ) : null}
             {domainCheckedAt ? (
               <p className="muted monitor-meta">
                 Проверка: {domainCheckedAt}

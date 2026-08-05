@@ -2468,6 +2468,152 @@ class FsmDbLayer:
             else None,
         }
 
+    def collect_tenant_queue_metrics(
+        self, session: SessionLike, service_id: str
+    ) -> dict[str, Any]:
+        """
+        Полный ops-снимок одного service_id (instances / outbox / timers / reconcile).
+        """
+        sid = str(service_id or "").strip()
+        instances = {
+            str(r["status"]): int(r["n"])
+            for r in session.execute(
+                text(
+                    """
+                    SELECT status, COUNT(*) AS n
+                    FROM server_fsm_instances
+                    WHERE service_id = :service_id
+                    GROUP BY status
+                    """
+                ),
+                {"service_id": sid},
+            ).mappings()
+        }
+        oldest_pending = session.execute(
+            text(
+                """
+                SELECT TIMESTAMPDIFF(SECOND, MIN(created_at), UTC_TIMESTAMP()) AS age_s
+                FROM server_fsm_instances
+                WHERE service_id = :service_id
+                  AND status = 'PENDING'
+                  AND (next_attempt_at IS NULL
+                       OR next_attempt_at <= UTC_TIMESTAMP())
+                """
+            ),
+            {"service_id": sid},
+        ).scalar()
+        failed_1h = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM server_fsm_instances
+                WHERE service_id = :service_id
+                  AND status = 'FAILED'
+                  AND finished_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 1 HOUR)
+                """
+            ),
+            {"service_id": sid},
+        ).scalar()
+        outbox = {
+            str(r["status"]): int(r["n"])
+            for r in session.execute(
+                text(
+                    """
+                    SELECT status, COUNT(*) AS n
+                    FROM platform_outbox
+                    WHERE service_id = :service_id
+                    GROUP BY status
+                    """
+                ),
+                {"service_id": sid},
+            ).mappings()
+        }
+        outbox_retry = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM platform_outbox
+                WHERE service_id = :service_id
+                  AND status = 'PENDING'
+                  AND attempts > 0
+                """
+            ),
+            {"service_id": sid},
+        ).scalar()
+        outbox_pending_fresh = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM platform_outbox
+                WHERE service_id = :service_id
+                  AND status = 'PENDING'
+                  AND attempts = 0
+                """
+            ),
+            {"service_id": sid},
+        ).scalar()
+        timers_due = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM fsm_timers
+                WHERE service_id = :service_id
+                  AND status = 'SCHEDULED'
+                  AND fire_at <= UTC_TIMESTAMP()
+                """
+            ),
+            {"service_id": sid},
+        ).scalar()
+        timers_overdue = session.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM fsm_timers
+                WHERE service_id = :service_id
+                  AND status = 'SCHEDULED'
+                  AND fire_at <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 60 SECOND)
+                """
+            ),
+            {"service_id": sid},
+        ).scalar()
+        reconcile = {
+            str(r["status"]): int(r["n"])
+            for r in session.execute(
+                text(
+                    """
+                    SELECT status, COUNT(*) AS n
+                    FROM platform_reconcile_queue
+                    WHERE service_id = :service_id
+                    GROUP BY status
+                    """
+                ),
+                {"service_id": sid},
+            ).mappings()
+        }
+        return {
+            "service_id": sid,
+            "instances": {
+                "by_status": instances,
+                "pending": int(instances.get("PENDING") or 0),
+                "processing": int(instances.get("PROCESSING") or 0),
+                "failed_1h": int(failed_1h or 0),
+                "oldest_due_pending_age_seconds": int(oldest_pending)
+                if oldest_pending is not None
+                else None,
+            },
+            "outbox": {
+                "by_status": outbox,
+                "pending": int(outbox_pending_fresh or 0),
+                "retry": int(outbox_retry or 0),
+                "dead": int(outbox.get("DEAD") or 0),
+                "processing": int(outbox.get("PROCESSING") or 0),
+            },
+            "timers": {
+                "due": int(timers_due or 0),
+                "overdue": int(timers_overdue or 0),
+            },
+            "reconcile": {
+                "by_status": reconcile,
+                "pending": int(reconcile.get("PENDING") or 0),
+                "dead": int(reconcile.get("DEAD") or 0),
+            },
+        }
+
     def collect_platform_queue_metrics(self, session: SessionLike) -> dict[str, Any]:
         """Агрегаты instances / outbox / reconcile / timers для ops-метрик."""
         instances = {

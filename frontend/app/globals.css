@@ -691,6 +691,10 @@ select {
   gap: 0.55rem;
 }
 
+.metrics-grid {
+  margin-top: 0.55rem;
+}
+
 .health-chip {
   display: grid;
   gap: 0.15rem;

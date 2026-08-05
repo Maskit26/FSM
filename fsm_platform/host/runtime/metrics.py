@@ -18,6 +18,18 @@ def collect_platform_metrics() -> dict[str, Any]:
         sp.close()
 
 
+def collect_tenant_metrics(service_id: str) -> dict[str, Any]:
+    """Ops-снимок одного service_id."""
+    sid = str(service_id or "").strip()
+    if not sid:
+        raise ValueError("service_id required")
+    sp = platform_session()
+    try:
+        return default_db_layer.collect_tenant_queue_metrics(sp, sid)
+    finally:
+        sp.close()
+
+
 def _stale_pending_seconds() -> int:
     raw = (os.environ.get("WORKER_QUEUE_STALE_SECONDS") or "20").strip()
     try:
@@ -28,7 +40,7 @@ def _stale_pending_seconds() -> int:
 
 def enrich_worker_status(service_id: str, process: dict[str, Any]) -> dict[str, Any]:
     """
-    Добавляет queue snapshot и health для ЛК-монитора.
+    Добавляет queue snapshot, полный metrics и health для ЛК-монитора.
     failed: процесс не running, либо due PENDING старше порога (воркер не claim'ит).
     """
     out = dict(process)
@@ -39,10 +51,20 @@ def enrich_worker_status(service_id: str, process: dict[str, Any]) -> dict[str, 
         "processing": 0,
         "oldest_due_pending_age_seconds": None,
     }
+    metrics: dict[str, Any] | None = None
     try:
         sp = platform_session()
         try:
-            queue = default_db_layer.collect_tenant_instance_queue_metrics(sp, sid)
+            metrics = default_db_layer.collect_tenant_queue_metrics(sp, sid)
+            inst = metrics.get("instances") or {}
+            queue = {
+                "pending": int(inst.get("pending") or 0),
+                "processing": int(inst.get("processing") or 0),
+                "oldest_due_pending_age_seconds": inst.get(
+                    "oldest_due_pending_age_seconds"
+                ),
+                "failed_1h": int(inst.get("failed_1h") or 0),
+            }
         finally:
             sp.close()
     except Exception as exc:
@@ -55,6 +77,7 @@ def enrich_worker_status(service_id: str, process: dict[str, Any]) -> dict[str, 
         return out
 
     out["queue"] = queue
+    out["metrics"] = metrics
     pending = int(queue.get("pending") or 0)
     age = queue.get("oldest_due_pending_age_seconds")
     stale_after = _stale_pending_seconds()

@@ -53,6 +53,12 @@ def fanout_webhooks(
         "entity_id": entity_id,
         "payload": payload or {},
     }
+    from fsm_platform.host.runtime.correlation import current_envelope, merge_into_dict
+
+    if current_envelope() is not None:
+        body = merge_into_dict(body)
+    elif isinstance(payload, dict) and isinstance(payload.get("correlation"), dict):
+        body["correlation"] = payload["correlation"]
     for sub in subs:
         if not _event_types_match(sub.get("event_types"), event_type):
             continue

@@ -120,6 +120,9 @@ class InvokeBody(BaseModel):
     operation: str
     params: dict[str, Any] = Field(default_factory=dict)
     actor: Optional[Actor] = None
+    commandId: Optional[str] = None
+    correlationId: Optional[str] = None
+    causationId: Optional[str] = None
 
 
 class EnqueueBody(BaseModel):
@@ -131,6 +134,9 @@ class EnqueueBody(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     actor: Optional[Actor] = None
     mode: str = "async"
+    commandId: Optional[str] = None
+    correlationId: Optional[str] = None
+    causationId: Optional[str] = None
 
 
 def _http_actor(
@@ -216,6 +222,20 @@ def tenant_ready(service_id: str) -> dict[str, Any]:
     return JSONResponse(status_code=503, content=body)
 
 
+@domain_router.get("/metrics")
+def tenant_metrics(service_id: str) -> dict[str, Any]:
+    """
+    Ops-метрики одного service_id: instances / outbox / timers / reconcile.
+    Только DOMAIN_ADMIN_TOKEN.
+    """
+    from fsm_platform.host.runtime.metrics import collect_tenant_metrics
+
+    try:
+        return {"status": "ok", **collect_tenant_metrics(service_id)}
+    except Exception as exc:
+        raise HTTPException(503, detail=f"METRICS_UNAVAILABLE: {exc}") from exc
+
+
 @domain_router.get("/catalog")
 def catalog(service_id: str) -> dict[str, Any]:
     """Каталог операций, процессов и inbound hook channels домена."""
@@ -239,14 +259,34 @@ def invoke(
     body: InvokeBody,
     request: Request,
     authorization: Optional[str] = Header(default=None),
+    x_command_id: Optional[str] = Header(default=None, alias="X-Command-Id"),
+    x_correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-Id"),
+    x_causation_id: Optional[str] = Header(default=None, alias="X-Causation-Id"),
 ) -> dict[str, Any]:
     """
     Синхронный вызов Command/Query домена.
     Ошибки домена отдаёт как 409 с error_code.
     """
+    from fsm_platform.host.runtime.correlation import (
+        bind_envelope,
+        merge_into_dict,
+        reset_envelope,
+        resolve_envelope,
+    )
+
     actor = _http_actor(authorization, body.actor, request)
+    envelope = resolve_envelope(
+        headers={
+            "x-command-id": x_command_id,
+            "x-correlation-id": x_correlation_id,
+            "x-causation-id": x_causation_id,
+        },
+        body=body.model_dump(),
+    )
+    token = bind_envelope(envelope)
     meta = default_operation_registry.get(service_id, body.operation)
     if meta is None:
+        reset_envelope(token)
         raise HTTPException(
             404,
             detail={
@@ -256,6 +296,7 @@ def invoke(
             },
         )
     if not is_domain_ready(service_id):
+        reset_envelope(token)
         raise HTTPException(
             503,
             detail={
@@ -273,6 +314,17 @@ def invoke(
             body.params,
             actor,
         )
+        return merge_into_dict(
+            {
+                "operation": body.operation,
+                "data": result.get("data", result),
+                "entity_type": result.get("entity_type"),
+                "entity_id": result.get("entity_id"),
+                "instance_id": result.get("instance_id"),
+                "instance_ids": result.get("instance_ids"),
+                "saga_id": result.get("saga_id"),
+            }
+        )
     except DomainError as exc:
         raise HTTPException(
             409,
@@ -284,16 +336,8 @@ def invoke(
         raise HTTPException(400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(500, detail=str(exc)) from exc
-
-    return {
-        "operation": body.operation,
-        "data": result.get("data", result),
-        "entity_type": result.get("entity_type"),
-        "entity_id": result.get("entity_id"),
-        "instance_id": result.get("instance_id"),
-        "instance_ids": result.get("instance_ids"),
-        "saga_id": result.get("saga_id"),
-    }
+    finally:
+        reset_envelope(token)
 
 
 @domain_router.post("/fsm/enqueue", status_code=202)
@@ -303,17 +347,38 @@ def enqueue(
     request: Request,
     authorization: Optional[str] = Header(default=None),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_command_id: Optional[str] = Header(default=None, alias="X-Command-Id"),
+    x_correlation_id: Optional[str] = Header(default=None, alias="X-Correlation-Id"),
+    x_causation_id: Optional[str] = Header(default=None, alias="X-Causation-Id"),
 ) -> dict[str, Any]:
     """
     Ставит FSM-процесс в очередь для существующей сущности.
     Worker потом заберёт PENDING-инстанс и прогонит переход.
     """
+    from fsm_platform.host.runtime.correlation import (
+        bind_envelope,
+        merge_into_dict,
+        reset_envelope,
+        resolve_envelope,
+    )
+
     actor = _http_actor(authorization, body.actor, request)
+    envelope = resolve_envelope(
+        headers={
+            "x-command-id": x_command_id,
+            "x-correlation-id": x_correlation_id,
+            "x-causation-id": x_causation_id,
+        },
+        body=body.model_dump(),
+        idempotency_key=idempotency_key,
+    )
+    token = bind_envelope(envelope)
     if not default_process_registry.has(service_id, body.process_name):
+        reset_envelope(token)
         raise HTTPException(400, detail=f"UNKNOWN_PROCESS: {body.process_name}")
     try:
         uid = int(actor["actor_id"]) if actor.get("actor_id") else None
-        return request_runtime.enqueue_instance(
+        out = request_runtime.enqueue_instance(
             service_id,
             process_name=body.process_name,
             entity_type=body.entity_type,
@@ -322,8 +387,11 @@ def enqueue(
             actor_id=uid,
             idempotency_key=idempotency_key,
         )
+        return merge_into_dict(out)
     except LookupError as exc:
         raise HTTPException(400, detail=str(exc)) from exc
+    finally:
+        reset_envelope(token)
 
 
 @domain_router.get("/fsm/instances/{instance_id}")

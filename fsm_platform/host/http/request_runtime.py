@@ -18,6 +18,12 @@ from fsm_platform.host.runtime.graph_version import (
 logger = logging.getLogger(__name__)
 
 
+def _payload_with_correlation(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
+    from fsm_platform.host.runtime.correlation import attach_to_payload
+
+    return attach_to_payload(payload)
+
+
 def _actor_id_from_actor(actor: Optional[dict[str, Any]]) -> Optional[int]:
     """Достаёт opaque actor_id из тела Public API. Не связан с именами колонок домена."""
     if not actor:
@@ -291,7 +297,7 @@ def _bootstrap_and_maybe_enqueue(
                     process_name=str(process_name),
                     entity_type=e_type,
                     entity_id=e_id,
-                    payload=item.get("payload") or {},
+                    payload=_payload_with_correlation(item.get("payload") or {}),
                     actor_id=_actor_id_from_actor(actor),
                     graph_version=graph_version,
                 )
@@ -312,7 +318,7 @@ def _bootstrap_and_maybe_enqueue(
         process_name=str(process_name),
         entity_type=entity_type,
         entity_id=entity_id,
-        payload=enqueue.get("payload") or {},
+        payload=_payload_with_correlation(enqueue.get("payload") or {}),
         actor_id=_actor_id_from_actor(actor),
         graph_version=graph_version,
     )
@@ -448,7 +454,7 @@ def enqueue_instance(
             process_name=process_name,
             entity_type=entity_type,
             entity_id=entity_id,
-            payload=payload or {},
+            payload=_payload_with_correlation(payload),
             actor_id=actor_id,
             graph_version=gv,
         )
@@ -458,6 +464,11 @@ def enqueue_instance(
             "service_id": service_id,
             "status_url": f"/v1/{service_id}/fsm/instances/{instance_id}",
         }
+        from fsm_platform.host.runtime.correlation import current_envelope
+
+        env = current_envelope()
+        if env is not None:
+            response["correlation"] = env.to_public()
         if key:
             inserted = default_db_layer.put_idempotency(
                 sp,

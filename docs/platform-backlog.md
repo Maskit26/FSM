@@ -122,18 +122,14 @@ Reclaim: убитый worker оставляет PROCESSING → worker loop во�
 Env: `READY_MAX_PENDING_AGE_SECONDS` (default 300, `0` = off),
 `READY_MAX_OUTBOX_DEAD` / `READY_MAX_RECONCILE_DEAD` (если заданы).
 
-### 2.3. Метрики per `service_id` — `planned`
+### 2.3. Метрики per `service_id` — `done`
 
-- Сейчас есть глобальный `GET /v1/metrics` и кусок queue в worker/status.
-- Нужен tenant-scoped снимок + отображение в ЛК.
+- `GET /v1/{service_id}/metrics` — tenant snapshot (admin token).
+- Тот же снимок в `GET …/worker/status` → `metrics` (ЛК без лишнего round-trip).
+- ЛК монитор: pending / processing / failed 1h / pending age / outbox / timers.
 
-**Первая итерация (блокер):**
-
-- instances: pending count, oldest due pending age, processing count;
-- failed (например за 1h);
-- outbox: pending / retry / dead;
-- timers: due / overdue;
-- всё **per `service_id`**.
+Первая итерация: instances, outbox (pending/retry/dead), timers (due/overdue),
+reconcile в JSON metrics.
 
 **Нарастить позже (не блокер первой итерации):**
 
@@ -144,26 +140,26 @@ Env: `READY_MAX_PENDING_AGE_SECONDS` (default 300, `0` = off),
 - realtime/WS: backlog, connections/drops;
 - DB pool saturation.
 
-### 2.4. Correlation envelope (полный пакет)
+### 2.4. Correlation envelope (полный пакет) — `done`
 
-Сразу полный конверт на входе Public API (`invoke` / `enqueue` и далее):
+На входе Public API (`invoke` / `enqueue`):
 
-| Поле | Смысл |
-|------|--------|
-| `commandId` | id конкретной команды/запроса клиента |
-| `correlationId` | id всей цепочки (сквозной след) |
-| `causationId` | id причины (предыдущее событие/команда), если есть |
+| Поле | Header | Body | Смысл |
+|------|--------|------|--------|
+| `commandId` | `X-Command-Id` | `commandId` | id этой команды |
+| `correlationId` | `X-Correlation-Id` | `correlationId` | id цепочки |
+| `causationId` | `X-Causation-Id` | `causationId` | id причины (опц.) |
 
-Плюс по пути уже известные: actor, `instance_id`, при наличии — outbox/event ids.
+Если не передали — генерируются. `Idempotency-Key` на enqueue, если нет
+`commandId`, становится `commandId` (retry безопасен и связан).
 
-- Принимать от клиента и/или генерировать на входе, если не передали.
-- Протаскивать: invoke/enqueue → instance/payload → `platform_events` →
-  outbox/webhooks → логи (без сырых секретов).
-- Связать с Idempotency-Key на enqueue (уже есть): retry безопасен.
+Протаскивание: payload инстанса (`_correlation`) → worker ContextVar →
+`platform_events` (`correlation_id` / `client_request_id`) → outbox/webhooks
+(`correlation` в JSON) → логи `corr=` / `cmd=`.
 
----
+Ответ invoke/enqueue содержит блок `correlation`.
 
-## 3. Интеграции и конфликты — `planned`
+### 3. Интеграции и конфликты — `planned`
 
 ### 3.1. Adapter checklist (лёгкие требования) — `planned`
 
@@ -221,8 +217,8 @@ outbox `http_external` (не новый framework).
 | O1 | Reliability Matrix + DR runbook | done |
 | O2 | Autotest: kill worker → queue drains | done |
 | O3 | `/ready` vs `/health` | done |
-| O4 | Metrics per `service_id` | planned |
-| O5 | Full correlation envelope | planned |
+| O4 | Metrics per `service_id` | done |
+| O5 | Full correlation envelope | done |
 | A1 | Adapter checklist + light call_api/outbox requirements | planned |
 | C1 | Conflict semantics docs for clients (dual-commit) | planned |
 | C2 | Autotest: parallel take race → one win / one conflict | planned |

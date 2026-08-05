@@ -369,6 +369,23 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
 
     assert instance is not None
     service_id = str(instance["service_id"])
+    from fsm_platform.host.runtime.correlation import (
+        bind_envelope,
+        envelope_from_payload,
+        reset_envelope,
+    )
+
+    inst_payload = instance.get("payload") or instance.get("payload_json") or {}
+    if isinstance(inst_payload, str):
+        import json as _json
+
+        try:
+            inst_payload = _json.loads(inst_payload) if inst_payload.strip() else {}
+        except _json.JSONDecodeError:
+            inst_payload = {}
+    env = envelope_from_payload(inst_payload if isinstance(inst_payload, dict) else {})
+    env_token = bind_envelope(env) if env is not None else None
+
     sp = platform_session()
     sg = None
     try:
@@ -427,6 +444,8 @@ def process_one(*, service_id: Optional[str] = None) -> bool:
         _finish_failure(instance, f"WORKER_CRASH: {exc}")
         return True
     finally:
+        if env_token is not None:
+            reset_envelope(env_token)
         if sg is not None:
             sg.close()
         sp.close()

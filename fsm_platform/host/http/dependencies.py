@@ -35,6 +35,7 @@ _ADMIN_ONLY_SUFFIXES = (
     "/webhooks",
     "/schedules",
     "/end-user-tokens",
+    "/metrics",
 )
 
 logger = logging.getLogger(__name__)

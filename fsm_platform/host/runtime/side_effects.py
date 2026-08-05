@@ -54,13 +54,19 @@ def notify(
     Кладёт уведомление в platform_outbox (PENDING).
     Реальная отправка HTTP — только после commit, outbox-worker’ом.
     """
+    from fsm_platform.host.runtime.correlation import current_envelope, merge_into_dict
+
+    body = dict(payload or {})
+    env = current_envelope()
+    if env is not None and "correlation" not in body:
+        body = merge_into_dict(body)
     return default_db_layer.insert_outbox(
         session_platform,
         service_id=service_id,
         channel=channel,
         destination=destination,
         event_type=event_type,
-        payload=payload,
+        payload=body,
         idempotency_key=idempotency_key,
     )
 
@@ -109,6 +115,22 @@ def emit_event(
     Пишет доменное/платформенное событие в platform_events.
     Единая точка записи событий для SSE/аудита.
     """
+    from fsm_platform.host.runtime.correlation import (
+        current_envelope,
+        event_ids_from_envelope,
+        merge_into_dict,
+    )
+
+    env = current_envelope()
+    if correlation_id is None or client_request_id is None:
+        auto_corr, auto_cmd = event_ids_from_envelope(env)
+        if correlation_id is None:
+            correlation_id = auto_corr
+        if client_request_id is None:
+            client_request_id = auto_cmd
+    body = dict(payload or {})
+    if env is not None and "correlation" not in body:
+        body = merge_into_dict(body)
     return default_db_layer.insert_event(
         session_platform,
         service_id=service_id,
@@ -116,7 +138,7 @@ def emit_event(
         instance_id=instance_id,
         entity_type=entity_type,
         entity_id=entity_id,
-        payload=payload,
+        payload=body,
         correlation_id=correlation_id,
         client_request_id=client_request_id,
     )
