@@ -197,9 +197,20 @@ class CorrelationLogFilter(logging.Filter):
 
 
 def install_correlation_logging() -> None:
-    """Вешает filter на root logger (идемпотентно)."""
+    """Вешает filter на root handlers (идемпотентно).
+
+    Filter только на Logger недостаточно: при propagate у child logger
+    вызываются handlers родителя без filter родителя.
+    """
     root = logging.getLogger()
+    existing: CorrelationLogFilter | None = None
     for f in root.filters:
         if isinstance(f, CorrelationLogFilter):
-            return
-    root.addFilter(CorrelationLogFilter())
+            existing = f
+            break
+    filt = existing or CorrelationLogFilter()
+    if existing is None:
+        root.addFilter(filt)
+    for h in root.handlers:
+        if not any(isinstance(f, CorrelationLogFilter) for f in h.filters):
+            h.addFilter(filt)

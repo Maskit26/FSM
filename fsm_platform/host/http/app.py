@@ -98,6 +98,30 @@ def debug_pool() -> dict[str, Any]:
 platform_router = APIRouter(
     tags=["Platform Admin"], dependencies=[Depends(require_platform_admin)]
 )
+
+
+@app.get("/v1/health")
+def health() -> dict[str, Any]:
+    """
+    Liveness: процесс Platform API жив (без admin token).
+    Не проверяет DB / worker / backlog — для этого GET /v1/ready.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/v1/ready")
+def ready() -> dict[str, Any]:
+    """
+    Readiness: пускать ли трафик на API (без admin token).
+    200 = ready, 503 = not ready (platform DB / критический backlog).
+    """
+    from fsm_platform.host.runtime.readiness import check_platform_ready
+    from fastapi.responses import JSONResponse
+
+    body = check_platform_ready()
+    if body.get("ok"):
+        return body
+    return JSONResponse(status_code=503, content=body)
 domain_router = APIRouter(
     prefix="/v1/{service_id}",
     tags=["Domain API"],
@@ -167,30 +191,6 @@ def _startup() -> None:
     from fsm_platform.host.tenant.boot import boot
 
     boot()
-
-
-@platform_router.get("/v1/health")
-def health() -> dict[str, Any]:
-    """
-    Liveness: процесс Platform API жив.
-    Не проверяет DB / worker / backlog — для этого GET /v1/ready.
-    """
-    return {"status": "ok"}
-
-
-@platform_router.get("/v1/ready")
-def ready() -> dict[str, Any]:
-    """
-    Readiness: пускать ли трафик на API.
-    200 = ready, 503 = not ready (platform DB / критический backlog).
-    """
-    from fsm_platform.host.runtime.readiness import check_platform_ready
-    from fastapi.responses import JSONResponse
-
-    body = check_platform_ready()
-    if body.get("ok"):
-        return body
-    return JSONResponse(status_code=503, content=body)
 
 
 @platform_router.get("/v1/metrics")
@@ -782,6 +782,64 @@ def resume_schedule(service_id: str, schedule_id: int) -> dict[str, Any]:
             raise HTTPException(404, detail="SCHEDULE_NOT_FOUND")
         sp.commit()
         return {"id": schedule_id, "status": "ACTIVE"}
+    except HTTPException:
+        sp.rollback()
+        raise
+    except Exception:
+        sp.rollback()
+        raise
+    finally:
+        sp.close()
+
+
+@domain_router.get("/timers")
+def list_timers(
+    service_id: str,
+    status: Optional[str] = "SCHEDULED",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """
+    Список fsm_timers тенанта (ops UI).
+    status=SCHEDULED (default) | FIRED | CANCELLED | ALL.
+    """
+    sp = platform_session()
+    try:
+        rows = default_db_layer.list_timers(
+            sp,
+            service_id=service_id,
+            status=status,
+            limit=limit,
+        )
+        for r in rows:
+            for k, v in list(r.items()):
+                if hasattr(v, "isoformat"):
+                    r[k] = v.isoformat()
+            raw = r.get("payload_json")
+            if isinstance(raw, str):
+                try:
+                    r["payload"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    r["payload"] = None
+            elif raw is not None:
+                r["payload"] = raw
+            r.pop("payload_json", None)
+        return {"service_id": service_id, "timers": rows}
+    finally:
+        sp.close()
+
+
+@domain_router.post("/timers/{timer_id}/cancel")
+def cancel_timer(service_id: str, timer_id: int) -> dict[str, Any]:
+    """Отменяет SCHEDULED-таймер в рамках service_id."""
+    sp = platform_session()
+    try:
+        ok = default_db_layer.cancel_timer_for_service(
+            sp, service_id=service_id, timer_id=timer_id
+        )
+        if not ok:
+            raise HTTPException(404, detail="TIMER_NOT_FOUND_OR_NOT_SCHEDULED")
+        sp.commit()
+        return {"id": timer_id, "status": "CANCELLED"}
     except HTTPException:
         sp.rollback()
         raise

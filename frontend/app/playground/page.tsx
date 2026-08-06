@@ -8,6 +8,7 @@ import {
   enqueueProcess,
   entityActions,
   entityHistory,
+  entitySnapshot,
   fetchCatalog,
   instanceStatus,
   invokeOperation,
@@ -88,7 +89,10 @@ export default function PlaygroundPage() {
   const [entityType, setEntityType] = useState("order");
   const [entityId, setEntityId] = useState("");
   const [instanceId, setInstanceId] = useState("");
+  const [entityActorId, setEntityActorId] = useState("");
+  const [entityActorType, setEntityActorType] = useState("user");
   const [entityPayload, setEntityPayload] = useState("{\n  \n}");
+  const [entityParams, setEntityParams] = useState("{\n  \n}");
 
   const [eventsAfterId, setEventsAfterId] = useState("0");
   const [eventsLimit, setEventsLimit] = useState("50");
@@ -254,6 +258,57 @@ export default function PlaygroundPage() {
     }
   }
 
+  async function onEntitySnapshot() {
+    const eid = Number(entityId);
+    if (!entityType.trim() || !Number.isFinite(eid)) {
+      setError("Укажите entity_type и entity_id.");
+      return;
+    }
+    if (!entityActorId.trim()) {
+      setError("Для Snapshot укажите actor_id (кто смотрит сущность).");
+      return;
+    }
+    let params: Record<string, unknown> = {};
+    try {
+      params = JSON.parse(entityParams || "{}") as Record<string, unknown>;
+    } catch {
+      setError("params: невалидный JSON");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setResponseJson("");
+    try {
+      const res = await entitySnapshot(
+        serviceId,
+        adminToken,
+        entityType.trim(),
+        eid,
+        {
+          actor: {
+            actor_type: entityActorType.trim() || "user",
+            actor_id: entityActorId.trim(),
+            channel: "api",
+          },
+          params,
+          include_actions: true,
+        },
+      );
+      setResponseJson(pretty(res));
+    } catch (err) {
+      if (err instanceof ApiRequestError) {
+        setResponseJson(
+          pretty({ status: err.status, error: err.message, body: err.body }),
+        );
+        setError(err.message);
+      } else {
+        handleErr(err);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onEntityActions() {
     const eid = Number(entityId);
     if (!entityType.trim() || !Number.isFinite(eid)) {
@@ -278,7 +333,11 @@ export default function PlaygroundPage() {
         eid,
         {
           payload,
-          actor: { actor_type: "user", channel: "api" },
+          actor: {
+            actor_type: entityActorType.trim() || "user",
+            actor_id: entityActorId.trim() || undefined,
+            channel: "api",
+          },
         },
       );
       setResponseJson(pretty(res));
@@ -456,7 +515,7 @@ export default function PlaygroundPage() {
                 setResponseJson("");
               }}
             >
-              Entities
+              Entity inspect
             </button>
             <button
               type="button"
@@ -606,8 +665,15 @@ export default function PlaygroundPage() {
             {mode === "entities" ? (
               <>
                 <div className="playground-meta">
-                  <span>Entity actions / history / instance</span>
+                  <span>
+                    Entity inspect — snapshot / actions / history / instance
+                  </span>
                 </div>
+                <p className="muted" style={{ marginTop: 0, marginBottom: "0.85rem" }}>
+                  Snapshot: access policy + карточка сущности (+ available
+                  actions). Нужен <code>actor_id</code> — от чьего имени
+                  смотрим.
+                </p>
                 <div className="tile-form" style={{ maxWidth: "100%" }}>
                   <div className="field-row">
                     <div className="field">
@@ -616,6 +682,7 @@ export default function PlaygroundPage() {
                         id="ent-type"
                         value={entityType}
                         onChange={(e) => setEntityType(e.target.value)}
+                        placeholder="order"
                       />
                     </div>
                     <div className="field">
@@ -636,6 +703,35 @@ export default function PlaygroundPage() {
                       />
                     </div>
                   </div>
+                  <div className="field-row">
+                    <div className="field">
+                      <label htmlFor="ent-actor-id">actor_id</label>
+                      <input
+                        id="ent-actor-id"
+                        value={entityActorId}
+                        onChange={(e) => setEntityActorId(e.target.value)}
+                        placeholder="обязателен для Snapshot"
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="ent-actor-type">actor_type</label>
+                      <input
+                        id="ent-actor-type"
+                        value={entityActorType}
+                        onChange={(e) => setEntityActorType(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  <div className="field">
+                    <label htmlFor="ent-params">params (для snapshot)</label>
+                    <textarea
+                      id="ent-params"
+                      className="code-area"
+                      value={entityParams}
+                      onChange={(e) => setEntityParams(e.target.value)}
+                      spellCheck={false}
+                    />
+                  </div>
                   <div className="field">
                     <label htmlFor="ent-payload">payload (для actions)</label>
                     <textarea
@@ -647,6 +743,15 @@ export default function PlaygroundPage() {
                     />
                   </div>
                   <div className="toolbar">
+                    <button
+                      type="button"
+                      className="btn btn-accent"
+                      style={{ minWidth: "8rem" }}
+                      disabled={busy}
+                      onClick={onEntitySnapshot}
+                    >
+                      Snapshot
+                    </button>
                     <button
                       type="button"
                       className="btn btn-primary"

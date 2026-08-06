@@ -599,6 +599,100 @@ export function resumeSchedule(
   );
 }
 
+export type TimerRow = {
+  id: number;
+  service_id?: string;
+  entity_type: string;
+  entity_id: number;
+  process_name: string;
+  fire_at?: string;
+  status?: string;
+  idempotency_key?: string | null;
+  owner?: string;
+  created_at?: string;
+  cancelled_at?: string | null;
+  payload?: Record<string, unknown> | null;
+};
+
+export function listTimers(
+  serviceId: string,
+  domainAdminToken: string,
+  opts: { status?: string; limit?: number } = {},
+) {
+  const q = new URLSearchParams();
+  if (opts.status) q.set("status", opts.status);
+  if (opts.limit != null) q.set("limit", String(opts.limit));
+  const qs = q.toString();
+  return apiFetch<{ service_id: string; timers: TimerRow[] }>(
+    `/v1/${encodeURIComponent(serviceId)}/timers${qs ? `?${qs}` : ""}`,
+    { adminToken: domainAdminToken },
+  );
+}
+
+export function cancelTimer(
+  serviceId: string,
+  domainAdminToken: string,
+  timerId: number,
+) {
+  return apiFetch<{ id: number; status: string }>(
+    `/v1/${encodeURIComponent(serviceId)}/timers/${timerId}/cancel`,
+    { method: "POST", adminToken: domainAdminToken },
+  );
+}
+
+export type EndUserTokenResponse = {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  expires_at?: number;
+  service_id: string;
+  actor_type: string;
+  actor_id: string;
+  roles: string[];
+};
+
+export function issueEndUserToken(
+  serviceId: string,
+  domainAdminToken: string,
+  body: {
+    actor_id: string;
+    actor_type?: string;
+    roles?: string[];
+    ttl_seconds?: number;
+  },
+) {
+  return apiFetch<EndUserTokenResponse>(
+    `/v1/${encodeURIComponent(serviceId)}/end-user-tokens`,
+    {
+      method: "POST",
+      adminToken: domainAdminToken,
+      body: {
+        actor_id: body.actor_id,
+        actor_type: body.actor_type || "user",
+        roles: body.roles || [],
+        ttl_seconds: body.ttl_seconds ?? 86400,
+      },
+    },
+  );
+}
+
+export function entitySnapshot(
+  serviceId: string,
+  domainAdminToken: string,
+  entityType: string,
+  entityId: number,
+  body: {
+    actor?: { actor_type?: string; actor_id?: string; channel?: string; roles?: string[] };
+    params?: Record<string, unknown>;
+    include_actions?: boolean;
+  } = {},
+) {
+  return apiFetch<Record<string, unknown>>(
+    `/v1/${encodeURIComponent(serviceId)}/entities/${encodeURIComponent(entityType)}/${entityId}/snapshot`,
+    { method: "POST", adminToken: domainAdminToken, body },
+  );
+}
+
 export function instanceStatus(
   serviceId: string,
   domainAdminToken: string,
@@ -700,5 +794,16 @@ export function inboundHookSecretKey(channel: string): string {
 
 export function telegramWebhookUrl(serviceId: string): string {
   return `${apiBaseUrl()}/input/telegram/${encodeURIComponent(serviceId)}/webhook`;
+}
+
+/** Live WS для Snapshot / биржи / events (уже есть после Connect, регистрировать не нужно). */
+export function eventsWsUrl(serviceId: string): string {
+  const http = apiBaseUrl();
+  const ws = http.startsWith("https://")
+    ? `wss://${http.slice("https://".length)}`
+    : http.startsWith("http://")
+      ? `ws://${http.slice("http://".length)}`
+      : http;
+  return `${ws}/v1/${encodeURIComponent(serviceId)}/ws/events`;
 }
 

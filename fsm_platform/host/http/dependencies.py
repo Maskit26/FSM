@@ -34,6 +34,7 @@ _ADMIN_ONLY_SUFFIXES = (
     "/graph/publish",
     "/webhooks",
     "/schedules",
+    "/timers",
     "/end-user-tokens",
     "/metrics",
 )

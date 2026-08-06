@@ -7,11 +7,13 @@ import {
   AdminTokenMeta,
   ApiRequestError,
   ScheduleRow,
+  TimerRow,
   WebhookRow,
   createAdminToken,
   createSchedule,
   createWebhook,
   connectDomain,
+  cancelTimer,
   deactivateWebhook,
   deleteSecret,
   fetchCatalog,
@@ -23,6 +25,7 @@ import {
   listEvents,
   listSchedules,
   listSecrets,
+  listTimers,
   listWebhooks,
   logout,
   pauseSchedule,
@@ -33,6 +36,7 @@ import {
   rotateAdminToken,
   telegramLink,
   telegramWebhookUrl,
+  eventsWsUrl,
   TenantMetrics,
   upsertSecret,
   workerRestart,
@@ -52,6 +56,14 @@ import {
   setEnvBannerDismissed,
   setSelectedTokenId,
 } from "@/lib/session";
+import { markdownToHtml } from "@/lib/markdown";
+
+type DocListItem = {
+  slug: string;
+  file: string;
+  title: string;
+  summary: string;
+};
 
 type TileId =
   | "token"
@@ -61,6 +73,8 @@ type TileId =
   | "output"
   | "secret"
   | "schedule"
+  | "timer"
+  | "docs"
   | null;
 
 const TILE_LABELS: Record<Exclude<TileId, null>, string> = {
@@ -71,6 +85,8 @@ const TILE_LABELS: Record<Exclude<TileId, null>, string> = {
   input: "Input",
   output: "Output",
   schedule: "Schedules",
+  timer: "Timers",
+  docs: "Docs",
 };
 
 const BTN_TIPS = {
@@ -118,6 +134,10 @@ const BTN_TIPS = {
     "Ставит расписание на паузу — worker перестаёт enqueue по этому id. Само расписание и interval сохраняются. Возобновить можно кнопкой Resume. Удобно на время инцидента или обслуживания процесса.",
   resumeSchedule:
     "Снимает паузу с расписания и снова включает периодический enqueue. next_run_at пересчитается по политике платформы. Убедитесь, что process и worker в порядке. После resume снова смотрите List для статуса.",
+  listTimers:
+    "Обновляет список отложенных запусков. По умолчанию только ожидающие (SCHEDULED). Worker сам срабатывает по fire_at — здесь можно только посмотреть и отменить.",
+  cancelTimer:
+    "Отменяет ожидающий таймер: процесс по нему больше не запустится. Уже сработавшие (FIRED) и отменённые трогать нельзя.",
 } as const;
 
 function Tip({
@@ -179,6 +199,25 @@ function Tip({
   );
 }
 
+function timerFireLabel(fireAt?: string): { text: string; overdue: boolean } {
+  if (!fireAt) return { text: "—", overdue: false };
+  const at = new Date(fireAt);
+  if (Number.isNaN(at.getTime())) return { text: fireAt, overdue: false };
+  const ms = at.getTime() - Date.now();
+  const overdue = ms < 0;
+  const abs = Math.abs(ms);
+  const sec = Math.round(abs / 1000);
+  let rel: string;
+  if (sec < 60) rel = `${sec}с`;
+  else if (sec < 3600) rel = `${Math.round(sec / 60)}м`;
+  else if (sec < 86400) rel = `${Math.round(sec / 3600)}ч`;
+  else rel = `${Math.round(sec / 86400)}д`;
+  return {
+    text: `${at.toLocaleString()} (${overdue ? `просрочен на ${rel}` : `через ${rel}`})`,
+    overdue,
+  };
+}
+
 function prefixOf(token: AdminTokenMeta): string {
   return token.token_prefix || token.prefix || `#${token.id}`;
 }
@@ -211,12 +250,23 @@ export default function CabinetPage() {
   const [schedules, setSchedules] = useState<ScheduleRow[]>([]);
   const [schedProcess, setSchedProcess] = useState("");
   const [schedInterval, setSchedInterval] = useState("60");
+  const [timers, setTimers] = useState<TimerRow[]>([]);
+  const [timerStatusFilter, setTimerStatusFilter] = useState("SCHEDULED");
+  const [timersLoaded, setTimersLoaded] = useState(false);
+  const [docList, setDocList] = useState<DocListItem[]>([]);
+  const [docSlug, setDocSlug] = useState<string | null>(null);
+  const [docTitle, setDocTitle] = useState("");
+  const [docHtml, setDocHtml] = useState("");
+  const [docsError, setDocsError] = useState<string | null>(null);
 
   const [domainResult, setDomainResult] = useState("");
   const [hookChannels, setHookChannels] = useState<string[]>([]);
   const [telegramUserId, setTelegramUserId] = useState("");
   const [telegramLinkUrl, setTelegramLinkUrl] = useState("");
   const [inputPanel, setInputPanel] = useState<"menu" | "telegram" | "generic">(
+    "menu",
+  );
+  const [outputPanel, setOutputPanel] = useState<"menu" | "ws" | "webhooks">(
     "menu",
   );
 
@@ -464,13 +514,120 @@ export default function CabinetPage() {
 
   function toggleTile(id: TileId) {
     clearMsg();
-    setOpenTile((cur) => (cur === id ? null : id));
+    setOpenTile((cur) => {
+      const next = cur === id ? null : id;
+      if (next === "timer") {
+        queueMicrotask(() => {
+          void refreshTimers(timerStatusFilter);
+        });
+      }
+      if (next === "docs") {
+        setDocSlug(null);
+        setDocHtml("");
+        setDocTitle("");
+        setDocsError(null);
+        queueMicrotask(() => {
+          void loadDocList();
+        });
+      }
+      if (next === "output") {
+        setOutputPanel("menu");
+      }
+      if (next == null) {
+        setOutputPanel("menu");
+      }
+      return next;
+    });
   }
 
   function closeTile() {
     clearMsg();
     setOpenTile(null);
     setInputPanel("menu");
+    setOutputPanel("menu");
+    setDocSlug(null);
+    setDocHtml("");
+    setDocsError(null);
+  }
+
+  async function loadDocList() {
+    setBusy(true);
+    setDocsError(null);
+    try {
+      const res = await fetch("/api/docs");
+      const body = (await res.json()) as { docs?: DocListItem[]; error?: string };
+      if (!res.ok) {
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      setDocList(body.docs || []);
+    } catch (err) {
+      setDocsError(err instanceof Error ? err.message : "Не удалось загрузить docs");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openDoc(slug: string) {
+    setBusy(true);
+    setDocsError(null);
+    try {
+      const res = await fetch(`/api/docs/${encodeURIComponent(slug)}`);
+      const body = (await res.json()) as {
+        slug?: string;
+        title?: string;
+        markdown?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
+      setDocSlug(slug);
+      setDocTitle(body.title || slug);
+      setDocHtml(markdownToHtml(body.markdown || ""));
+    } catch (err) {
+      setDocsError(err instanceof Error ? err.message : "Не удалось открыть документ");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshTimers(status: string = timerStatusFilter) {
+    setBusy(true);
+    clearMsg();
+    try {
+      const res = await listTimers(serviceId, adminToken, {
+        status: status || "SCHEDULED",
+      });
+      setTimers(res.timers || []);
+      setTimersLoaded(true);
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onListTimers() {
+    await refreshTimers();
+  }
+
+  async function onTimerFilter(status: string) {
+    setTimerStatusFilter(status);
+    await refreshTimers(status);
+  }
+
+  async function onCancelTimer(id: number) {
+    setBusy(true);
+    clearMsg();
+    try {
+      await cancelTimer(serviceId, adminToken, id);
+      setInfo(`Таймер #${id} отменён.`);
+      await refreshTimers();
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+    }
   }
 
   const loadTokens = useCallback(async () => {
@@ -941,9 +1098,8 @@ export default function CabinetPage() {
           >
             <span className="tile-title">Token</span>
             <span className="tile-sub">
-              Выпуск и просмотр DOMAIN_ADMIN_TOKEN для вызовов Domain API.
-              Токен привязан к вашему tenant account и нужен для secrets,
-              connect и остальных admin-операций домена.
+              Выпуск и ротация DOMAIN_ADMIN_TOKEN для Domain API: secrets,
+              connect, worker и остальных admin-операций домена.
             </span>
           </button>
           <button
@@ -960,13 +1116,22 @@ export default function CabinetPage() {
           <button
             type="button"
             className={`tile${openTile === "output" ? " tile-open" : ""}`}
-            onClick={() => toggleTile("output")}
+            onClick={() => {
+              clearMsg();
+              if (openTile === "output") {
+                setOpenTile(null);
+                setOutputPanel("menu");
+                return;
+              }
+              setOpenTile("output");
+              setOutputPanel("menu");
+            }}
           >
             <span className="tile-title">Output</span>
             <span className="tile-sub">
-              Исходящие уведомления и webhooks из platform outbox. Создавайте
-              endpoints, куда платформа доставляет notify после команд и
-              эффектов FSM.
+              Исходящие каналы: готовый live WS для Snapshot/биржи и HTTP
+              webhooks из outbox. WS регистрировать не нужно — URL уже есть
+              после Connect.
             </span>
           </button>
           <button
@@ -979,6 +1144,29 @@ export default function CabinetPage() {
               Периодический enqueue процессов по интервалу. Создавайте,
               ставьте на паузу и возобновляйте расписания — worker сам сдвинет
               next_run_at и поставит instance в очередь.
+            </span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "timer" ? " tile-open" : ""}`}
+            onClick={() => toggleTile("timer")}
+          >
+            <span className="tile-title">Timers</span>
+            <span className="tile-sub">
+              Отложенный одноразовый запуск процесса (не путать с Schedules).
+              Смотрите ожидающие и отменяйте лишние — создавать тут нельзя,
+              их ставит домен/граф.
+            </span>
+          </button>
+          <button
+            type="button"
+            className={`tile${openTile === "docs" ? " tile-open" : ""}`}
+            onClick={() => toggleTile("docs")}
+          >
+            <span className="tile-title">Docs</span>
+            <span className="tile-sub">
+              Документация платформы из папки docs: контракт, онбординг,
+              realtime, ops, адаптеры и бэклог.
             </span>
           </button>
         </div>
@@ -1164,7 +1352,9 @@ export default function CabinetPage() {
               </div>
             ) : null}
             {liveEvents.length === 0 && !eventsError ? (
-              <p className="muted">Пока нет событий — появятся при работе домена.</p>
+              <div className="events-feed events-feed-empty">
+                <p className="muted">Пока нет событий — появятся при работе домена.</p>
+              </div>
             ) : (
               <ul className="events-feed">
                 {liveEvents.map((ev) => (
@@ -1195,22 +1385,41 @@ export default function CabinetPage() {
             onClick={closeTile}
           >
             <div
-              className="modal"
+              className={`modal${openTile === "docs" ? " modal-wide" : ""}`}
               role="dialog"
               aria-modal="true"
               aria-labelledby="tile-modal-title"
               onClick={(e) => e.stopPropagation()}
             >
               <header className="modal-head">
-                <h2 id="tile-modal-title">{TILE_LABELS[openTile]}</h2>
-                <button
-                  type="button"
-                  className="btn btn-ghost modal-close"
-                  onClick={closeTile}
-                  aria-label="Закрыть"
-                >
-                  Закрыть
-                </button>
+                <h2 id="tile-modal-title">
+                  {openTile === "docs" && docSlug
+                    ? docTitle || TILE_LABELS.docs
+                    : TILE_LABELS[openTile]}
+                </h2>
+                <div className="modal-head-actions">
+                  {openTile === "docs" && docSlug ? (
+                    <button
+                      type="button"
+                      className="btn btn-ghost modal-close"
+                      onClick={() => {
+                        setDocSlug(null);
+                        setDocHtml("");
+                        setDocTitle("");
+                      }}
+                    >
+                      ← К списку
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="btn btn-ghost modal-close"
+                    onClick={closeTile}
+                    aria-label="Закрыть"
+                  >
+                    Закрыть
+                  </button>
+                </div>
               </header>
               <div className="modal-body">
                 {openTile === "secret" ? (
@@ -1544,65 +1753,166 @@ export default function CabinetPage() {
 
                 {openTile === "output" ? (
                   <>
-                    <div className="toolbar">
-                      <Tip text={BTN_TIPS.listWebhooks}>
-                        <button type="button" className="btn btn-ghost" disabled={busy} onClick={onListWebhooks}>
-                          List webhooks
-                        </button>
-                      </Tip>
-                    </div>
-                    <form className="tile-form" onSubmit={onCreateWebhook} autoComplete="off">
-                      <div className="field">
-                        <label htmlFor="hook-url">URL</label>
-                        <input
-                          id="hook-url"
-                          name="fsm_webhook_url"
-                          value={hookUrl}
-                          onChange={(e) => setHookUrl(e.target.value)}
-                          autoComplete="off"
-                          required
-                        />
-                      </div>
-                      <div className="field">
-                        <label htmlFor="hook-secret">Secret (HMAC)</label>
-                        <input
-                          id="hook-secret"
-                          name="fsm_webhook_secret"
-                          type="password"
-                          value={hookSecret}
-                          onChange={(e) => setHookSecret(e.target.value)}
-                          autoComplete="new-password"
-                          required
-                        />
-                      </div>
-                      <Tip text={BTN_TIPS.createWebhook}>
-                        <button type="submit" className="btn btn-primary" style={{ width: "auto" }} disabled={busy}>
-                          Create webhook
-                        </button>
-                      </Tip>
-                    </form>
-                    {webhooks.length > 0 ? (
-                      <ul className="plain-list">
-                        {webhooks.map((w) => (
-                          <li key={w.id}>
+                    {outputPanel === "menu" ? (
+                      <>
+                        <p className="muted" style={{ marginTop: 0 }}>
+                          Выберите исходящий канал: live WS или HTTP webhooks.
+                        </p>
+                        <div className="input-channel-grid">
+                          <button
+                            type="button"
+                            className="input-channel-card"
+                            onClick={() => setOutputPanel("ws")}
+                          >
+                            <strong>Live WebSocket</strong>
                             <span>
-                              #{w.id} · {w.active ? "active" : "off"} · {w.url}
+                              Готовый путь после Connect: Snapshot карточки и
+                              подписка на query (биржа/списки). Регистрировать
+                              сокет не нужно.
                             </span>
-                            {w.active ? (
-                              <Tip text={BTN_TIPS.deactivateWebhook}>
-                                <button
-                                  type="button"
-                                  className="btn btn-danger"
-                                  disabled={busy}
-                                  onClick={() => onDeactivateWebhook(w.id)}
-                                >
-                                  Deactivate
-                                </button>
-                              </Tip>
-                            ) : null}
+                          </button>
+                          <button
+                            type="button"
+                            className="input-channel-card"
+                            onClick={() => setOutputPanel("webhooks")}
+                          >
+                            <strong>HTTP webhooks (outbox)</strong>
+                            <span>
+                              Исходящие notify на ваш URL из platform outbox.
+                              Это не live-биржа и не Snapshot.
+                            </span>
+                          </button>
+                        </div>
+                      </>
+                    ) : null}
+
+                    {outputPanel === "ws" ? (
+                      <>
+                        <div className="toolbar" style={{ justifyContent: "flex-start" }}>
+                          <button
+                            type="button"
+                            className="btn btn-ghost"
+                            onClick={() => setOutputPanel("menu")}
+                          >
+                            ← Каналы
+                          </button>
+                        </div>
+                        <p className="muted tile-section-lead">
+                          После Connect домена путь уже работает. Приложение
+                          открывает сокет и шлёт <code>subscribe</code>. Docs →
+                          domain-app-realtime.
+                        </p>
+                        <div className="field">
+                          <label>WS URL</label>
+                          <div className="token-box">{eventsWsUrl(serviceId)}</div>
+                        </div>
+                        <ol className="wizard-steps">
+                          <li>
+                            Auth: <code>X-Admin-Token</code> или{" "}
+                            <code>Authorization: Bearer eut1.…</code>
                           </li>
-                        ))}
-                      </ul>
+                          <li>
+                            Карточка сущности (Snapshot):
+                            <br />
+                            <code>
+                              {`{"op":"subscribe","entity_type":"order","entity_id":42}`}
+                            </code>
+                            <br />В домене нужны{" "}
+                            <code>access_policies</code> + <code>snapshots</code>.
+                          </li>
+                          <li>
+                            Биржа / список (любой query из catalog):
+                            <br />
+                            <code>
+                              {`{"op":"subscribe","operation":"list_courier_exchange","params":{}}`}
+                            </code>
+                            <br />Новая биржа = новый query в{" "}
+                            <code>register_all</code>, не новый WS.
+                          </li>
+                          <li>
+                            Ответы: <code>{"{type:\"snapshot\",…}"}</code>, затем{" "}
+                            <code>{"{type:\"event\",…}"}</code>; при event
+                            платформа обновляет Snapshot.
+                          </li>
+                        </ol>
+                      </>
+                    ) : null}
+
+                    {outputPanel === "webhooks" ? (
+                      <>
+                        <div className="toolbar" style={{ justifyContent: "flex-start" }}>
+                          <button
+                            type="button"
+                            className="btn btn-ghost"
+                            onClick={() => setOutputPanel("menu")}
+                          >
+                            ← Каналы
+                          </button>
+                        </div>
+                        <p className="muted tile-section-lead">
+                          Исходящие notify на ваш URL из platform outbox.
+                        </p>
+                        <div className="toolbar">
+                          <Tip text={BTN_TIPS.listWebhooks}>
+                            <button type="button" className="btn btn-ghost" disabled={busy} onClick={onListWebhooks}>
+                              List webhooks
+                            </button>
+                          </Tip>
+                        </div>
+                        <form className="tile-form" onSubmit={onCreateWebhook} autoComplete="off">
+                          <div className="field">
+                            <label htmlFor="hook-url">URL</label>
+                            <input
+                              id="hook-url"
+                              name="fsm_webhook_url"
+                              value={hookUrl}
+                              onChange={(e) => setHookUrl(e.target.value)}
+                              autoComplete="off"
+                              required
+                            />
+                          </div>
+                          <div className="field">
+                            <label htmlFor="hook-secret">Secret (HMAC)</label>
+                            <input
+                              id="hook-secret"
+                              name="fsm_webhook_secret"
+                              type="password"
+                              value={hookSecret}
+                              onChange={(e) => setHookSecret(e.target.value)}
+                              autoComplete="new-password"
+                              required
+                            />
+                          </div>
+                          <Tip text={BTN_TIPS.createWebhook}>
+                            <button type="submit" className="btn btn-primary" style={{ width: "auto" }} disabled={busy}>
+                              Create webhook
+                            </button>
+                          </Tip>
+                        </form>
+                        {webhooks.length > 0 ? (
+                          <ul className="plain-list">
+                            {webhooks.map((w) => (
+                              <li key={w.id}>
+                                <span>
+                                  #{w.id} · {w.active ? "active" : "off"} · {w.url}
+                                </span>
+                                {w.active ? (
+                                  <Tip text={BTN_TIPS.deactivateWebhook}>
+                                    <button
+                                      type="button"
+                                      className="btn btn-danger"
+                                      disabled={busy}
+                                      onClick={() => onDeactivateWebhook(w.id)}
+                                    >
+                                      Deactivate
+                                    </button>
+                                  </Tip>
+                                ) : null}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </>
                     ) : null}
                   </>
                 ) : null}
@@ -1682,6 +1992,163 @@ export default function CabinetPage() {
                       </ul>
                     ) : null}
                   </>
+                ) : null}
+
+                {openTile === "timer" ? (
+                  <div className="timer-panel">
+                    <p className="tile-help">
+                      <strong>Timer</strong> — разовый «будильник»: в{" "}
+                      <code>fire_at</code> worker запустит{" "}
+                      <code>process_name</code> для сущности. Их создаёт домен
+                      (timeout, отложение), не эта форма.
+                      <br />
+                      <strong>Schedules</strong> рядом — это другое: периодический
+                      повтор по интервалу.
+                      <br />
+                      Здесь только просмотр и <strong>Cancel</strong> для ещё не
+                      сработавших. Чип Timers в мониторе = due / overdue.
+                    </p>
+                    <div className="filter-chips" role="tablist" aria-label="Фильтр статуса">
+                      {(
+                        [
+                          ["SCHEDULED", "Ожидают"],
+                          ["FIRED", "Сработали"],
+                          ["CANCELLED", "Отменены"],
+                          ["ALL", "Все"],
+                        ] as const
+                      ).map(([value, label]) => (
+                        <button
+                          key={value}
+                          type="button"
+                          role="tab"
+                          aria-selected={timerStatusFilter === value}
+                          className={`filter-chip${
+                            timerStatusFilter === value ? " is-active" : ""
+                          }`}
+                          disabled={busy}
+                          onClick={() => void onTimerFilter(value)}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                      <Tip text={BTN_TIPS.listTimers}>
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          style={{ width: "auto" }}
+                          disabled={busy}
+                          onClick={() => void onListTimers()}
+                        >
+                          Обновить
+                        </button>
+                      </Tip>
+                    </div>
+                    {timers.length > 0 ? (
+                      <ul className="timer-cards">
+                        {timers.map((t) => {
+                          const due = timerFireLabel(t.fire_at);
+                          return (
+                            <li key={t.id} className="timer-card">
+                              <div className="timer-card-head">
+                                <span className="timer-card-id">#{t.id}</span>
+                                <span
+                                  className={`timer-status status-${(
+                                    t.status || "unknown"
+                                  ).toLowerCase()}`}
+                                >
+                                  {t.status || "—"}
+                                </span>
+                                {t.owner ? (
+                                  <span className="timer-owner">{t.owner}</span>
+                                ) : null}
+                              </div>
+                              <dl className="timer-card-meta">
+                                <div>
+                                  <dt>Процесс</dt>
+                                  <dd>
+                                    <code>{t.process_name}</code>
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Сущность</dt>
+                                  <dd>
+                                    <code>
+                                      {t.entity_type}/{t.entity_id}
+                                    </code>
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt>Сработает</dt>
+                                  <dd className={due.overdue && t.status === "SCHEDULED" ? "is-overdue" : undefined}>
+                                    {due.text}
+                                  </dd>
+                                </div>
+                              </dl>
+                              {t.status === "SCHEDULED" ? (
+                                <div className="timer-card-actions">
+                                  <Tip text={BTN_TIPS.cancelTimer}>
+                                    <button
+                                      type="button"
+                                      className="btn btn-ghost"
+                                      disabled={busy}
+                                      onClick={() => void onCancelTimer(t.id)}
+                                    >
+                                      Отменить
+                                    </button>
+                                  </Tip>
+                                </div>
+                              ) : null}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : (
+                      <p className="muted timer-empty">
+                        {timersLoaded
+                          ? "По этому фильтру таймеров нет."
+                          : "Загрузка…"}
+                      </p>
+                    )}
+                  </div>
+                ) : null}
+
+                {openTile === "docs" ? (
+                  <div className="docs-panel">
+                    {docsError ? (
+                      <div className="msg msg-error">{docsError}</div>
+                    ) : null}
+                    {!docSlug ? (
+                      <>
+                        <p className="muted" style={{ marginTop: 0 }}>
+                          Разделы из <code>docs/</code>. Откройте документ.
+                        </p>
+                        {docList.length === 0 && !docsError ? (
+                          <p className="muted">{busy ? "Загрузка…" : "Документов нет."}</p>
+                        ) : (
+                          <div className="docs-grid">
+                            {docList.map((d) => (
+                              <button
+                                key={d.slug}
+                                type="button"
+                                className="docs-card"
+                                disabled={busy}
+                                onClick={() => void openDoc(d.slug)}
+                              >
+                                <strong>{d.title}</strong>
+                                {d.summary ? <span>{d.summary}</span> : null}
+                                <code>{d.file}</code>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <article
+                        className="doc-md"
+                        dangerouslySetInnerHTML={{ __html: docHtml }}
+                      />
+                    )}
+                  </div>
                 ) : null}
 
                 {error ? (

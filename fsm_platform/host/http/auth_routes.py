@@ -7,7 +7,7 @@ import smtplib
 from email.message import EmailMessage
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 
@@ -315,8 +315,8 @@ def refresh(body: RefreshBody, request: Request) -> dict[str, Any]:
         sp.close()
 
 
-@router.post("/logout", status_code=204)
-def logout(body: RefreshBody) -> None:
+@router.post("/logout", status_code=204, response_class=Response)
+def logout(body: RefreshBody) -> Response:
     sp = platform_session()
     try:
         row = default_db_layer.get_refresh_token_for_update(
@@ -330,3 +330,4 @@ def logout(body: RefreshBody) -> None:
         raise
     finally:
         sp.close()
+    return Response(status_code=204)

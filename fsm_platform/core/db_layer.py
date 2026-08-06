@@ -309,6 +309,63 @@ class FsmDbLayer:
             {"timer_id": timer_id},
         )
 
+    def cancel_timer_for_service(
+        self, session: SessionLike, *, service_id: str, timer_id: int
+    ) -> bool:
+        """Отмена SCHEDULED-таймера в рамках service_id. True если строка обновлена."""
+        result = session.execute(
+            text(
+                """
+                UPDATE fsm_timers
+                SET status = 'CANCELLED', cancelled_at = UTC_TIMESTAMP()
+                WHERE id = :timer_id
+                  AND service_id = :service_id
+                  AND status = 'SCHEDULED'
+                """
+            ),
+            {"timer_id": int(timer_id), "service_id": service_id},
+        )
+        return int(result.rowcount or 0) > 0
+
+    def list_timers(
+        self,
+        session: SessionLike,
+        *,
+        service_id: str,
+        status: Optional[str] = "SCHEDULED",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Список таймеров тенанта для ops UI.
+        status=None / '' / 'ALL' — без фильтра; иначе точное совпадение статуса.
+        """
+        lim = max(1, min(int(limit), 500))
+        status_n = str(status or "").strip().upper()
+        params: dict[str, Any] = {"service_id": service_id, "limit": lim}
+        status_sql = ""
+        if status_n and status_n != "ALL":
+            status_sql = "AND status = :status"
+            params["status"] = status_n
+        rows = session.execute(
+            text(
+                f"""
+                SELECT id, service_id, entity_type, entity_id, process_name,
+                       fire_at, status, payload_json, idempotency_key, owner,
+                       created_at, cancelled_at
+                FROM fsm_timers
+                WHERE service_id = :service_id
+                  {status_sql}
+                ORDER BY
+                  CASE status WHEN 'SCHEDULED' THEN 0 ELSE 1 END,
+                  fire_at ASC,
+                  id ASC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
     def cancel_timer_by_idempotency_key(
         self, session: SessionLike, service_id: str, idempotency_key: str
     ) -> int:
