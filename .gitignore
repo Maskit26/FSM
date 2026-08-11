@@ -44,3 +44,6 @@ Thumbs.db
 
 # Local worker pid files (dev provisioner)
 .worker-pids/
+
+# External taxi frontend (separate project, not part of FSM repo)
+taksi_proj/
